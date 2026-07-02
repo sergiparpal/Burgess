@@ -1,0 +1,11 @@
+{
+  "name": "burgess",
+  "version": "0.1.0",
+  "description": "STUB (Stage 0) — Burgess fuses Sproutgraph's grounded knowledge-graph convergence engine with Cambrian's diversity-preserving divergence engine. Real manifest lands in Stage 1 (vendored from Sproutgraph and renamed).",
+  "author": {
+    "name": "Sergi Parpal",
+    "email": "sergiparpal@gmail.com"
+  },
+  "license": "MIT",
+  "keywords": ["knowledge-graph", "grounding", "provenance", "creativity", "ideation", "diversity", "map-elites", "mcp"]
+}

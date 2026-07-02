@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# Virtual envs (uv.lock IS committed)
+.venv/
+venv/
+
+# Runtime / session state (never canon)
+.kg-data/
+.kg/
+*.log
+provision.log
+
+# OS / editor strays
+*Zone.Identifier
+.DS_Store
+Thumbs.db

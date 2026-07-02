@@ -1,0 +1,15 @@
+{
+  "comment": "Stage-0 donor pins (FUSION_PLAN.md I11 / D5). Donors are read-only; HEAD must equal the pinned SHA and the working tree must be clean at every Burgess commit.",
+  "donors": {
+    "Sproutgraph": {
+      "path": "../Sproutgraph",
+      "url": "https://github.com/sergiparpal/Sproutgraph",
+      "sha": "17c406632bb547a4abca3a824d9ffdc577e83891"
+    },
+    "Cambrian": {
+      "path": "../Cambrian",
+      "url": "https://github.com/sergiparpal/Cambrian",
+      "sha": "a2adfa1d8b83c52ba17a79382811ea82012f8f99"
+    }
+  }
+}
