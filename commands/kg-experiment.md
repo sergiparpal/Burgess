@@ -15,6 +15,12 @@ set of ideation prompts, in four conditions that differ ONLY in what context the
   / a `/kg-generate` run): the generative layer's proposals, clearly flagged as unverified candidates.
   Tests whether *generating* lifts ideation beyond grounded context alone (PLAN Stage 9).
 - **rag** — the prompt + a naive flat-text retrieval slice of the source document (the strawman to beat).
+- **graph+generate+dpp** *(FUSION Stage 6)* — the graph pack plus the SAME hypothesized slate as
+  `graph+generate`, but presented in the advisory-DPP order with its geometry labels
+  (`kg_generate(..., dpp=true)` → `divergence_advisory` bins / semantic novelty / cliché-hub
+  distance, rendered as opaque text). The candidate SET is identical (I5) — this arm measures
+  whether the *presentation* lifts ideation. Decision Rule D1 (docs/fusion/EXPERIMENT.md) compares
+  it against `graph+generate` to set the shipped `divergence.dpp` default.
 - **lightrag** *(optional, off by default)* — the prompt answered from a real, published **GraphRAG**
   baseline (LightRAG) built over the **same** `examples/source.md` corpus. A stronger strawman than flat
   `rag`: it lets the central claim stand against a genuine graph-retrieval system, not only against grep.
@@ -121,7 +127,7 @@ generation; this command never sees which arm is which until the JSON comes back
 
 `Task(subagent_type: "kg-evaluator", description: "blind ideation A/B/C/D", prompt: …)` — instruct it to:
 
-1. For **each** of the N prompts, build four context blocks:
+1. For **each** of the N prompts, build the context blocks (four donor arms + the dpp arm):
    - **control** → no context.
    - **graph** → the result of `mcp__plugin_burgess_burgess__kg_context(query=<prompt>, budget=2000)`, rendered as
      opaque text — the **grounded** `items[]` only. Carry through the pack's `advisory` (e.g.
@@ -133,7 +139,11 @@ generation; this command never sees which arm is which until the JSON comes back
      AND the generative proposals; it still must not fabricate verdicts or spans.
    - **rag** → a naive flat slice of `examples/source.md`: the top text chunks by keyword overlap with the
      prompt, no graph structure. This is the honest strawman.
-2. Present these four blocks to the generator **without labels** (shuffle; refer to them only as context A/B/C/D),
+   - **graph+generate+dpp** → the graph block PLUS the same slate reordered by
+     `mcp__plugin_burgess_burgess__kg_generate(mechanism="all", k=12, dpp=true)` with its
+     `divergence_advisory` labels rendered as opaque text (bins + semantic novelty + cliché distance),
+     clearly marked *unverified candidates* exactly like graph+generate.
+2. Present these blocks to the generator **without labels** (shuffle; refer to them only as context A/B/C/D/E),
    generate one idea per (prompt × condition), then **de-shuffle** when emitting JSON.
    - **lightrag (optional)** → NOT one of the blinded context blocks — its answers come from the external
      LightRAG system, not from the evaluator's own generation. Run it separately via the isolated helper
@@ -150,6 +160,7 @@ generation; this command never sees which arm is which until the JSON comes back
     "control":        ["…one string per prompt…"],
     "graph":          ["…"],
     "graph+generate": ["…"],
+    "graph+generate+dpp": ["…"],
     "rag":            ["…"],
     "lightrag":       ["… (OPTIONAL — present only when the lightrag arm was enabled+available) …"]
   },

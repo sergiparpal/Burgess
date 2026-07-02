@@ -339,7 +339,7 @@ def _beats(a: dict, c: dict) -> bool:
 # the flat `rag` arm) is OPTIONAL and off by default: when its outputs are absent the arm is simply
 # missing from `table`, never an error. Any non-canonical key is still scored and appended in input
 # order, so the harness tolerates whatever arms the evaluator actually emitted.
-_CANONICAL_ARMS = ("control", "graph", "graph+generate", "rag", "lightrag")
+_CANONICAL_ARMS = ("control", "graph", "graph+generate", "graph+generate+dpp", "rag", "lightrag")
 
 
 def _ordered_conditions(outputs_by_condition: dict):
@@ -390,6 +390,15 @@ def ideation(outputs_by_condition: dict, source_text: str = "") -> dict:
                                                                else " (on par with graph alone)"))
         else:
             out["generate_verdict"] = "graph+generate did NOT clearly beat control"
+    gdpp = table.get("graph+generate+dpp")
+    if gdpp and gg and gdpp["n"] and gg["n"]:
+        # FUSION Stage 6: the D1 comparison arm — the SAME hypothesized slate, presented in
+        # advisory-DPP order with geometry labels. Beating graph+generate here means the
+        # PRESENTATION (order + labels) lifted ideation, since the candidate set is identical.
+        out["dpp_verdict"] = (
+            "graph+generate+dpp beat graph+generate on diversity/novelty without more "
+            "unsupported claims" if _beats(gdpp, gg)
+            else "graph+generate+dpp did NOT clearly beat graph+generate")
     lr = table.get("lightrag")
     if lr and g and lr["n"] and g["n"]:
         out["lightrag_verdict"] = (

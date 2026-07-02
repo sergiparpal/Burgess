@@ -280,3 +280,11 @@ python -m kg_engine.harness ideation outputs.json
 - [ ] If `failed_or_rejected_edges > 0`, no GRAPH idea re-treads a known-failed connection.
 - [ ] `source` contains the FULL text of `examples/source.md`.
 - [ ] You did NOT compute diversity/novelty/utility/unsupported_rate yourself — that is `harness.ideation`'s job.
+
+## The dpp arm (FUSION Stage 6)
+
+When the run includes the `graph+generate+dpp` arm, its context block is the graph pack plus the
+SAME hypothesized slate as `graph+generate`, in the advisory-DPP order with its geometry labels
+(from `kg_generate(..., dpp=true)`'s `divergence_advisory`). Blind it exactly like every other
+block (it must be indistinguishable in form: opaque text, unlabeled); emit its ideas under the
+`graph+generate+dpp` key, same length and prompt order as every other arm.
