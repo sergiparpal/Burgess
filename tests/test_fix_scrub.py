@@ -50,10 +50,8 @@ def test_person_leading_genuine_name_still_redacts():
     assert "Alan Turing" not in scrubbed and "⟦PERSON" in scrubbed, scrubbed
 
 
-def test_person_nonname_bigram_alone_is_left():
-    # A pure non-name Title-Case bigram (a concept) with nothing to rescan is untouched.
-    scrubbed, _ = Scrubber("high").scrub("Creative Destruction reshapes the market.")
-    assert scrubbed == "Creative Destruction reshapes the market.", scrubbed
+# (the spared-concept-bigram case is covered by test_scrub_egress.py's
+#  test_person_rule_spares_concept_bigram_at_high — a byte-identical duplicate lived here, review-r4)
 
 
 def test_person_placeholder_consistency_after_rescan():

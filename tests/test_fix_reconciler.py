@@ -191,16 +191,6 @@ def test_noncanonical_correction_unlinks_original_before_writing(canon, monkeypa
     assert len(edges) == 1 and edges[0].epistemic_state == EpistemicState.UNVERIFIED
 
 
-def _seed_grounded_edge(engine) -> str:
-    """Write one span-verifying edge and ground it (audited). Returns its edge id."""
-    engine.kg_write({"edges": [
-        {"source": "degree", "target": "importance", "relation": "approximates",
-         "span": "Degree approximates importance", "authored_by": "agent"}]})
-    eid = edge_id("degree", "approximates", "importance")
-    engine.kg_ground(eid, "grounded", by="agent")
-    return eid
-
-
 def test_idempotent_reground_surplus_cannot_later_justify_a_forgery(engine):
     """H1/[2]: an idempotent re-ground (grounded->grounded) appends a SECOND audit record the
     `last == current` branch never spends, leaving a spendable surplus. A later out-of-band forgery

@@ -391,6 +391,7 @@ class BackendExtractor:
         totals: Counter = Counter()
         n_written = 0
         failed_sections: list[dict] = []
+        projection_error: str | None = None
         # Parse the canon baseline ONCE here and thread it through every section's kg_write, refreshing
         # only the nodes each section touched (read back from the authoritative post-merge canon). This
         # replaces the per-section full-canon re-parse inside kg_write — O(S·N) → O(N + S·K) (backend-1).
@@ -410,14 +411,26 @@ class BackendExtractor:
         finally:
             # Always reconcile the derived layer with whatever landed, even if a section raised — the
             # canon may have been partially updated and must not be left with a stale projection.
-            self.engine.projector.project()  # build/refresh the derived layer
-        return {
+            # GUARDED: a projection failure inside a `finally` would REPLACE any in-flight extraction
+            # exception, hiding the true failure from CI logs (review-r4: finally-masks-run-error).
+            # The derived layer is regenerable and self-heals on the next engine read, so record the
+            # failure in the summary instead of letting it shadow the run's own outcome.
+            try:
+                self.engine.projector.project()  # build/refresh the derived layer
+            except Exception as exc:  # noqa: BLE001 — never mask the extraction outcome
+                projection_error = f"{type(exc).__name__}: {exc}"
+                print(f"[backend] post-run projection failed ({projection_error}); "
+                      f"the derived layer will refresh on the next engine read", file=sys.stderr)
+        out = {
             "model": self.model,
             "sections": n_written,
             "dispositions": dict(totals),
             "failed_sections": failed_sections,
             "metrics": self.engine.kg_metrics(),
         }
+        if projection_error:
+            out["projection_error"] = projection_error
+        return out
 
 
 # --------------------------------------------------------------------------- CLI

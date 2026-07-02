@@ -57,8 +57,11 @@ def _bridge_set(nodes: list, gate_on: int) -> set:
     weighting earned promotion) use the confound-corrected ``spec_betweenness`` (top by that signal). Node
     SIZE is degree-only elsewhere — the bridge metric never drives size, so the confound can't sneak in."""
     if gate_on:
+        # Descend on the metric but tie-break id ASCENDING — the same (value DESC, id ASC) order
+        # kg_context's bridge_metric SQL uses — so among exact ties the HTML highlights the SAME
+        # nodes kg_context reports (a bare reverse=True descended the id tiebreak too).
         ranked = sorted((n for n in nodes if (n.get("spec_betweenness") or 0) > 0),
-                        key=lambda n: (n.get("spec_betweenness") or 0, n.get("id")), reverse=True)
+                        key=lambda n: (-(n.get("spec_betweenness") or 0), n.get("id")))
         return {n["id"] for n in ranked[:_BRIDGE_TOP_N]}
     return {n["id"] for n in nodes if n.get("structural_bridge")}
 

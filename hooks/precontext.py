@@ -84,10 +84,25 @@ def main() -> int:
                                             metrics_mode=metrics_mode)
         if not proj.db_path.exists():
             return 0  # nothing projected yet
+        # Bound the damage of the hook being SIGKILLed mid-projection (precontext.mjs caps us at 5s):
+        # a killed hook leaves its canon lease behind, and on Windows a dead pid can't be probed, so
+        # the lease is only stale after its TTL — the default 120s exceeds the writers' 30s acquire
+        # budget and every write in that window errors "locked by another live session". A short TTL
+        # keeps a killed hook's lease reclaimable well inside the writer budget; while the hook is
+        # ALIVE the projection's own heartbeats keep the lease fresh, so a legitimate slow projection
+        # is never stolen mid-write (review-r4: hook-kill-wedges-windows-writers).
+        proj.canon.lock.ttl = 15.0
         # Mirror the server's lazy-reproject gate (server._ensure_projected): a raw kg_context read off a
         # stale projection would inject obsolete provenance / epistemic labels. The index already exists
         # (guarded above), so this is a cheap incremental reproject, never a side-effecting cold build.
-        if proj.is_stale():
+        # SIZE-GATED: this hook runs on every Grep/Glob/Read and is killed at 5s, and a projection's
+        # betweenness pass is O(V·E) — on a large canon it can NEVER finish inside the cap, so every
+        # read tool would burn 5s of CPU and get killed again, forever, while serving nothing. Above
+        # the gate, serve the existing (stale) index instead — the same one-projection-lag the server
+        # already tolerates elsewhere (R3/Q3); the server's own next read reprojects for real
+        # (review-r4: hook-reprojects-doomed-on-large-canons).
+        _MAX_HOOK_REPROJECT_NOTES = 400  # ~the scale where pure-Python betweenness nears the 5s cap
+        if len(proj.canon.note_paths()) <= _MAX_HOOK_REPROJECT_NOTES and proj.is_stale():
             proj.project()
         ti = payload.get("tool_input", {})
         query = ti.get("pattern") or ti.get("query") \

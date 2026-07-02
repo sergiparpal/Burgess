@@ -39,6 +39,10 @@ INDEX_DB = "index.sqlite"
 # an index.sqlite built before them lacks the columns, so a projection that finds them missing forces
 # a full rebuild (CREATE TABLE IF NOT EXISTS cannot add a column to an existing table).
 _NEW_NODE_COLUMNS = {"betweenness", "spec_betweenness", "specificity", "gate_on"}
+# Same late-addition marker for the `edges` table: `owner` (the note file an edge is persisted in)
+# was added after the original 11 edge columns — see _EDGE_COLUMNS for why it exists. A pre-owner
+# index.sqlite must full-rebuild exactly like a pre-Stage-2 one.
+_NEW_EDGE_COLUMNS = {"owner"}
 # The `nodes` table column order, in DDL order — the single source of truth for the positional
 # persistence contract. `_NODES_DDL`, the INSERT placeholder string, `_node_row`, and the
 # incremental rank-refresh all derive from this tuple, so a column add/reorder is one edit here
@@ -71,6 +75,12 @@ _EDGE_COLUMNS = (
     ("id", "TEXT PRIMARY KEY"), ("source", "TEXT"), ("target", "TEXT"), ("relation", "TEXT"),
     ("provenance", "TEXT"), ("authored_by", "TEXT"), ("epistemic_state", "TEXT"), ("span", "TEXT"),
     ("source_file", "TEXT"), ("confidence", "TEXT"), ("confidence_score", "REAL"),
+    # `owner` = the id of the canon NOTE the edge is persisted in. Normally identical to `source`,
+    # but a hand-edited note may legitimately carry an edge whose explicit `source:` names another
+    # node (model.Edge.from_dict honors it). The incremental diff/delete must be keyed on the OWNING
+    # FILE — keying on `source` left a removed foreign-source edge as a stale row the canon no longer
+    # holds (violating "derived contains nothing the canon does not") until the next full rebuild.
+    ("owner", "TEXT"),
 )
 _EDGE_COLUMN_NAMES = tuple(name for name, _ in _EDGE_COLUMNS)
 # Hard ceiling on the kg_context token budget so a client passing a huge value can't make the engine
@@ -524,8 +534,10 @@ class Projector:
                   + ", ".join(f"{name} {sqltype}" for name, sqltype in _EDGE_COLUMNS) + ")")
     _EDGES_INSERT = ("INSERT OR REPLACE INTO edges VALUES ("
                      + ",".join("?" * len(_EDGE_COLUMNS)) + ")")
-    _EDGES_SELECT_BY_SOURCE = ("SELECT " + ",".join(_EDGE_COLUMN_NAMES)
-                               + " FROM edges WHERE source=?")
+    # Keyed on `owner` (the persisting note), NOT `source`: a changed note's edge diff must cover
+    # exactly the rows that note contributed, or a removed foreign-source edge leaks (see _EDGE_COLUMNS).
+    _EDGES_SELECT_BY_OWNER = ("SELECT " + ",".join(_EDGE_COLUMN_NAMES)
+                              + " FROM edges WHERE owner=?")
 
     def _connect(self) -> sqlite3.Connection:
         con = sqlite3.connect(self.db_path)
@@ -546,60 +558,77 @@ class Projector:
                 CREATE INDEX IF NOT EXISTS idx_nodes_degree ON nodes(degree);
                 """
             )
-            # CREATE TABLE IF NOT EXISTS cannot add the Stage-2 columns to a pre-existing 11-column
-            # `nodes` table. If they are missing, drop and recreate it empty (a full reprojection —
-            # forced by _schema_outdated — repopulates it). Done here so every connect path heals the
-            # schema. The pre-BEGIN read below is only a cheap fast-path skip; the authoritative decision
-            # re-reads the columns under the exclusive lock (TOCTOU guard).
+            # idx_edges_owner is deliberately NOT in the script above: `owner` is a late-added column,
+            # so on a pre-owner edges table (CREATE TABLE IF NOT EXISTS never adds columns) an eager
+            # CREATE INDEX would raise "no such column" BEFORE the heal below could run. It is created
+            # after the heal instead — see the end of this method.
+            # CREATE TABLE IF NOT EXISTS cannot add the Stage-2 `nodes` columns — or the `owner`
+            # edge column — to a pre-existing table. If either table is missing its late-added
+            # columns, drop and recreate IT empty (a full reprojection — forced by _schema_outdated —
+            # repopulates both). Done here so every connect path heals the schema. The pre-BEGIN read
+            # below is only a cheap fast-path skip; the authoritative decision re-reads the columns
+            # under the exclusive lock (TOCTOU guard).
             cols = {r[1] for r in con.execute("PRAGMA table_info(nodes)")}
-            if not _NEW_NODE_COLUMNS <= cols:
-                # Heal a pre-Stage-2 schema by dropping + recreating `nodes` empty (a full reproject,
-                # forced by _schema_outdated, repopulates it). Do the DROP+CREATE inside ONE IMMEDIATE
-                # transaction so a concurrent lease-free WAL reader sees either the old table or the new
-                # one — never the intermediate no-`nodes`-table state, which would raise "no such table:
-                # nodes". executescript auto-commits between statements (reopening that window), so drive
-                # explicit statements under manual transaction control instead.
+            ecols = {r[1] for r in con.execute("PRAGMA table_info(edges)")}
+            if not (_NEW_NODE_COLUMNS <= cols and _NEW_EDGE_COLUMNS <= ecols):
+                # Heal an outdated schema by dropping + recreating the affected table(s) empty (a full
+                # reproject, forced by _schema_outdated, repopulates them). Do the DROP+CREATE inside
+                # ONE IMMEDIATE transaction so a concurrent lease-free WAL reader sees either the old
+                # table or the new one — never the intermediate no-table state, which would raise "no
+                # such table". executescript auto-commits between statements (reopening that window),
+                # so drive explicit statements under manual transaction control instead.
                 prior_iso = con.isolation_level
                 con.isolation_level = None  # autocommit: BEGIN/COMMIT are explicit + predictable cross-version
                 try:
                     con.execute("BEGIN IMMEDIATE")
                     try:
                         # Re-read the columns INSIDE the immediate transaction: a concurrent rebuild may
-                        # have already healed + populated `nodes` between the pre-BEGIN read above and
+                        # have already healed + populated the tables between the pre-BEGIN read above and
                         # acquiring this exclusive lock. Dropping on that stale read would discard the
-                        # freshly-projected rows, so only DROP/recreate if the table is STILL pre-Stage-2
-                        # under the lock.
+                        # freshly-projected rows, so only DROP/recreate what is STILL outdated under the
+                        # lock.
                         cols = {r[1] for r in con.execute("PRAGMA table_info(nodes)")}
                         if not _NEW_NODE_COLUMNS <= cols:
                             con.execute("DROP TABLE IF EXISTS nodes")
                             con.execute(self._NODES_DDL)
                             con.execute("CREATE INDEX IF NOT EXISTS idx_nodes_degree ON nodes(degree)")
+                        ecols = {r[1] for r in con.execute("PRAGMA table_info(edges)")}
+                        if not _NEW_EDGE_COLUMNS <= ecols:
+                            con.execute("DROP TABLE IF EXISTS edges")
+                            con.execute(self._EDGES_DDL)
+                            con.execute("CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source)")
+                            con.execute("CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target)")
+                            con.execute("CREATE INDEX IF NOT EXISTS idx_edges_owner ON edges(owner)")
                         con.execute("COMMIT")
                     except Exception:
                         con.execute("ROLLBACK")
                         raise
                 finally:
                     con.isolation_level = prior_iso
+            # Safe only now: the edges table is guaranteed post-`owner` here — fresh (the DDL above
+            # includes it), already current, or just healed by the transaction above.
+            con.execute("CREATE INDEX IF NOT EXISTS idx_edges_owner ON edges(owner)")
             return con
         except Exception:
             con.close()  # never leak the connection if a PRAGMA/schema-heal step raises (returned only on success)
             raise
 
     def _schema_outdated(self) -> bool:
-        """True if an index.sqlite exists but its `nodes` table predates the Stage-2 columns — forces a
-        full rebuild so the betweenness/specificity/gate columns get populated for every node, not just
-        the ones an incremental pass happens to touch."""
+        """True if an index.sqlite exists but its `nodes` table predates the Stage-2 columns, or its
+        `edges` table predates the `owner` column — forces a full rebuild so the late-added columns get
+        populated for every row, not just the ones an incremental pass happens to touch."""
         if not self.db_path.exists():
             return False  # no db -> do_full is already True via the exists() check
         try:
             con = sqlite3.connect(self.db_path)
             try:
                 cols = {r[1] for r in con.execute("PRAGMA table_info(nodes)")}
+                ecols = {r[1] for r in con.execute("PRAGMA table_info(edges)")}
             finally:
                 con.close()
         except sqlite3.Error:
             return True
-        return not _NEW_NODE_COLUMNS <= cols
+        return not (_NEW_NODE_COLUMNS <= cols and _NEW_EDGE_COLUMNS <= ecols)
 
     def _node_row(self, n, ranks: Ranks) -> dict:
         """One node's persisted column values as a dict keyed by `_NODE_COLUMN_NAMES`, so callers read
@@ -623,16 +652,18 @@ class Projector:
         return tuple(row[name] for name in _NODE_COLUMN_NAMES)
 
     @staticmethod
-    def _edge_row(e) -> tuple:
+    def _edge_row(e, owner: str) -> tuple:
         """One edge's persisted column VALUES as a positional tuple in _EDGE_COLUMNS order. Built via a
         name->value dict and flattened through _EDGE_COLUMN_NAMES, so the order is DERIVED from the same
         single source the DDL / INSERT placeholder / incremental-diff SELECT use — the positional
-        comparison in _write_incremental (cur SELECT row vs this tuple) can't desync on a column edit."""
+        comparison in _write_incremental (cur SELECT row vs this tuple) can't desync on a column edit.
+        `owner` is the id of the persisting NOTE (usually == e.source; see _EDGE_COLUMNS)."""
         v = {
             "id": e.id, "source": e.source, "target": e.target, "relation": e.relation,
             "provenance": e.provenance.value, "authored_by": e.authored_by.value,
             "epistemic_state": e.epistemic_state.value, "span": e.span, "source_file": e.source_file,
             "confidence": e.confidence.value, "confidence_score": e.confidence_score,
+            "owner": owner,
         }
         return tuple(v[name] for name in _EDGE_COLUMN_NAMES)
 
@@ -644,7 +675,7 @@ class Projector:
             con.executemany(
                 self._NODES_INSERT,
                 [self._node_values(self._node_row(n, ranks)) for n in nodes])
-            erows = [self._edge_row(e) for n in nodes for e in n.edges]
+            erows = [self._edge_row(e, n.id) for n in nodes for e in n.edges]
             con.executemany(self._EDGES_INSERT, erows)
             report.touched_nodes = [n.id for n in nodes]
             report.touched_edges = [e.id for n in nodes for e in n.edges]
@@ -658,16 +689,17 @@ class Projector:
         con = self._connect()
         try:
             changed_ids = {c.id for c in changed}  # hoisted out of the per-node loop below
-            # removed nodes: drop node + its outgoing edges
+            # removed nodes: drop node + every edge its FILE contributed (owner, not source — a
+            # hand-edited note can persist an edge whose source names another node; see _EDGE_COLUMNS)
             for nid in removed:
                 con.execute("DELETE FROM nodes WHERE id=?", (nid,))
-                con.execute("DELETE FROM edges WHERE source=?", (nid,))
+                con.execute("DELETE FROM edges WHERE owner=?", (nid,))
             for n in changed:
                 con.execute(self._NODES_INSERT, self._node_values(self._node_row(n, ranks)))
                 report.touched_nodes.append(n.id)
-                # diff this node's edges against the DB; upsert only changed rows, delete vanished
-                cur = {r[0]: r for r in con.execute(self._EDGES_SELECT_BY_SOURCE, (n.id,))}
-                new = {e.id: self._edge_row(e) for e in n.edges}
+                # diff this note's edges against the DB; upsert only changed rows, delete vanished
+                cur = {r[0]: r for r in con.execute(self._EDGES_SELECT_BY_OWNER, (n.id,))}
+                new = {e.id: self._edge_row(e, n.id) for e in n.edges}
                 for eid, row in new.items():
                     if cur.get(eid) != row:
                         con.execute(self._EDGES_INSERT, row)
@@ -905,11 +937,13 @@ class Projector:
             con.close()
 
     def owner_of_edge(self, edge_id: str) -> str | None:
-        """Source node id for an edge, via the indexed edges table (O(1) lookup); None if absent.
-        Lets kg_ground resolve an edge's owner without an O(N) full-canon scan per call (server-2)."""
+        """Owning-NOTE id for an edge, via the indexed edges table (O(1) lookup); None if absent.
+        Lets kg_ground resolve an edge's owner without an O(N) full-canon scan per call (server-2).
+        Reads the `owner` column (the persisting file), not `source`: a hand-edited note may carry an
+        edge whose source names another node, and the caller wants the note that HOLDS the edge."""
         con = self._ro()
         try:
-            r = con.execute("SELECT source FROM edges WHERE id=?", (edge_id,)).fetchone()
+            r = con.execute("SELECT owner FROM edges WHERE id=?", (edge_id,)).fetchone()
             return r[0] if r else None
         finally:
             con.close()

@@ -210,9 +210,11 @@ def test_i4_divergence_state_is_session_scoped(tmp_path, monkeypatch):
     """Pre-port: the divergence package must simply not exist. Post-port: its state
     resolver must target the project-local session dir (.kg/diverge) or an explicit
     override — never the canon vault or the derived DB directory."""
-    if importlib.util.find_spec("kg_engine.divergence") is None:
-        assert True  # pre-port trivial pass, becomes load-bearing after Stage 2's port
-        return
+    # The Stage-2 port has landed, so kg_engine.divergence MUST resolve. The old pre-port guard
+    # (`assert True; return`) would now SILENTLY pass on a package-resolution regression — the exact
+    # failure this test exists to catch (review-r4: firewall-guard-vacuous-pass).
+    assert importlib.util.find_spec("kg_engine.divergence") is not None, \
+        "kg_engine.divergence failed to resolve — a packaging regression, not a pre-port state"
 
     from kg_engine.divergence import state as dstate
 

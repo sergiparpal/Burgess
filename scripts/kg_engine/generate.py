@@ -59,6 +59,16 @@ NO_COMMUNITY = -1
 # original code path (unbounded BFS + full O(V^2) pair scan) so small graphs stay byte-identical with
 # the golden/reproducibility expectations. Above it, BFS is bounded by SEED_BFS_CUTOFF (see `seed`).
 SEED_ALLPAIRS_MAX_NODES = 400
+# Convergence-tally exactness gate (review-r4: big-k-materializes-o(v2)-candidates). At or below this
+# node count run_generators runs every mechanism UNTRUNCATED so the cross-mechanism convergence tally
+# sees each full pre-truncation candidate list — the exact behavior the convergence-undercount fix
+# introduced, and where every golden expectation lives. Above it, that full materialization (a
+# Candidate object with a formatted rationale string per surviving pair, O(V^2) of them) is a real
+# memory/time cliff, so mechanisms run at the surfaced k and the tally covers the union of the top-k
+# lists only. The SURFACED slate is identical either way (slicing a full ranked list to k is
+# byte-identical to ranking at k); `convergence` is an advisory ranking prior (G3/G4), so a possible
+# undercount on a >400-node graph trades bounded precision for bounded cost.
+FULL_TALLY_MAX_NODES = 400
 # The cutoff radius the seed model actually consumes. seed scores a pair by the residual of its
 # common-neighbour count; a shared neighbour can exist only at distance ≤ 2, so pairs at distance ≥ 3
 # always score 0 and are dropped. Radius 2 enumerates every pair seed can ever turn into a candidate.
@@ -641,8 +651,11 @@ def run_generators(G, mechanism="bridge", *, pack=None, corpus=None, failures=No
     # full ranked list to k is byte-identical to calling the mechanism with k (_rank sorts then
     # truncates), so the SURFACED slate is unchanged — but the retained full lists let the convergence
     # tally (below) count a pair proposed by two mechanisms even when it fell off ONE mechanism's top-k
-    # (review: convergence undercount).
-    _BIG_K = G.number_of_nodes() ** 2 + G.number_of_nodes() + 1
+    # (review: convergence undercount). SIZE-GATED at FULL_TALLY_MAX_NODES: above the gate the exact
+    # tally's O(V^2) materialization is prohibitive, so mechanisms run at the surfaced k and the tally
+    # is approximate (see the constant's rationale).
+    n_nodes = G.number_of_nodes()
+    _BIG_K = (n_nodes ** 2 + n_nodes + 1) if n_nodes <= FULL_TALLY_MAX_NODES else max(0, int(k))
     out: list = []
     full: list = []  # every mechanism's PRE-truncation candidate list — feeds the convergence tally only
     for m in mechs:

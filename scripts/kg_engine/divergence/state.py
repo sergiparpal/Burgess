@@ -133,8 +133,12 @@ def _atomic_write(path: Path, text: str) -> None:
         # Fsync the directory so the rename itself is durable, not just the data.
         _fsync_dir(path.parent)
     finally:
+        # Best-effort cleanup: an unlink failing on the ERROR path (tmp vanished, a transient Windows
+        # sharing violation) must not MASK the true exception propagating from the try — mirror
+        # kg_engine.atomicio's guarded cleanup.
         if os.path.exists(tmp):
-            os.unlink(tmp)
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
 
 
 def _steal_stale_lock(lock: Path) -> None:

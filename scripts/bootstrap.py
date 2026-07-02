@@ -88,7 +88,7 @@ POLL_SECS = 2.0                     # how often a foreground waiter re-checks th
 LOG_NAME = "provision.log"          # where the detached worker logs
 SCHEMA = "1"                        # bump to force every venv to rebuild
 
-# Modules the engine must be able to import for the MCP server to come up. python-igraph
+# Modules the engine must be able to import for the MCP server to come up. The igraph dep
 # imports as ``igraph``; pyyaml as ``yaml``. ``kg_engine`` resolves off PYTHONPATH. (Git is
 # used only via the ``git`` CLI through subprocess in canon.py — no ``import git`` — so the
 # ``git`` module is intentionally absent here and from [project.dependencies].)

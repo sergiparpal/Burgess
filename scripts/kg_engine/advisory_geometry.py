@@ -89,11 +89,18 @@ def _structural_descriptor(c: Dict[str, Any], G, undirected, dist_cache: Dict) -
     d = dist_cache[key]
     graph_distance = "unreachable" if d is None else ("d" + str(min(int(d), 5)))
 
-    incident_states = [
-        (data or {}).get("epistemic_state") == "grounded"
-        for node in (u, v) if node in G
-        for _, _, data in G.edges(node, data=True)
-    ]
+    # Truly INCIDENT edges: on a MultiDiGraph, G.edges(node) yields OUT-edges only, which silently
+    # dropped every incoming edge from the mix. Walk both directions; skip self-loops on the incoming
+    # pass so they are not double-counted (they already appear in the outgoing pass).
+    incident_states = []
+    for node in (u, v):
+        if node not in G:
+            continue
+        for _, _, data in G.out_edges(node, data=True):
+            incident_states.append((data or {}).get("epistemic_state") == "grounded")
+        for s, t, data in G.in_edges(node, data=True):
+            if s != t:
+                incident_states.append((data or {}).get("epistemic_state") == "grounded")
     grounded_mix = (sum(incident_states) / len(incident_states)) if incident_states else 0.0
     return {"community": community, "graph_distance": graph_distance,
             "grounded_mix": round(float(grounded_mix), 4)}

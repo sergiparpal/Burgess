@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import sys
 from pathlib import Path
 
 import pytest
@@ -21,9 +20,10 @@ from kg_engine.harness import (
 )
 
 # f4_probe.py is a standalone script under scripts/, not a package module — load it by path.
+# Loaded via importlib ONLY: a module-level sys.path.insert would mutate interpreter-global state
+# for the whole test session (review-r4: test-harness-sys-path-leak); f4_probe is stdlib-only, so
+# it needs no path help beyond the explicit file location.
 _SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
-if str(_SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(_SCRIPTS))
 _spec = importlib.util.spec_from_file_location("f4_probe", _SCRIPTS / "f4_probe.py")
 f4_probe = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(f4_probe)
@@ -43,10 +43,24 @@ def test_disagreement_lowers_alpha():
 
 
 def test_alpha_threshold_semantics():
-    # 5/6 units agree -> alpha should be clearly positive but the test only asserts it is finite & < 1
-    a = agreement([{f"u{i}": "x" for i in range(6)},
-                   {**{f"u{i}": "x" for i in range(5)}, "u5": "y"}])
-    assert a == a and a < 1.0  # not NaN
+    """The _ALPHA_RELIABLE threshold actually separates: perfect agreement clears it, systematic
+    disagreement lands far below it, and a mostly-agreeing panel sits strictly between 0 and 1
+    (the old body only asserted "finite and < 1", testing none of the threshold semantics)."""
+    from kg_engine.harness import _ALPHA_RELIABLE
+
+    perfect = agreement([{f"u{i}": "x" for i in range(6)},
+                         {f"u{i}": "x" for i in range(6)}])
+    assert perfect >= _ALPHA_RELIABLE  # a perfect panel is RELIABLE
+    disagree = agreement([{f"u{i}": "x" for i in range(6)},
+                          {f"u{i}": "y" for i in range(6)}])
+    assert disagree < _ALPHA_RELIABLE  # systematic disagreement stays advisory (negative alpha)
+    # A mostly-agreeing TWO-category panel (4 agreed x, 3 agreed y, 1 disagreement) sits strictly
+    # between 0 and 1. NB: the single-category variant (5/6 agree, one lone 'y') scores EXACTLY 0.0 —
+    # Krippendorff's chance correction makes a one-off rare category indistinguishable from chance —
+    # so a balanced fixture is required for a genuinely-positive case.
+    c1 = {**{f"u{i}": "x" for i in range(4)}, **{f"u{i}": "y" for i in range(4, 7)}, "u7": "x"}
+    a = agreement([c1, {**c1, "u7": "y"}])
+    assert 0.0 < a < 1.0
 
 
 def test_idf_seeds_rank_rare_above_common():

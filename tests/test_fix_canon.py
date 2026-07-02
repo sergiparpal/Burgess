@@ -475,6 +475,18 @@ def test_contended_writer_waits_for_lease_then_commits(tmp_path: Path):
     writer = _foreign_canon(tmp_path, "writer-host")
     writer.lock_acquire_timeout = 10.0
     done: dict = {}
+    # Count the writer's acquire attempts (instance attr shadows the method) so "still waiting" is
+    # asserted only AFTER the writer has provably attempted — and failed — at least one acquire. The
+    # old bare sleep(0.3) could pass vacuously on a starved machine where the thread had not even
+    # been scheduled yet (review-r4: sleep-based-blocked-assert).
+    attempts: list = []
+    real_acquire = writer.lock.acquire
+
+    def counting_acquire(*a, **k):
+        attempts.append(1)
+        return real_acquire(*a, **k)
+
+    writer.lock.acquire = counting_acquire
 
     def do_write() -> None:
         done["info"] = writer.write_nodes([Node(id="late", label="Late", body="landed")],
@@ -482,7 +494,11 @@ def test_contended_writer_waits_for_lease_then_commits(tmp_path: Path):
 
     t = threading.Thread(target=do_write)
     t.start()
-    time.sleep(0.3)
+    deadline = time.time() + 10.0
+    while not attempts and time.time() < deadline:
+        time.sleep(0.01)
+    assert attempts, "writer thread never attempted the lease"
+    # it has attempted at least once while the lease is HELD, and cannot have finished: it is waiting
     assert "info" not in done, "writer should still be WAITING for the held lease, not done/failed"
     holder.lock.release()  # free the lease — the waiter now acquires on its next retry
     t.join(timeout=10)

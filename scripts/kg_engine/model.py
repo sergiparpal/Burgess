@@ -313,6 +313,14 @@ def node_to_markdown(node: Node) -> str:
 
 
 def node_from_markdown(text: str, *, fallback_id: str | None = None) -> Node:
+    # Tolerate a leading UTF-8 BOM (U+FEFF): every canon read decodes with encoding="utf-8", which
+    # preserves a BOM as a leading ﻿ character, and the frontmatter regex then fails to match —
+    # so a note hand-edited in an editor that writes BOMs (Windows Notepad's default "UTF-8") would
+    # raise here and SILENTLY vanish from every read via all_nodes()'s tolerance, taking its §1.7
+    # failure memory with it. Stripping it here (the single parse chokepoint) fixes every caller
+    # (canon, reconciler, canonmerge) at once; engine writes never emit a BOM, so this is a no-op on
+    # engine-authored notes and the note is re-serialized BOM-less on its next write.
+    text = text.lstrip("﻿")
     m = _FRONTMATTER_RE.match(text)
     if not m:
         raise ValueError("note has no YAML frontmatter")

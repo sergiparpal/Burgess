@@ -1,5 +1,72 @@
 # Changelog
 
+## Unreleased
+
+Fixes from the 2026-07 full-codebase review (review-r4; regression-tested in
+`tests/test_review_r4.py`).
+
+### Fixed
+
+- **BOM tolerance**: a canon note hand-saved with a UTF-8 BOM (Windows
+  Notepad's default) failed the frontmatter parse and silently vanished from
+  every read — including its §1.7 failure memory. `node_from_markdown` now
+  strips a leading U+FEFF at the single parse chokepoint.
+- **Stale-edge leak on incremental reprojection**: the per-note edge diff was
+  keyed on `source`, so a hand-edited note carrying an edge whose `source:`
+  names another node leaked a stale `index.sqlite` row after the edge was
+  removed (graph.json, rebuilt in full, disagreed). The edges table now
+  carries an `owner` column (the persisting note); diff/delete key on it, a
+  pre-`owner` DB reads as schema-outdated and heals via full rebuild, and
+  `owner_of_edge` resolves the owning file rather than assuming
+  `source == owner`.
+- **§1.9 egress gaps**: the read-path re-scrub now covers `label`, kg_agenda
+  `question` strings and kg_generate `rationale`s (ids stay untouched);
+  kg_agenda and kg_generate route through `_scrub_egress` like the sibling
+  reads; `kg_scrub` no longer counts identity (literal-placeholder) entries as
+  redactions.
+- A SIGKILLed PreToolUse hook could hold the canon lease past the writers'
+  30 s budget on Windows (no pid probe there): the hook now declares a 15 s
+  lease TTL and size-gates its synchronous reprojection (>400 notes serve the
+  existing index instead of burning the 5 s cap on every read, forever).
+- The divergence `ingest` now parses candidates and warm-loads the embedder
+  BEFORE taking the project lock, so the first-use ~120 MB model download can
+  no longer outlive the lock's 60 s staleness window and get it stolen
+  mid-cycle.
+- `backend.run()`'s post-run projection is guarded: a projection failure is
+  recorded as `projection_error` in the summary instead of masking the run's
+  own exception from the `finally`.
+- `export._bridge_set` tie-breaks by id ASCENDING among equal
+  `spec_betweenness`, matching kg_context's `ORDER BY … id ASC`.
+- `advisory_geometry`'s `grounded_mix` counts incoming edges too
+  (`G.edges(node)` is out-only on a MultiDiGraph).
+- `build_engine_from_env` filters unsubstituted `${…}` values from
+  `CLAUDE_PLUGIN_OPTION_*` reads, like every other env read.
+- Divergence `_atomic_write` guards its temp-file cleanup so an unlink failure
+  can't mask the real write error (parity with `atomicio`).
+
+### Changed
+
+- `run_generators` size-gates the exact convergence tally at
+  `FULL_TALLY_MAX_NODES` (400): above it, mechanisms run at the surfaced `k`
+  instead of materializing O(V²) candidates; the surfaced slate is identical.
+- `kg_write` now reuses a cheap-signature-keyed canon baseline across calls
+  (the server-side twin of backend-1), so a parallel `/kg-build` wave no
+  longer re-parses the whole canon per write; any out-of-band write
+  invalidates it.
+- Depend on `igraph` directly (the `python-igraph` name is a deprecated PyPI
+  alias for the same package).
+
+### Tests
+
+- New `tests/test_review_r4.py` regression file (12 tests) covering all of the
+  above; the divergence-firewall pre-port guard now fails loudly instead of
+  silently passing if the package stops resolving; a `sys.modules` stub leak,
+  a duplicated helper, a byte-identical duplicate test, a module-level
+  `sys.path` mutation and a vacuous sleep-based "writer blocks" assertion were
+  cleaned up; `test_alpha_threshold_semantics` now actually tests the
+  reliability threshold (and documents Krippendorff's rare-category zero).
+
+
 ## 0.1.0 — first release (2026-07-02)
 
 Burgess 0.1.0 is the first release of the fused plugin: Sproutgraph's grounded

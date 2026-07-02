@@ -464,6 +464,14 @@ class KGEngine:
         # and counts, not a second pass. Bounded by _WRITE_CACHE_MAX; lost on restart, but the
         # payload-derived `receipt` + id-dedup keep a post-restart retry safe regardless (§1.4).
         self._write_cache: "OrderedDict[str, dict]" = OrderedDict()
+        # Canon-baseline cache for kg_write (the server-side twin of backend-1/server-16): the MCP path
+        # re-parsed the ENTIRE canon once per kg_write call, making a parallel /kg-build wave
+        # O(sections × notes). Holds {id: Node} keyed by the projector's cheap dir signature; after a
+        # successful write only the touched notes are re-read (their exact post-merge state). Any
+        # out-of-band writer — another process, kg_ground/kg_rename/kg_merge, a hand edit — moves the
+        # cheap signature and the next call re-parses in full: the same invalidation primitive the
+        # projector itself trusts (review-r4: kg_write-reparses-canon-per-call).
+        self._baseline_cache: "tuple[str, dict[str, Node]] | None" = None
 
     # ---- source set (for span verification) — delegate to the shared resolver
     def source_set(self) -> SourceSet:
@@ -521,8 +529,12 @@ class KGEngine:
         src = text if text is not None else self.source_text()
         scrubbed, mapping = self.scrubber.scrub(src)
         self._scrub_map.update(mapping)
-        return {"scrubbed": scrubbed, "redactions": len(mapping),
-                "sensitivity": self.sensitivity, "categories": sorted({k.split(":")[0].strip("⟦") for k in mapping})}
+        # Identity entries (a literal ⟦CAT:N⟧ already present in the source prose, mapped to itself so
+        # restore leaves it alone — scrub-2/M4) are protection bookkeeping, not redactions: keep them
+        # out of the reported count and category list so the response reflects real redactions only.
+        real = {k: v for k, v in mapping.items() if v != k}
+        return {"scrubbed": scrubbed, "redactions": len(real),
+                "sensitivity": self.sensitivity, "categories": sorted({k.split(":")[0].strip("⟦") for k in real})}
 
     def _restore_fn(self):
         """The §1.9 span-restore: map placeholder spans back to the original before span verification,
@@ -551,6 +563,36 @@ class KGEngine:
         finally:
             if wd is not None:
                 wd.end_critical()
+
+    def _canon_baseline(self) -> "dict[str, Node]":
+        """The {id: Node} canon baseline for kg_write's dedup/flood seeding, cached on the projector's
+        cheap dir signature. The signature is computed BEFORE the parse: if a foreign writer lands
+        mid-parse, the stored signature is already stale and the next call re-parses — the failure
+        direction is always a redundant re-parse, never a stale baseline served as fresh."""
+        sig = self.projector._cheap_sig()
+        cache = self._baseline_cache
+        if cache is not None and cache[0] == sig:
+            return cache[1]
+        nodes = {n.id: n for n in self.canon.all_nodes()}
+        self._baseline_cache = (sig, nodes)
+        return nodes
+
+    def _refresh_baseline(self, written_ids) -> None:
+        """Refresh ONLY the notes a successful write touched (read back in their exact post-merge
+        state) and re-stamp the signature, so the next kg_write reuses the cache instead of re-parsing
+        the whole canon — mirroring backend._refresh_baseline. Signature first (same stale-safe
+        ordering as _canon_baseline); any hiccup drops the cache, since correctness never depends on
+        it (the next call falls back to a full parse)."""
+        if self._baseline_cache is None:
+            return
+        try:
+            sig = self.projector._cheap_sig()
+            nodes = self._baseline_cache[1]
+            for nid in written_ids:
+                nodes[nid] = self.canon.read_node(nid)
+            self._baseline_cache = (sig, nodes)
+        except Exception:  # noqa: BLE001 — cache maintenance must never fail a write
+            self._baseline_cache = None
 
     @staticmethod
     def _append_note(existing: str, addition: str) -> str:
@@ -595,10 +637,10 @@ class KGEngine:
                  idempotency_key: str | None = None) -> dict:
         """Validate an extraction payload at the boundary and write accepted/demoted items.
 
-        `existing_nodes` is the canon baseline used for dedup + rate-limit seeding; it defaults to a
-        fresh parse (every existing call site is unchanged). The headless backend threads an
-        incrementally-maintained baseline so it doesn't re-parse the entire canon once per section
-        (backend-1/server-16).
+        `existing_nodes` is the canon baseline used for dedup + rate-limit seeding; it defaults to the
+        signature-cached parse in `_canon_baseline` (a full parse only when the canon dir actually
+        changed out-of-band). The headless backend threads its own incrementally-maintained baseline
+        so it doesn't re-parse the entire canon once per section (backend-1/server-16).
 
         **Idempotency (a lost response is harmless).** The response always carries a deterministic
         `receipt` derived from the payload (`_payload_receipt`). If `idempotency_key` is supplied and was
@@ -627,7 +669,9 @@ class KGEngine:
         # span verification, and store the original in the canon (§1.9).
         restore = self._restore_fn()
         if existing_nodes is None:
-            existing_nodes = self.canon.all_nodes()  # read once; derive edges + node baseline from it
+            # cached parse keyed on the canon dir signature (see _canon_baseline) — a wave of
+            # kg_write calls re-parses only the notes each write touched, not the whole canon.
+            existing_nodes = list(self._canon_baseline().values())
         existing_edges = [e for n in existing_nodes for e in n.edges]
         results = validate_payload(payload, pack=self.pack, source_text=self.source_text(),
                                    sources=self.source_set(),
@@ -653,6 +697,12 @@ class KGEngine:
             for d in persisted:
                 summary[d] = 0
             written = []
+        else:
+            # keep the canon-baseline cache warm: fold the just-written notes back in (their exact
+            # post-merge state) so the NEXT kg_write skips the full canon re-parse. A rollback restored
+            # files (mtimes moved), so its stale cache self-invalidates via the signature instead.
+            if written:
+                self._refresh_baseline(written)
         out = {
             "dispositions": summary,
             "details": [{"kind": r.kind, "id": getattr(r.item, "id", None), "disposition": r.disposition.value,
@@ -1377,8 +1427,9 @@ class KGEngine:
                     f"divergence.dpp advisory ordering unavailable ({e}); donor ordering kept"
         # Echo projection_degraded like the sibling reads so a caller can tell "no candidates because the
         # graph is genuinely empty" from "no candidates because projection failed/was contended"
-        # (review: generative-reads-omit-degraded-flag).
-        return self._with_degraded(payload)
+        # (review: generative-reads-omit-degraded-flag). Scrubbed like the sibling reads: candidate
+        # `label`/`rationale` strings embed canon labels (§1.9, review-r4: egress-label-gap).
+        return self._with_degraded(self._scrub_egress(payload))
 
     def _second_graph(self, path: str):
         """Load a SECOND construction's graph.json into a NetworkX graph (raises on failure)."""
@@ -1509,7 +1560,12 @@ class KGEngine:
     # extraction lives in the canon span — and must be re-scrubbed on the READ path before it crosses back
     # to the model. Structural fields (ids/relation/type/axes) are deliberately excluded so referential
     # integrity is preserved (review: reads-return-canon-spans-unscrubbed).
-    _EGRESS_TEXT_KEYS = frozenset({"span", "notes", "note", "body", "support_note"})
+    # `label` is included: it is extracted free text like the body, and identity lives in the slug id
+    # (which stays untouched), so scrubbing it costs no referential integrity. `question` (kg_agenda)
+    # and `rationale` (kg_generate candidates) are derived FROM labels, so they must be covered too or
+    # the same secret round-trips through a differently-named field (review-r4: egress-label-gap).
+    _EGRESS_TEXT_KEYS = frozenset({"span", "notes", "note", "body", "support_note",
+                                   "label", "question", "rationale"})
 
     def _scrub_egress(self, obj):
         """Re-run the §1.9 egress scrub over the free-text fields of a read result before it returns to
@@ -1693,7 +1749,8 @@ class KGEngine:
         return self._with_degraded(self._scrub_egress(self._proj.kg_context(query, budget=budget)))
 
     def kg_agenda(self, *, limit: int = 5) -> dict:
-        return self._with_degraded(self._proj.kg_agenda(limit=limit))
+        # scrubbed like the sibling reads: the agenda's question strings embed canon labels (§1.9)
+        return self._with_degraded(self._scrub_egress(self._proj.kg_agenda(limit=limit)))
 
     def kg_export(self, kind: str = "all") -> dict:
         """Render the human-facing artifacts (R1): a self-contained `graph.html` + `GRAPH_REPORT.md` under
@@ -1722,7 +1779,10 @@ def build_engine_from_env(*, project=None, data=None, source=None, pack=None) ->
     _env = _clean_env
     project = project or _env("KG_PROJECT_DIR") or _env("CLAUDE_PROJECT_DIR") or os.getcwd()
     data = data or _env("KG_DATA")
-    opt = lambda k, d=None: (os.environ.get(f"CLAUDE_PLUGIN_OPTION_{k}") or "").strip() or d  # noqa: E731
+    # Route the CLAUDE_PLUGIN_OPTION_* reads through the same ${...}-placeholder filter as every other
+    # env read (_clean_env): an unsubstituted `${user_config.*}` literal must read as unset here too,
+    # not as a real sensitivity/metrics/source value (review-r4: opt-skips-placeholder-filter).
+    opt = lambda k, d=None: _clean_env(f"CLAUDE_PLUGIN_OPTION_{k}") or d  # noqa: E731
     src = source or opt("SOURCE_PATH") or _env("KG_SOURCE_PATH")
     if not src:
         # documented default: build/ground against the bundled example when nothing is configured

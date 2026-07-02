@@ -1,6 +1,6 @@
 # Burgess
 
-![bugress-with-fossils.png](images/burgess-with-fossils.png)
+![burgess-with-fossils.png](images/burgess-with-fossils.png)
 
 **The full creative cycle in one Claude Code plugin: diverge without collapsing to the mean, converge without believing your own ideas.**
 
@@ -88,7 +88,7 @@ In the spirit of both donors, honestly:
 ## Tests
 
 <!-- test-count:begin -->
-The suite currently reports: **1000 passed, 2 skipped** (`uv run --extra dev pytest tests/`).
+The suite currently reports: **1011 passed, 2 skipped** (`uv run --extra dev pytest tests/`).
 <!-- test-count:end -->
 
 This line is generated from pytest output, never hand-written. Run it yourself:

@@ -33,12 +33,23 @@ def _load_backend():
         from kg_engine import backend
         return backend
     except Exception:
+        # Install the stub ONLY for the duration of the import, then restore sys.modules: leaving it
+        # registered would poison `kg_engine.server` for every later test in the session (review-r4:
+        # sys-modules-stub-leak). The returned backend module keeps its stub-bound references —
+        # unavoidable in an env where the real server can't import — but the registry stays clean.
         stub = types.ModuleType("kg_engine.server")
         stub.KGEngine = object
         stub.build_engine_from_env = lambda **k: None
+        prior = sys.modules.get("kg_engine.server")
         sys.modules["kg_engine.server"] = stub
-        from kg_engine import backend
-        return backend
+        try:
+            from kg_engine import backend
+            return backend
+        finally:
+            if prior is not None:
+                sys.modules["kg_engine.server"] = prior
+            else:
+                sys.modules.pop("kg_engine.server", None)
 
 
 # --- #1 f4_probe on a corrupt json exits cleanly -----------------------------
