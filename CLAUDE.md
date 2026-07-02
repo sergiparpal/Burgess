@@ -1,0 +1,81 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+Burgess is a Claude Code **plugin** fusing two engines around one trust boundary: a **convergence** engine (grounded knowledge graph extracted from a source document) and a **divergence** engine (MAP-Elites/DPP ideation). The design razor that resolves disputes here: **embeddings measure dispersion, never truth.**
+
+## Commands
+
+```bash
+uv sync --extra dev                  # install (or: pip install -e ".[dev]"; CI uses ".[dev,backend]")
+uv run pytest tests/                 # full suite (pyproject sets -q; ~1000 tests, no network needed)
+uv run pytest tests/test_grounding.py::test_name   # single test
+uv run pytest -m "not selftest"      # faster loop (skips divergence selftest e2e) — run the FULL suite before committing
+```
+
+Other gates CI runs (all from repo root):
+
+```bash
+python -m kg_engine.pack validate pack/pack.yaml examples/source.md   # pack ↔ source coverage
+python -m kg_engine.harness agreement|specificity|ideation            # eval harness CLIs
+python scripts/validate_plugin.py    # manifest/component structural check (enforces plugin.json version == kg_engine.__version__)
+claude plugin validate ./ --strict   # real plugin validator (best-effort in CI)
+python scripts/check_donors_clean.py # donor pin gate — see "Donors" below; installed as local pre-commit hook
+```
+
+Dev extras: `python -m kg_engine.divergence <init-project|ingest|recall|remember|parents|metrics|selftest|import-cambrian>` (divergence CLI, no MCP needed); `python -m kg_engine.backend` (headless API extraction; needs the `backend` extra). Run the plugin live with `claude --plugin-dir /path/to/Burgess` — the MCP server refuses to start until the required `source_path` userConfig is set.
+
+Notes:
+- **No linter/formatter is configured.** pytest is the only gate.
+- `uv.lock` is deliberately **gitignored** (per-machine, built by provisioning).
+- Node ≥ 20 is needed for the launcher tests (`tests/test_launchers.py`); without it they skip silently.
+- The test count in README.md between `<!-- test-count:begin/end -->` is **generated from pytest output** — regenerate it when the count changes, never hand-edit it.
+
+## Architecture
+
+Two layers, one boundary:
+
+1. **Deterministic Python engine** — `scripts/kg_engine/`. Exposed as the `burgess` MCP server (27 tools, namespaced `mcp__plugin_burgess_burgess__*`). `server.py` is the KGEngine facade + FastMCP tool surface = the trust boundary. The engine is **never installed**: it resolves via `PYTHONPATH=<repo>/scripts` (see `.mcp.json`), so engine source edits need no rebuild; the venv (built by `scripts/bootstrap.py`, triggered by the SessionStart hook, dev fallback `<repo>/.venv`) holds only dependencies.
+2. **Language layer** — 9 slash commands (`commands/kg-*.md`), 6 subagents (`agents/`: extractor, grounder, adversarial-grounder, generator, annotator, evaluator), the operating-guide skill (`skills/burgess/SKILL.md` + on-demand `references/`). LLM work happens ONLY here; agents hand structured JSON back across the MCP boundary. The engine stays rule-bound.
+
+`scripts/launch_server.mjs` supervises the Python engine (cold-start venv self-heal, restart policy); `hooks/precontext.mjs` (PreToolUse on Grep/Glob/Read) injects grounded graph context, fails silent.
+
+### Convergence spine (canon vs derived)
+
+- **Canon** = source of truth: one human-editable Markdown file per node at `<project>/canon/<id>.md` (YAML frontmatter; directed edges live in the source node's `edges:` block). Carries the grounding state.
+- **Derived** = disposable projection (`$CLAUDE_PLUGIN_DATA/derived/{graph.json,index.sqlite}`, built by `projector.py`). Contains nothing the canon does not; never hand-edit — reproject.
+- **Three orthogonal axes, never collapsed to one scalar**: `provenance` (span-present|inferred|hypothesized), `authored_by` (deterministic|agent|human), `epistemic_state` (unverified|grounded|rejected|failed|obsolete).
+- **Write path**: `kg_write` → `boundary.py` validation → dispositions `ACCEPTED` / `DEMOTED` / `QUARANTINED` (undeclared pack type) / `REJECTED`. Every non-deterministic edge must carry a **verbatim** source span (span-present); a payload asserting a verdict or human/deterministic authorship is DEMOTED (never-forge-a-verdict).
+- **Verdict monopoly**: only `kg_ground` sets epistemic states; `reconciler.py` re-quarantines out-of-band verdict edits. `rejected`/`failed` edges are permanent negative memory — never pruned, surfaced in `kg_context` falsification counters.
+- **Domain pack**: `pack/pack.yaml` declares the node/edge type vocabulary (plus an optional `divergence:` config section); templates in `pack/domains/`.
+
+### Divergence engine
+
+`scripts/kg_engine/divergence/` — model2vec embedder (deterministic hash embedder in tests/offline), MAP-Elites archive, k-NN novelty, DPP slates, anti-collapse monitor. Constraints, all test-enforced in `tests/fusion/`:
+
+- **Import firewall**: nothing under `divergence/` can set or upgrade an epistemic state.
+- **Advisory ceiling**: geometry (DPP order, novelty, cliché distance) affects what is proposed and in what order, never what is true — grounding output is snapshot-tested bit-identical with `divergence.dpp` on vs off.
+- **Ephemerality**: archives live under project-local `.kg/diverge/` and die with the session; only pins/discards/comparisons persist. Pins enter the graph ONLY via the propose lane (`kg_propose`/`kg_diverge_materialize`) as `provenance=hypothesized, epistemic_state=unverified` — the next `/kg-ground` is the filter.
+- **Graceful degradation**: every `kg_*` graph tool works with divergence deps blocked.
+
+### Workflow the commands implement
+
+build → ground → generate → ground → query → eval → experiment. Generation is offensive (emits into the `hypothesized` lane, never gates on a metric); grounding is the only defensive filter and the only verdict path.
+
+### Tests
+
+`tests/` = vendored convergence suite (files named `test_fix_*`, `test_rfix_*`, `test_review_*` pin regressions from past reviews — keep them green); `tests/fusion/` = the eleven fusion invariants I1–I11; `tests/fusion/divergence/` = ported donor suite. `tests/conftest.py` provides a git-backed temp canon `vault`, a configured `engine` (KGEngine), and the real `pack`.
+
+## Donors (read-only)
+
+Burgess was fused from two pinned donor repos expected as siblings: `../Sproutgraph` @ `17c4066` and `../Cambrian` @ `a2adfa1` (`scripts/donor_pins.json`). Donors are **never modified** — `scripts/check_donors_clean.py` (invariant I11) must pass before every commit.
+
+## Conventions and gotchas
+
+- Comments and docs cite plan sections (`§1.5`, `§2.2`) and invariant/decision IDs (`I1`–`I11`, `D1`–`D5`). The decision record lives in `FUSION_PLAN.md` and `docs/fusion/` (DECISIONS.md, PLAN_STATE.md, EXPERIMENT.md, ATTRIBUTION.md) — consult it before changing invariant-adjacent behavior; code comments here carry rationale, keep that density when editing.
+- SKILL.md mentions an `ARCHITECTURE.md`; that file does not exist in this repo — the engine source is the authority. When in doubt about a field or symbol, grep `scripts/kg_engine` rather than guessing.
+- Runtime/session state at the project root (`.kg/`, `.kg-ground-audit.jsonl*`, `.kg-reconcile-state.json`, `derived/`) is gitignored engine state, never canon.
+- `canon/*.md` routes through the `kgcanon` semantic merge driver (`.gitattributes`); activation is an opt-in `git config` per clone (see the comment in `.gitattributes`).
+- Engine env contract (`.mcp.json`): `KG_PROJECT_DIR`, `KG_DATA`, `KG_PACK_PATH`, `KG_SOURCE_PATH`; `KG_ENGINE_VENV` overrides the venv; divergence knobs are `KG_DIVERGE_*`; the optional lightrag experiment arm needs the `lightrag` extra + `KG_LIGHTRAG=1` + `OPENAI_API_KEY`.
