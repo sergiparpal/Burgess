@@ -27,3 +27,19 @@ Burgess is a fusion of two MIT-licensed donor plugins by the same author. Both d
 | `.gitattributes`, `.github/workflows/ci.yml`, `examples/source.md` | same paths | `.gitattributes` merge-driver name unchanged (`kgcanon`); CI identical (it is donor-agnostic) |
 
 Not vendored (donor-specific): `README.md`, `CHANGELOG.md`, `CLAUDE.md`, `ARCHITECTURE.md`, `PROGRESS.md`, `images/`, `LICENSE` (Burgess has its own MIT), `.claude/settings.local.json` (untracked donor-local), `uv.lock` (untracked in donor by design — generated per machine).
+
+### Stage 2 — Cambrian divergence engine (all from Cambrian @ `a2adfa1`, copied via `git archive`)
+
+| Burgess path | Donor path | Adaptations |
+|---|---|---|
+| `scripts/kg_engine/divergence/*.py` (15 modules) | `skills/ideate/scripts/cambrian_engine/*.py` | package rename `cambrian_engine` → `kg_engine.divergence`; env prefix `CAMBRIAN_*` → `KG_DIVERGE_*` (incl. `KG_DIVERGE_EMBED_API*`); identity prose. **All algorithmic constants preserved verbatim** (I6/I7): judge weight `QUALITY_WEIGHT=0.3` (`pipeline.py`), fitness clip `lo=0.7, hi=1.3` (`diversity.bounded_quality`), monitor thresholds 0.55/0.50/0.15/0.80, k-NN k=5, ref cap 500, DPP pool 200, open niches 24×2 freeze, dedup taus, embedder id `minishlab/potion-multilingual-128M` — drift-guarded by ported `test_engine_config.py::test_defaults_match_module_constants`. |
+| `scripts/kg_engine/divergence/state.py` | `cambrian_engine/state.py` | **transform (plan §3.2 + I10):** base dir `~/.cambrian` → project-local `<project>/.kg/diverge` (env `KG_DIVERGE_HOME` override); geometry files (archive/candidates/embeddings/mech_embeddings/open_nicher) moved into the session-ephemeral `session/` zone; new `session.json` + `begin_session()` (new id ⇒ wipe geometry + drop geometry-coupled meta series; pins/discards/comparisons/axes survive). |
+| `scripts/kg_engine/divergence/pipeline.py` | `cambrian_engine/pipeline.py` | `init_project` gains `session=` (auto-generates a fresh id when omitted) and reports `session_id`/`new_session`. |
+| `scripts/kg_engine/divergence/embed.py` | `cambrian_engine/embed.py` | I9 hardening: `model2vec` import + `from_pretrained` wrapped in `ConfigError` with actionable messages (hash fallback, provisioning pointer, "kg_* unaffected"); model artifact cached under `$KG_DATA/models` via `HF_HOME` when unset. |
+| `scripts/kg_engine/divergence/config.py` | `cambrian_engine/config.py` | `generic_axes_path()` resolves domain templates beside the configured pack (`KG_PACK_PATH/../domains/`) with repo-layout fallback `pack/domains/`. |
+| `pack/domains/**` (generic + _schema + 3 examples) | `skills/ideate/config/domains/**` | identity strings only; shipped as pack fragments per plan Stage 3 table. |
+| `tests/fusion/divergence/*.py` (23 files, 226 tests) | `tests/*.py` | import/env renames; `test_bootstrap.py` NOT ported (its subject, Cambrian's own provisioning chain, is not vendored — Burgess uses Sproutgraph's chain per plan §3.2, deps extended); `test_init_reset.py` adapted to the session contract (re-init tests pass an explicit resume `session=`; new `test_new_session_wipes_geometry_keeps_pins`). |
+| `scripts/bootstrap.py` (extension) | — | `probe_divergence` soft probe added beside `probe_leidenalg` (advisory, never fails provisioning — I9). |
+| `pyproject.toml` (extension) | `skills/ideate/scripts/requirements.txt` | donor pins mirrored exactly: `numpy>=1.26,<3`, `scikit-learn>=1.4,<2`, `model2vec>=0.3,<0.9` (pyyaml already present). |
+
+Stage-2 fix in vendored Sproutgraph tests: `test_rfix_server.py` bare `from conftest import` became ambiguous with two conftests in-tree → explicit-path load of the sibling conftest (no logic change); `test_e2e_generative.py` release-gate literal `0.6.1` → `0.1.0`.

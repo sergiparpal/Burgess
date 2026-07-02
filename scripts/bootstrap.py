@@ -577,6 +577,34 @@ def probe_leidenalg(py: Path) -> None:
         )
 
 
+def probe_divergence(py: Path) -> None:
+    """Soft-probe the divergence-layer deps (numpy / scikit-learn / model2vec) — advisory only.
+
+    They are core deps in pyproject (wheel-only installs), but the divergence layer is
+    OPTIONAL at runtime (I9): every import inside kg_engine.divergence is lazy/guarded and
+    a missing dep degrades /kg-diverge with a clear error while every kg_* convergence tool
+    keeps working. So, exactly like leidenalg, a missing/blocked divergence dep must never
+    abort provisioning — this just reports which path the diverge flow will take.
+    """
+    snippet = (
+        "try:\n"
+        "    import numpy, sklearn, model2vec\n"
+        "    print('[bootstrap] divergence deps OK (numpy/sklearn/model2vec)')\n"
+        "except Exception as e:\n"
+        "    print('[bootstrap] divergence deps unavailable (' + type(e).__name__ + ': '\n"
+        "          + str(e) + '); /kg-diverge will raise a clear error until provisioned;'\n"
+        "          + ' convergence (kg_*) tools are unaffected (I9)')\n"
+    )
+    try:
+        subprocess.run([str(py), "-c", snippet], check=False, env=_engine_env())
+    except Exception as exc:  # noqa: BLE001 — an optional layer must never abort provisioning
+        print(
+            f"[bootstrap] divergence deps unavailable ({type(exc).__name__}: {exc}); "
+            "/kg-diverge degraded until provisioned; kg_* tools unaffected (I9)",
+            flush=True,
+        )
+
+
 def _has_engine_marker(venv_dir: Path) -> bool:
     """True only when the dir carries an ENGINE-specific marker that bootstrap itself writes
     (``engine-python.txt`` / ``install.stamp``) — proof that THIS provisioner built it, so
@@ -644,6 +672,7 @@ def do_install(venv_dir: Path) -> Path:
         # Optional, never fatal: report whether Leiden is loadable or the engine will fall back
         # to label propagation (SAC-blocked DLL). probe_leidenalg swallows all failures.
         probe_leidenalg(py)
+        probe_divergence(py)
     except BaseException:
         # A failed/interrupted install leaves a venv with an interpreter but a partial
         # dependency graph that the next run would silently "reuse". Remove it so the next

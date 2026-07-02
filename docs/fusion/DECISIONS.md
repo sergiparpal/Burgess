@@ -30,3 +30,12 @@ Every kickoff answer, every default applied on timeout, every judgment call. One
 - **Vendored donor CI workflow** (`.github/workflows/ci.yml`) — two vendored tests require it (`test_ci_matrix_covers_windows_and_macos`, `test_ci_test_job_sets_up_node`) and it is donor-agnostic. Keeping it preserves baseline parity without test adaptations.
 - **Engine pip-package name `kg-engine` kept** (not donor identity — it names the `/kg-*` engine); description + versions updated to Burgess 0.1.0 (validate_plugin enforces plugin.json ↔ `kg_engine.__version__` agreement, which caught the initial miss).
 - **uv.lock not committed** — donor convention (gitignored; provisioning locks per machine); Burgess follows it.
+
+## Stage 2 judgment calls
+
+- **Whole-engine port at Stage 2** (all 15 Cambrian modules incl. state/pipeline/selftest, not just the math listed in the stage's task): porting the full package + its 226 tests front-loads the port risk into the stage whose firewall tests exist for exactly that; Stage 3 builds only the command/skill layer on top.
+- **Env identity surface renamed like Stage 1's:** `CAMBRIAN_EMBEDDER/HOME/DEBUG/EMBED_API*` → `KG_DIVERGE_*`. Constants untouched (I6/I7, D2).
+- **Session semantics (I10):** session boundary = `init-project`'s `session` id. Omitted id ⇒ fresh auto id ⇒ geometry wiped (ephemeral by default); passing the persisted id ⇒ resume. The /kg-diverge command (Stage 3) passes one id per chat session. Durable across sessions: pins, discards, comparisons, axes snapshot, project meta identity, session.json. Ephemeral: archive, candidates, embeddings, mech_embeddings, open_nicher + geometry-coupled meta series (cycles, cos_window, novelty_window, erosion_streak, gap_log).
+- **Divergence deps are core deps with lazy guarded imports** (plan Stage 2 task 3): installed by default so /kg-diverge works out of the box; I9 enforced by guarded imports + actionable errors + `test_core_engine_works_with_divergence_deps_blocked` (full write→ground→query round-trip in a process where numpy/sklearn/model2vec imports are blocked).
+- **Domain templates live at `pack/domains/`** (pack fragments per plan §3.2/Stage 3); resolver prefers `KG_PACK_PATH/../domains` so wheel installs work, falls back to the repo layout for dev/tests.
+- **Divergence engine version = 0.1.0** (`kg_engine.divergence.__version__`) — it is Burgess's component now; lineage recorded here and in ATTRIBUTION.md.

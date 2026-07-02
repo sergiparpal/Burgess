@@ -27,6 +27,15 @@ dependencies = [
     # bootstrap verifies it via a SOFT probe (not the mandatory import set) and projector._leiden
     # degrades to label propagation when the import fails, so a SAC-blocked DLL never breaks the engine.
     "leidenalg>=0.10,<1",     # Leiden community detection (optional at runtime — see note above)
+    # Divergence engine (FUSION_PLAN Stage 2, ported from Cambrian @ a2adfa1). All three install
+    # from wheels with no build toolchain, matching the policy above. They are HARD deps so
+    # /kg-diverge works out of the box, but every import of them inside kg_engine.divergence is
+    # lazy/guarded (I9): if they are missing or the model download fails, divergence raises a
+    # clear actionable error and every convergence (kg_*) capability is untouched. Pins mirror
+    # the donor's requirements.txt exactly.
+    "numpy>=1.26,<3",         # geometry: embeddings, kernels, archives
+    "scikit-learn>=1.4,<2",   # HashingVectorizer (hash embedder) + KMeans (CVT open-nicher)
+    "model2vec>=0.3,<0.9",    # static embedder (potion-multilingual-128M), torch-free (I7)
 ]
 
 [project.optional-dependencies]

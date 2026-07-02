@@ -13,7 +13,16 @@ import kg_engine.server as srv
 from kg_engine.model import EpistemicState, Provenance, edge_id
 from kg_engine.server import KGEngine, _Watchdog
 
-from conftest import make_edge, make_node
+# Load the SIBLING conftest by explicit path: with tests/fusion/divergence/ in the
+# tree there are two conftest.py files, so the bare module name "conftest" is
+# ambiguous (whichever collected first owns sys.modules["conftest"]).
+import importlib.util as _ilu
+from pathlib import Path as _Path
+
+_spec = _ilu.spec_from_file_location("_kg_root_conftest", _Path(__file__).with_name("conftest.py"))
+_root_conftest = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_root_conftest)
+make_edge, make_node = _root_conftest.make_edge, _root_conftest.make_node
 
 
 # --- 527: idempotency receipt folds content, not just ids ------------------------------------------
