@@ -1,13 +1,32 @@
 # Fusion Plan State
 Last updated: 2026-07-02 · Session: 1
-Handoff note: <empty unless stopping mid-plan>
+Handoff note: **ALL STAGES DONE — first release built and tagged locally (v0.1.0).** The remaining steps are deliberately the human's (plan §5.4: the agent never pushes):
+
+1. **Push:** `git push origin main --follow-tags` (the annotated tag `v0.1.0` rides along). The GitHub repo `sergiparpal/Burgess` already exists (this clone's origin).
+2. **Create the GitHub Release** from tag `v0.1.0` (paste CHANGELOG.md's 0.1.0 section).
+3. **Publish to the marketplace:** the repo doubles as the marketplace source (`.claude-plugin/marketplace.json`, marketplace `sergiparpal`); once pushed, users run `/plugin marketplace add sergiparpal/Burgess` then `/plugin install burgess@sergiparpal`.
+4. **Optional interactive smoke** (the one thing that can't be scripted): `claude --plugin-dir /home/sergi/Burgess` in a scratch project, set the `source_path` userConfig when prompted, run `/kg-build` → `/kg-ground` → `/kg-query` and `/kg-diverge "any brief"` end-to-end in chat. Every underlying surface is already test-verified (1000 passed, 2 skipped; MCP handshake 27 tools; provisioning both paths).
+5. Donors remain untouched and pinned (I11 final check green); re-syncing to any future upstream Sproutgraph/Cambrian commits is a post-release decision (D5).
 
 | Stage | Status | Commit(s) | Notes |
 |---|---|---|---|
-| 0 Bootstrap + pinning | DONE | 2906cac | Donors pinned; baselines 731+2s / 240; kickoff answered live (all 6); INVENTORY complete, 8 discrepancies documented; I11 gate installed |
-| 1 Foundation vendoring | DONE | 7bf43db | 731+2 at exact baseline parity under burgess identity; provisioning smoke uv+pip; validate --strict; MCP load (20 tools, kg_ping=burgess 0.1.0); round-trip green |
-| 2 Firewall + divergence port | DONE | ad2a318 | Firewall tests first (I1-I4, 9 tests) then port: 15 modules → kg_engine/divergence, 226 tests → tests/fusion/divergence; I9+I10 suites; full suite 973 passed + 2 skipped; provisioning smoke both paths incl. divergence deps; dev CLI selftest ok |
-| 3 kg-diverge (plan: "kg-ideate") | DONE | e9c9d79 | 6 kg_diverge_* MCP tools (26 total, real-handshake verified); commands/kg-diverge.md + 3 references; pack.yaml divergence: section (one format); import-cambrian; graphless e2e green; suite 979 passed + 2 skipped |
-| 4 Materialization + neg. memory | DONE | 7579798 | kg_diverge_materialize (27 tools): pins→propose lane only, lineage in body; fate-sync folds grounding failures into discards (I8 both paths); adversarial suite 10 tests; verdict neutrality; e2e; suite 989 passed + 2 skipped |
-| 5 Generate geometry | DONE | (stage-5 commit) | divergence.dpp flag (default off) + per-call override; advisory_geometry.py (hybrid axes + hub cliché map + DPP order); I5 snapshot bit-identical (frozen clocks); perf 0.008s/0.004s per 200; suite 997 passed + 2 skipped |
-| 6 Experiment + release | TODO | | |
+| 0 Bootstrap + pinning | DONE | 2906cac | Donors pinned (Sproutgraph 17c4066, Cambrian a2adfa1); baselines 731+2s / 240+selftest; kickoff answered live (all 6); INVENTORY complete, 8 discrepancies documented; I11 gate installed |
+| 1 Foundation vendoring | DONE | 7bf43db | 731+2 at exact baseline parity under burgess identity; provisioning smoke uv+pip; validate --strict; MCP load (20 tools); engine round-trip green |
+| 2 Firewall + divergence port | DONE | ad2a318 | Firewall tests first (I1-I4) then port: 15 modules, 226 tests; I9+I10 suites; 973 passed + 2 skipped; provisioning incl. divergence deps; dev CLI selftest ok |
+| 3 kg-diverge (plan: "kg-ideate") | DONE | e9c9d79 | 6 kg_diverge_* MCP tools; commands/kg-diverge.md + 3 references; pack.yaml divergence: section (one format); import-cambrian; graphless e2e green; 979 passed + 2 skipped |
+| 4 Materialization + neg. memory | DONE | 7579798 | kg_diverge_materialize (27 tools): propose lane only; fate-sync folds grounding failures into discards (I8 both paths); adversarial suite; verdict neutrality; e2e; 989 passed + 2 skipped |
+| 5 Generate geometry | DONE | c3aa127 | divergence.dpp flag (default off) + per-call override; hybrid axes + grounded-hub cliché map + DPP order; I5 snapshot bit-identical (frozen clocks); perf 0.008s/0.004s per 200; 997 passed + 2 skipped |
+| 6 Experiment + release | DONE | df34bf3 + (release commit) | graph+generate+dpp arm + dpp_verdict; blind 12-prompt run per pre-declared D1 → ALL criteria fail → default stays OFF (EXPERIMENT.md); README/CHANGELOG/MIGRATION; README count generated from pytest (1000 passed, 2 skipped); tag v0.1.0 local |
+
+## Definition of Done (plan §16) — final check
+
+- [x] All stages DONE; every exit criterion checked off in commit bodies.
+- [x] Both donor repos bit-identical to Stage-0 state (I11 green at every commit incl. this one).
+- [x] Invariant suite I1–I10 green in the default test path; I11 gate scripted (`scripts/check_donors_clean.py`) and green.
+- [x] Stage-1 parity: vendored Sproutgraph suite green at baseline counts under the new identity.
+- [x] `/kg-diverge` delivers Cambrian parity (selftest green: variety gate, DPP-beats-first-N, null check, collapse reversal) with project-local state and no graph required.
+- [x] Pins materialize only through the propose door; adversarial suite green; verdict neutrality proven.
+- [x] `/kg-generate` geometry snapshot-proven advisory, behind `divergence.dpp`.
+- [x] `graph+generate+dpp` measured blind; D1 applied (default stays off); EXPERIMENT.md written.
+- [x] Docs: README (counts generated from pytest), CHANGELOG, docs/MIGRATION.md, ATTRIBUTION.md with donor URLs @ SHAs, LICENSE (MIT).
+- [x] Local annotated tag v0.1.0; this handoff note lists exactly what the human creates/pushes/publishes.
