@@ -1,5 +1,7 @@
 # Burgess
 
+![bugress-with-fossils.png](images/burgess-with-fossils.png)
+
 **The full creative cycle in one Claude Code plugin: diverge without collapsing to the mean, converge without believing your own ideas.**
 
 Burgess fuses two engines around one boundary:
