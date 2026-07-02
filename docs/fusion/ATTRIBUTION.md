@@ -43,3 +43,13 @@ Not vendored (donor-specific): `README.md`, `CHANGELOG.md`, `CLAUDE.md`, `ARCHIT
 | `pyproject.toml` (extension) | `skills/ideate/scripts/requirements.txt` | donor pins mirrored exactly: `numpy>=1.26,<3`, `scikit-learn>=1.4,<2`, `model2vec>=0.3,<0.9` (pyyaml already present). |
 
 Stage-2 fix in vendored Sproutgraph tests: `test_rfix_server.py` bare `from conftest import` became ambiguous with two conftests in-tree → explicit-path load of the sibling conftest (no logic change); `test_e2e_generative.py` release-gate literal `0.6.1` → `0.1.0`.
+
+### Stage 3 — /kg-diverge surface (adapting Cambrian @ `a2adfa1` chat-side material)
+
+| Burgess path | Donor path | Adaptations |
+|---|---|---|
+| `commands/kg-diverge.md` | `skills/ideate/SKILL.md` + `references/loop.md` (folded) | rewritten for the MCP surface: the interpreter-location/bootstrap dance and tmp-file hand-offs are replaced by the six `kg_diverge_*` tools taking JSON directly; the loop's semantics (cliché map O_train/O_test, mechanism-first two-layer generation, descriptor discipline, validity-only prefilter, pins/discards/A-vs-B contract, monitor reactions incl. under_generation + variety_eroding, gap summary) preserved verbatim in spirit and constants |
+| `skills/burgess/references/{operators,judge_rubric,axis_inference}.md` | `skills/ideate/references/*` | identity renames; `config/domains/` → `pack/domains/` path |
+| `scripts/kg_engine/server.py` (+6 tools) | — (new, wrapping the ported pipeline) | `kg_diverge_init/ingest/remember/parents/metrics/recall`; lazy divergence imports (I3); state home forced to `<project>/.kg/diverge` |
+| `scripts/kg_engine/divergence/importer.py` + `import-cambrian` CLI | — (new) | one-shot preference-memory importer from `~/.cambrian/<project>` (read-only on source; geometry + meta deliberately skipped and reported — I10) |
+| `pack/pack.yaml` `divergence:` section + `pack.py` shape validator + `config.resolve_axes_source`/section-unwrap | `config/domains/_schema.md` concepts | one domain-pack format: extraction vocabulary + behavior axes in one file; deep validation stays in the divergence package (I3) |

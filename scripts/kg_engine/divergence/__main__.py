@@ -68,6 +68,15 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--seed", type=int, default=0)
     sp.add_argument("--project", default="selftest")
 
+    sp = sub.add_parser(
+        "import-cambrian",
+        help="one-shot import of an old Cambrian project's preference memory "
+             "(pins/discards/comparisons) into .kg/diverge; read-only on the source",
+    )
+    sp.add_argument("--project", required=True)
+    sp.add_argument("--from", dest="source", default=None,
+                    help="old Cambrian project dir (default: ~/.cambrian/<project>)")
+
     return p
 
 
@@ -108,6 +117,16 @@ def main(argv=None) -> int:
         elif args.command == "selftest":
             report = selftest.run(
                 project=args.project, live=args.live, seed=args.seed
+            )
+            _emit(report)
+            return 0 if report.get("ok") else 1
+        elif args.command == "import-cambrian":
+            from pathlib import Path
+
+            from . import importer
+
+            report = importer.import_cambrian(
+                args.project, source=Path(args.source) if args.source else None
             )
             _emit(report)
             return 0 if report.get("ok") else 1

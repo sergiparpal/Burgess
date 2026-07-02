@@ -1942,6 +1942,95 @@ def _register(mcp, engine: KGEngine) -> None:
         derived layer, writes only its two disposable artifacts; never forges a verdict or touches the canon."""
         return engine.kg_export(kind)
 
+    # ------------------------------------------------------------------------- #
+    # Divergence surface (FUSION_PLAN Stage 3) — the /kg-diverge flow's six tools.
+    #
+    # Everything here sits BELOW the grounding boundary: these tools organize idea
+    # candidates geometrically (embed → MAP-Elites → k-NN novelty → DPP slate →
+    # anti-collapse monitor) and can never touch canon, verdicts, or the derived
+    # DB (I1–I5: embeddings measure dispersion, never truth). State is project-
+    # local and session-ephemeral (.kg/diverge, I4/I10). kg_engine.divergence is
+    # imported LAZILY inside each body so this module's import graph stays
+    # divergence-free (I3, firewall-tested) and a missing divergence dep degrades
+    # only these six tools with a clear error (I9) — never a kg_* tool.
+    # ------------------------------------------------------------------------- #
+    def _diverge_home() -> Path:
+        # The USER project (KG_PROJECT_DIR), never the plugin data dir: divergence
+        # session state is git-friendly project state, like canon — not a cache.
+        return Path(engine.project_dir) / ".kg" / "diverge"
+
+    @mcp.tool()
+    @_tool_result
+    def kg_diverge_init(project: str, axes: dict | str | None = None, seed: int = 0,
+                        session: str | None = None) -> dict:
+        """Begin (or resume) a divergence session for a brief. `project` is the brief slug — one
+        state dir per brief under .kg/diverge/. `axes` may be an inline axes spec (dict, e.g. from
+        axis inference), a path, a bundled domain-template name (e.g. "generic", "marketing"), or
+        omitted — omitted prefers the pack's `divergence:` section, else the generic template.
+        `session` follows I10: pass ONE id per chat session (e.g. a timestamp slug) — a new id wipes
+        the ephemeral geometry archive; re-passing the same id resumes it; pins/discards always
+        survive. Returns the resolved domain, session id, and state paths."""
+        from kg_engine.divergence import config as dconfig
+        from kg_engine.divergence import pipeline as dpipe
+        return dpipe.init_project(project, dconfig.resolve_axes_source(axes),
+                                  seed=seed, home=_diverge_home(), session=session)
+
+    @mcp.tool()
+    @_tool_result
+    def kg_diverge_ingest(project: str, candidates: list, axes: dict | str | None = None,
+                          seed: int = 0) -> dict:
+        """One divergence cycle: embed the generated candidates, near-dup dedup, place into the
+        MAP-Elites archive, score geometric + mechanism novelty, and select a DPP-diverse slate.
+        Each candidate: {"id", "text", "descriptor" {axis: value, ...}, optional "fitness" (the
+        judge's bounded validity multiplier), optional "genealogy" {"operator_id", "parents"}}.
+        Returns the slate (with niche coords, novelty, why-picked signals), ask_pairs for A-vs-B,
+        and the anti-collapse monitor verdict — `mon.collapsing: true` means REGENERATE with more
+        diversity pressure (advisory notice to the user, no question). Discarded ids are never
+        re-slated. Purely advisory: nothing here can create graph state or verdicts."""
+        from kg_engine.divergence import config as dconfig
+        from kg_engine.divergence import pipeline as dpipe
+        return dpipe.ingest(project, candidates, dconfig.resolve_axes_source(axes),
+                            seed=seed, home=_diverge_home())
+
+    @mcp.tool()
+    @_tool_result
+    def kg_diverge_remember(project: str, event: dict) -> dict:
+        """Record a durable preference event: {"type": "pin"|"discard"|"comparison", ...}.
+        Pins ({"type":"pin","id":...}) are strong stepping-stone signals and always future
+        parents; discards ({"type":"discard","id":...}) are NEGATIVE MEMORY — dropped from
+        every future slate and parent pool, persisted across sessions (I8); comparisons
+        ({"type":"comparison","winner":...,"loser":...}) are low-weight A-vs-B evidence.
+        Pin and discard are mutually exclusive per id (latest wins)."""
+        from kg_engine.divergence import pipeline as dpipe
+        return dpipe.remember(project, event, home=_diverge_home())
+
+    @mcp.tool()
+    @_tool_result
+    def kg_diverge_parents(project: str, k: int = 4, seed: int = 0) -> dict:
+        """Diverse parent set for the NEXT generation: DPP-sampled archive elites honoring
+        preference memory — pins always included, discards never (I8). Use these as the
+        stepping stones the next round of variation operators mutates/combines."""
+        from kg_engine.divergence import pipeline as dpipe
+        return dpipe.parents(project, k=k, seed=seed, home=_diverge_home())
+
+    @mcp.tool()
+    @_tool_result
+    def kg_diverge_metrics(project: str) -> dict:
+        """Archive health for the session: niche occupancy/entropy, novelty trend, monitor
+        calibration, open-axis (mechanism) partition status, and advisory series (variety
+        erosion, surface-vs-mechanism gap when enabled)."""
+        from kg_engine.divergence import pipeline as dpipe
+        return dpipe.metrics(project, home=_diverge_home())
+
+    @mcp.tool()
+    @_tool_result
+    def kg_diverge_recall(project: str, k: int = 10) -> dict:
+        """Preference memory for injection at session start: recent pins, discards, and
+        comparison summaries for this brief — so a resumed brief generates AWAY from what
+        the human already discarded and TOWARD what they pinned."""
+        from kg_engine.divergence import pipeline as dpipe
+        return dpipe.recall(project, k=k, home=_diverge_home())
+
 
 def _start_watchdog() -> "_Watchdog | None":
     """Construct + start the handler watchdog from KG_HANDLER_TIMEOUT (default DEFAULT_HANDLER_TIMEOUT;

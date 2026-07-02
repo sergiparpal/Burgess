@@ -6,6 +6,8 @@ import json
 
 import pytest
 
+pytestmark = pytest.mark.selftest
+
 from kg_engine.divergence import selftest
 from kg_engine.divergence.__main__ import main
 from kg_engine.divergence.selftest import MARGIN_DPP, MARGIN_MPD, MARGIN_VENDI

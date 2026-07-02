@@ -606,7 +606,27 @@ def _load_config_dict(source: Union[str, Path, Dict[str, Any]]) -> Dict[str, Any
         raise ConfigError(f"could not parse config file {path}: {exc}") from exc
     if data is None:
         raise ConfigError(f"config file {path} is empty")
+    if isinstance(data, dict):
+        data = _unwrap_divergence_section(data)
     return data
+
+
+def _unwrap_divergence_section(d: Dict[str, Any]) -> Dict[str, Any]:
+    """One domain-pack format (FUSION_PLAN Stage 3): a Burgess ``pack.yaml`` may
+    embed the behavior-axes descriptor under a ``divergence:`` key beside the
+    extraction vocabulary. When a loaded config carries that section (and is not
+    itself already a plain axes config), the section IS the divergence config;
+    the pack's ``domain`` is inherited when the section doesn't set one. The pack
+    loader (kg_engine.pack) validates only the section's shallow shape — the deep
+    validation stays HERE so nothing on the convergence path imports this package
+    (I3)."""
+    dv = d.get("divergence")
+    if isinstance(dv, dict) and dv.get("axes") and "axes" not in d:
+        merged = dict(dv)
+        if not merged.get("domain") and d.get("domain"):
+            merged["domain"] = d["domain"]
+        return merged
+    return d
 
 
 def load_axes(source: Union[str, Path, Dict[str, Any]]) -> AxesSpec:
@@ -683,3 +703,49 @@ def generic_axes_path() -> Path:
 def load_generic_axes() -> AxesSpec:
     """Load the bundled generic fallback axes."""
     return load_axes(generic_axes_path())
+
+
+def resolve_axes_source(
+    axes: Union[None, str, Path, Dict[str, Any]] = None
+) -> Union[Path, Dict[str, Any]]:
+    """Resolve the ``axes`` argument of the kg_diverge_* MCP tools to a source
+    every loader accepts.
+
+    * a dict passes through (an inferred/inline axes spec);
+    * a string/path that names an existing file (or has a yaml/json suffix)
+      is used as that file;
+    * any other string is a bundled domain-template name, resolved under
+      ``pack/domains/`` then ``pack/domains/examples/``;
+    * ``None`` prefers the configured pack (``KG_PACK_PATH``) when it embeds a
+      ``divergence:`` section — the one-domain-pack-format path — and falls
+      back to the bundled neutral ``generic.yaml``.
+    """
+    if isinstance(axes, dict):
+        return axes
+    if isinstance(axes, (str, Path)):
+        raw = str(axes).strip()
+        if raw:
+            p = Path(raw).expanduser()
+            if p.exists() or p.suffix.lower() in (".yaml", ".yml", ".json"):
+                return p
+            domains = generic_axes_path().parent
+            for cand in (domains / f"{raw}.yaml", domains / "examples" / f"{raw}.yaml"):
+                if cand.exists():
+                    return cand
+            raise ConfigError(
+                f"unknown axes source {raw!r}: not a file and not a bundled "
+                f"domain template under {domains}"
+            )
+    pack_path = os.environ.get("KG_PACK_PATH", "").strip()
+    if pack_path:
+        p = Path(pack_path)
+        if p.exists():
+            try:
+                raw_pack = yaml.safe_load(p.read_text(encoding="utf-8"))
+            except yaml.YAMLError:
+                raw_pack = None
+            if (isinstance(raw_pack, dict)
+                    and isinstance(raw_pack.get("divergence"), dict)
+                    and raw_pack["divergence"].get("axes")):
+                return p
+    return generic_axes_path()

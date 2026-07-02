@@ -56,3 +56,18 @@ specificity_seeds:
   confound: 2.1
   reconciler: 2.3
   falsification: 2.3
+
+# FUSION (Stage 3): behavior axes for the divergence side — one domain-pack format:
+# the extraction vocabulary above governs what enters the graph; this section governs
+# how /kg-diverge spreads ideas out geometrically. Deep-validated by
+# kg_engine.divergence.config (the pack loader checks only the shape, preserving I3).
+divergence:
+  unit_of_generation: idea
+  axes:
+    - {name: angle, type: categorical}        # the lens/perspective taken
+    - {name: scope, type: categorical}        # how broad or narrow the idea is
+    - {name: form, type: categorical}         # the shape/format of the output
+    - {name: boldness, type: continuous, range: [0.0, 1.0]}  # safe <-> daring
+    - {name: mechanism, type: open, primary_novelty: true}   # the core "how"; novelty carrier
+  slate_size: 6
+  candidates_per_generation: 12

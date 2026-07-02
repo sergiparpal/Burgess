@@ -63,3 +63,6 @@ packages = ["scripts/kg_engine"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+    "selftest: divergence-engine selftest-heavy e2e (runs in the default suite; deselect with -m 'not selftest' for a faster loop — stage commits always run the FULL suite)",
+]

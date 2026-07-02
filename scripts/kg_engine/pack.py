@@ -25,6 +25,13 @@ class PackContract(BaseModel):
     edge_types: list[str] = Field(min_length=1)
     glossary: dict[str, str] = Field(default_factory=dict)        # term -> definition
     specificity_seeds: dict[str, float] = Field(default_factory=dict)  # term -> IDF/specificity
+    # FUSION (Stage 3): one domain-pack format. The OPTIONAL `divergence:` section embeds the
+    # behavior-axes descriptor (axes, slate_size, candidates_per_generation, judge_rubric,
+    # engine overrides) beside the extraction vocabulary above. Only its shallow SHAPE is
+    # validated here; the deep validation lives in kg_engine.divergence.config, which reads the
+    # SAME file — keeping it there preserves the I3 firewall (this module sits on the
+    # convergence path and must never import the divergence package).
+    divergence: dict | None = None
 
     @field_validator("node_types", "edge_types")
     @classmethod
@@ -53,6 +60,19 @@ class PackContract(BaseModel):
         bad = [t for t, s in v.items() if not math.isfinite(s)]
         if bad:
             raise ValueError(f"specificity seeds must be finite numbers: {bad}")
+        return v
+
+    @field_validator("divergence")
+    @classmethod
+    def _divergence_shape(cls, v: dict | None) -> dict | None:
+        if v is None:
+            return v
+        axes = v.get("axes")
+        if not isinstance(axes, list) or not axes:
+            raise ValueError("divergence.axes must be a non-empty list of axis mappings")
+        bad = [a for a in axes if not (isinstance(a, dict) and str(a.get("name", "")).strip())]
+        if bad:
+            raise ValueError("every divergence axis needs a non-empty 'name'")
         return v
 
     @model_validator(mode="after")
