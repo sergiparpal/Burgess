@@ -155,10 +155,15 @@ def test_pack_divergence_section_is_shape_validated():
     from kg_engine.pack import PackContract
 
     base = {"domain": "d", "node_types": ["n"], "edge_types": ["e"]}
+    # a config-only section (just flags) is valid — axes are optional
+    ok = PackContract.model_validate({**base, "divergence": {"dpp": True}})
+    assert ok.divergence == {"dpp": True}
     with pytest.raises(ValidationError, match="divergence.axes"):
-        PackContract.model_validate({**base, "divergence": {"slate_size": 4}})
+        PackContract.model_validate({**base, "divergence": {"axes": []}})
     with pytest.raises(ValidationError, match="non-empty 'name'"):
         PackContract.model_validate({**base, "divergence": {"axes": [{"type": "open"}]}})
+    with pytest.raises(ValidationError, match="must be a boolean"):
+        PackContract.model_validate({**base, "divergence": {"dpp": "yes"}})
 
 
 def _tree_digest(root: Path) -> str:

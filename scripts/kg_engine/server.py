@@ -1330,12 +1330,19 @@ class KGEngine:
             return {d.get("id") for _, _, d in G.edges(data=True) if d.get("epistemic_state") in fail}
         return {e.id for e in self.canon.all_edges() if e.epistemic_state in FAILURE_STATES}
 
-    def kg_generate(self, mechanism: str = "bridge", k: int = 10, second_graph: str | None = None) -> dict:
+    def kg_generate(self, mechanism: str = "bridge", k: int = 10, second_graph: str | None = None,
+                    dpp: bool | None = None) -> dict:
         """Generate hypothesized candidates from the derived graph (PLAN Stage 3 — the generative
         engine). Projects if stale, reads precomputed ranks O(1), dispatches to the chosen mechanism(s)
         (`bridge|seed|compression|regroup|transplant|ensemble`, or `all`/`default`), and returns ranked
         candidates. **READ-ONLY** — it never writes the canon; `/kg-generate` routes the candidates
-        through the propose lane (`kg_propose`). Generate offensively; grounding judges later."""
+        through the propose lane (`kg_propose`). Generate offensively; grounding judges later.
+
+        FUSION Stage 5: when `dpp` is true (default: the pack's `divergence.dpp` flag, shipped OFF),
+        the SAME candidate set is reordered by hybrid-descriptor DPP (one semantic axis + graph-
+        structural axes, judge-bounded quality) and a `divergence_advisory` block labels the slate.
+        Purely advisory (I5): never adds/drops/mutates a candidate; grounding output is snapshot-
+        proven bit-identical flag on vs off; any advisory failure keeps the donor ordering (I9)."""
         from .generate import run_generators
         self._ensure_projected()
         G = self.projector.load_graph()
@@ -1352,12 +1359,26 @@ class KGEngine:
             note = "no second construction supplied; ensemble degraded to regroup (run /kg-perturb to supply one)"
         cands = run_generators(G, mechanism, pack=self.pack, corpus=corpus, failures=failures,
                                k=k, second_graph=G2)
+        payload = {"mechanism": mechanism, "k": int(k), "gate_on": gate_on,
+                   "count": len(cands), "candidates": [c.to_dict() for c in cands],
+                   "note": note}
+        use_dpp = dpp
+        if use_dpp is None:
+            from .advisory_geometry import pack_dpp_default
+            use_dpp = pack_dpp_default(self.pack)
+        if use_dpp and len(payload["candidates"]) > 1:
+            try:
+                from .advisory_geometry import order_candidates
+                ordered, advisory = order_candidates(payload["candidates"], G)
+                payload["candidates"] = ordered
+                payload["divergence_advisory"] = advisory
+            except Exception as e:  # noqa: BLE001 — the advisory layer must never break generation (I9)
+                payload["note"] = ((payload["note"] + "; ") if payload["note"] else "") + \
+                    f"divergence.dpp advisory ordering unavailable ({e}); donor ordering kept"
         # Echo projection_degraded like the sibling reads so a caller can tell "no candidates because the
         # graph is genuinely empty" from "no candidates because projection failed/was contended"
         # (review: generative-reads-omit-degraded-flag).
-        return self._with_degraded({"mechanism": mechanism, "k": int(k), "gate_on": gate_on,
-                                    "count": len(cands), "candidates": [c.to_dict() for c in cands],
-                                    "note": note})
+        return self._with_degraded(payload)
 
     def _second_graph(self, path: str):
         """Load a SECOND construction's graph.json into a NetworkX graph (raises on failure)."""
@@ -1849,12 +1870,16 @@ def _register(mcp, engine: KGEngine) -> None:
 
     @mcp.tool()
     @_tool_result
-    def kg_generate(mechanism: str = "bridge", k: int = 10, second_graph: str | None = None) -> dict:
+    def kg_generate(mechanism: str = "bridge", k: int = 10, second_graph: str | None = None,
+                    dpp: bool | None = None) -> dict:
         """Generate hypothesized idea candidates from the graph's structure (PLAN Stage 3). Mechanisms:
         bridge (§2/§4), seed (§3 residual), compression (§7 new nodes), regroup (§8), transplant (§5),
         ensemble (§9) — or "all"/"default". READ-ONLY: candidates are proposals (provenance=hypothesized,
-        no span); route them through kg_propose. Generate offensively; kg_ground judges later."""
-        return engine.kg_generate(mechanism=mechanism, k=k, second_graph=second_graph)
+        no span); route them through kg_propose. Generate offensively; kg_ground judges later.
+        `dpp` (FUSION Stage 5; default = the pack's `divergence.dpp` flag, shipped OFF) reorders the
+        SAME candidate set by hybrid-descriptor DPP and adds a `divergence_advisory` block with bins,
+        semantic novelty and cliché-hub distances — advisory presentation only, verdict-invariant (I5)."""
+        return engine.kg_generate(mechanism=mechanism, k=k, second_graph=second_graph, dpp=dpp)
 
     @mcp.tool()
     @_tool_result

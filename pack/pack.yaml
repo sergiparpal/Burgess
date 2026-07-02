@@ -62,6 +62,9 @@ specificity_seeds:
 # how /kg-diverge spreads ideas out geometrically. Deep-validated by
 # kg_engine.divergence.config (the pack loader checks only the shape, preserving I3).
 divergence:
+  # Advisory DPP ordering of /kg-generate candidates (FUSION Stage 5). OFF by default;
+  # the Stage-6 blind experiment's pre-declared rule (D1) decides the shipped default.
+  dpp: false
   unit_of_generation: idea
   axes:
     - {name: angle, type: categorical}        # the lens/perspective taken

@@ -67,12 +67,17 @@ class PackContract(BaseModel):
     def _divergence_shape(cls, v: dict | None) -> dict | None:
         if v is None:
             return v
-        axes = v.get("axes")
-        if not isinstance(axes, list) or not axes:
-            raise ValueError("divergence.axes must be a non-empty list of axis mappings")
-        bad = [a for a in axes if not (isinstance(a, dict) and str(a.get("name", "")).strip())]
-        if bad:
-            raise ValueError("every divergence axis needs a non-empty 'name'")
+        # A config-only section (e.g. just the `dpp` flag) is valid — axes are optional,
+        # but WHEN present they must be a well-shaped non-empty list of named mappings.
+        if "axes" in v:
+            axes = v.get("axes")
+            if not isinstance(axes, list) or not axes:
+                raise ValueError("divergence.axes must be a non-empty list of axis mappings")
+            bad = [a for a in axes if not (isinstance(a, dict) and str(a.get("name", "")).strip())]
+            if bad:
+                raise ValueError("every divergence axis needs a non-empty 'name'")
+        if "dpp" in v and not isinstance(v["dpp"], bool):
+            raise ValueError("divergence.dpp must be a boolean")
         return v
 
     @model_validator(mode="after")

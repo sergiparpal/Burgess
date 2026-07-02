@@ -13,6 +13,19 @@ is NEVER gatekept by a quality metric — every candidate is written `hypothesiz
 *existing* grounding loop (`/kg-ground`) is the filter, applied **after**. The portico that used to stand
 at the door of imagination is moved to after generation.
 
+## Advisory DPP ordering (FUSION Stage 5 — `divergence.dpp`, default off)
+
+When the pack sets `divergence: {dpp: true}` (or you pass `dpp: true` to the `kg_generate` tool),
+the SAME candidate set comes back reordered by hybrid-descriptor DPP — one semantic axis (batch
+embedding novelty) + graph-structural axes (community intra/cross, endpoint graph distance,
+grounded-mix of the neighborhood) — with a `divergence_advisory` block: per-candidate niche bins,
+semantic novelty, and distance to the graph's "center" (the top grounded hubs, the structural
+cliché map — the periphery mechanism and cliché-distance are two views of the same
+away-from-center pressure). Present candidates in that order with those labels, exactly like a
+/kg-diverge slate. It is ADVISORY ONLY (I5, snapshot-enforced): same candidates, same scores,
+bit-identical grounding downstream; if the advisory layer is unavailable the donor ordering is
+kept and `note` says why.
+
 A generated candidate enters as `provenance=hypothesized`, `epistemic_state=unverified`, **with no span**.
 It is a *proposal from a discovery mechanism*, never a text claim — stored in a lane that can never be
 mistaken for grounded content. Promotion to `grounded` happens ONLY through `kg_ground`, and only when a
