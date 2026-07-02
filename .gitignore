@@ -8,13 +8,21 @@ htmlcov/
 dist/
 build/
 
-# Virtual envs (uv.lock IS committed)
+# Virtual envs + lockfile (donor convention: uv.lock is generated per machine by provisioning)
 .venv/
+.venv-*/
 venv/
+uv.lock
 
 # Runtime / session state (never canon)
 .kg-data/
 .kg/
+.kg-session-lock*
+.kg-reconcile-state.json
+.kg-ground-audit.jsonl*
+.tmp-*
+/derived/
+**/derived/lightrag/
 *.log
 provision.log
 

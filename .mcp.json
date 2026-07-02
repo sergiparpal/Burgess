@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "burgess": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/launch_server.mjs"],
+      "env": {
+        "PYTHONPATH": "${CLAUDE_PLUGIN_ROOT}/scripts",
+        "KG_PROJECT_DIR": "${CLAUDE_PROJECT_DIR}",
+        "KG_DATA": "${CLAUDE_PLUGIN_DATA}",
+        "KG_PACK_PATH": "${CLAUDE_PLUGIN_ROOT}/pack/pack.yaml",
+        "KG_SOURCE_PATH": "${user_config.source_path}"
+      }
+    }
+  }
+}

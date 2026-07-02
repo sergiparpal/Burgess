@@ -1,11 +1,37 @@
 {
   "name": "burgess",
   "version": "0.1.0",
-  "description": "STUB (Stage 0) — Burgess fuses Sproutgraph's grounded knowledge-graph convergence engine with Cambrian's diversity-preserving divergence engine. Real manifest lands in Stage 1 (vendored from Sproutgraph and renamed).",
+  "description": "The full creative cycle in one plugin: turn a conceptual document into a rigorously-grounded, queryable knowledge graph (human-editable canon, three-axis provenance, span-present write boundary, grounding loop with memory of failures), and diverge from any brief with a geometry-driven ideation engine (MAP-Elites, k-NN novelty, DPP slates, anti-collapse monitor) that proposes into the hypothesized lane — embeddings measure dispersion, never truth.",
   "author": {
     "name": "Sergi Parpal",
     "email": "sergiparpal@gmail.com"
   },
   "license": "MIT",
-  "keywords": ["knowledge-graph", "grounding", "provenance", "creativity", "ideation", "diversity", "map-elites", "mcp"]
+  "keywords": ["knowledge-graph", "grounding", "provenance", "networkx", "mcp"],
+  "userConfig": {
+    "source_path": {
+      "type": "string",
+      "required": true,
+      "title": "Source document path",
+      "description": "Path to the source the graph is built and grounded against — a single Markdown/text file, or a directory or glob of .md/.txt files (each edge's span is verified against the specific file it came from). Markdown/text only — no PDF/media."
+    },
+    "sensitivity": {
+      "type": "string",
+      "title": "Egress sensitivity",
+      "description": "Egress scrubbing aggressiveness — one of low | medium | high (low = secrets only; medium = + structured PII; high = + person/address heuristics). Validated by the engine; unknown values fall back to medium.",
+      "default": "medium"
+    },
+    "metrics_mode": {
+      "type": "string",
+      "title": "Metrics mode",
+      "description": "One of structure_only | with_embeddings (structure_only uses graph structure as the signal; with_embeddings is currently inert — the former sqlite-vss candidate generator was removed). Validated by the engine; unknown values fall back to structure_only.",
+      "default": "structure_only"
+    },
+    "extract_wave_size": {
+      "type": "string",
+      "title": "Extraction wave size",
+      "description": "How many section-extractor subagents /kg-build launches concurrently per wave (bounded parallelism, 1–10). Higher = faster but more rate-limit/lock pressure. Default 6.",
+      "default": "6"
+    }
+  }
 }

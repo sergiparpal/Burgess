@@ -1,0 +1,29 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/provision.mjs\"",
+            "async": true,
+            "timeout": 600,
+            "statusMessage": "Provisioning the Burgess engine (one-time)…"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Grep|Glob|Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/precontext.mjs\"",
+            "timeout": 8
+          }
+        ]
+      }
+    ]
+  }
+}

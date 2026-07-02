@@ -23,3 +23,10 @@ Every kickoff answer, every default applied on timeout, every judgment call. One
 - **No `annotations` field exists on Edge/Node.** The Stage-4 "pinned annotation" rides `Edge.notes` (plus the diverge-session back-reference), per INVENTORY discrepancy 2.
 - **D1 uses the harness's own convention** (per D1's escape clause): the vendored experiment harness defines no RNG seeds — its convention is 12 fixed ideation prompts + blind shuffle/de-shuffle by the evaluator. Stage 6 measures arms over that convention; the D1 thresholds (median comparison, win-rate, noise band) apply over the 12 prompts.
 - **Materialization front door:** the donor's hypothesized-lane public entry is `kg_propose` (a thin forced-provenance wrapper over `kg_write`, server.py:675). Stage-4 materialization goes through the propose lane — this **is** the "via kg_write exclusively" requirement in donor terms.
+
+## Stage 1 judgment calls
+
+- **"Loads locally in Claude Code" verified deterministically:** `claude plugin validate ./ --strict` (the CLI's own loadability gate) + a real MCP stdio handshake through the plugin's actual launch chain (`node scripts/launch_server.mjs` with the `.mcp.json` env contract): initialize → serverInfo.name=`burgess` → tools/list = 20 tools → `kg_ping` returns name=burgess v0.1.0. An interactive `claude --plugin-dir` session is listed in the final human handoff (it requires the `source_path` userConfig prompt, which is inherently interactive).
+- **Vendored donor CI workflow** (`.github/workflows/ci.yml`) — two vendored tests require it (`test_ci_matrix_covers_windows_and_macos`, `test_ci_test_job_sets_up_node`) and it is donor-agnostic. Keeping it preserves baseline parity without test adaptations.
+- **Engine pip-package name `kg-engine` kept** (not donor identity — it names the `/kg-*` engine); description + versions updated to Burgess 0.1.0 (validate_plugin enforces plugin.json ↔ `kg_engine.__version__` agreement, which caught the initial miss).
+- **uv.lock not committed** — donor convention (gitignored; provisioning locks per machine); Burgess follows it.

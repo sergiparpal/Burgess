@@ -1,0 +1,18 @@
+{
+  "name": "sergiparpal",
+  "owner": {
+    "name": "Sergi Parpal",
+    "email": "sergiparpal@gmail.com"
+  },
+  "metadata": {
+    "description": "Sergi Parpal's Claude Code plugin marketplace."
+  },
+  "plugins": [
+    {
+      "name": "burgess",
+      "source": ".",
+      "version": "0.1.0",
+      "description": "The full creative cycle in one plugin: turn a conceptual document into a rigorously-grounded, queryable knowledge graph (human-editable canon, three-axis provenance, span-present write boundary, grounding loop with memory of failures), and diverge from any brief with a geometry-driven ideation engine (MAP-Elites, k-NN novelty, DPP slates, anti-collapse monitor) that proposes into the hypothesized lane — embeddings measure dispersion, never truth."
+    }
+  ]
+}

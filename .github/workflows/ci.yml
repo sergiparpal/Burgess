@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: engine tests + smoke
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux carries the full Python-version coverage; the cross-platform install promise
+        # (Windows / macOS, see scripts/bootstrap.py) is exercised on a single pinned 3.12 to
+        # bound matrix cost. The install/test commands below are OS-agnostic (`python -m pip`,
+        # `pytest`), so no per-OS shell branching is needed.
+        os: [ubuntu-latest]
+        python-version: ["3.10", "3.12"]
+        include:
+          - os: windows-latest
+            python-version: "3.12"
+          - os: macos-latest
+            python-version: "3.12"
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # Node is required for the launcher tests (tests/test_launchers.py) — the Node-dependent
+      # cases skip silently when `node` is absent, so without this the .mjs parse/behavior
+      # coverage would vanish with the suite still green. Pin it so the coverage is guaranteed,
+      # not an accident of the runner image.
+      - name: Set up Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+
+      - name: Install the engine + dev/backend extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,backend]"
+
+      - name: Run the full test suite (chaos, invariants, grounding, projector, hardening, backend)
+        run: pytest tests/ -q
+
+      - name: Stage 2 — pack validates against the source
+        run: python -m kg_engine.pack validate pack/pack.yaml examples/source.md
+
+      - name: Stage 7/8 — harness commands run and log (no human gate)
+        run: |
+          python -m kg_engine.harness agreement
+          python -m kg_engine.harness specificity
+          python -m kg_engine.harness ideation
+
+      - name: Manifest + component structural check
+        run: python scripts/validate_plugin.py
+
+  plugin-validate:
+    name: claude plugin validate --strict
+    runs-on: ubuntu-latest
+    # Best-effort: requires the Claude Code CLI, which may be unavailable/unauthenticated in a
+    # generic runner. The deterministic structural check in the `test` job above is the hard gate;
+    # this job surfaces the real validator when the CLI is installable.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+      - name: Validate the plugin manifest
+        run: claude plugin validate ./ --strict
