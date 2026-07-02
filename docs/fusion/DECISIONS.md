@@ -55,3 +55,8 @@ Every kickoff answer, every default applied on timeout, every judgment call. One
 - **I5 snapshot method:** clocks frozen (model/server/groundaudit `utcnow`), two identical projects, flag off vs on → identical candidate SETS; identical canonical proposals; grounding artifacts compared bit-for-bit (canon tree digest, audit-log bytes, falsification counters). All equal.
 - **Perf budget actuals (Stage 5.5):** embed(200 candidates) = **0.008s**, DPP(200) = **0.004s** on CPU with the hash embedder — budget (single-digit seconds each) met with 3 orders of magnitude of headroom; the live model2vec embedder adds one-time model load (~seconds) which the cap + I9 degradation cover.
 - **"Flag off and on" suite coverage:** the shipped default (off) governs the whole vendored suite; every on-path is exercised explicitly by tests/fusion/test_generate_geometry.py (snapshot, advisory failure, cap fallback, per-call override).
+
+## Post-release (publishing, on explicit user instruction)
+
+- **Plan Non-Goal 4 (no pushing) was overridden by the user** ("Do these steps yourself") after the local tag existed — push, GitHub Release, marketplace add + install executed by the agent; recorded here because it supersedes the plan's default, not its intent (the human decided).
+- **Required-config gating confirmed in production:** the burgess MCP server does not start while the required `source_path` userConfig is unset (the first two headless smokes proved the gate). Set at user scope to `~/.claude/burgess-demo-source.md` (a persistent copy of `examples/source.md`) so the server runs out of the box; per-project reconfiguration via `/plugin configure burgess@sergiparpal` is the intended real-use path.

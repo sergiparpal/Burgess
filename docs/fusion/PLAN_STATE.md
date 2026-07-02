@@ -1,12 +1,12 @@
 # Fusion Plan State
 Last updated: 2026-07-02 · Session: 1
-Handoff note: **ALL STAGES DONE — first release built and tagged locally (v0.1.0).** The remaining steps are deliberately the human's (plan §5.4: the agent never pushes):
+Handoff note: **ALL STAGES DONE AND PUBLISHED.** The publishing steps were originally reserved for the human (plan §5.4); the human explicitly instructed the agent to execute them, and they are complete:
 
-1. **Push:** `git push origin main --follow-tags` (the annotated tag `v0.1.0` rides along). The GitHub repo `sergiparpal/Burgess` already exists (this clone's origin).
-2. **Create the GitHub Release** from tag `v0.1.0` (paste CHANGELOG.md's 0.1.0 section).
-3. **Publish to the marketplace:** the repo doubles as the marketplace source (`.claude-plugin/marketplace.json`, marketplace `sergiparpal`); once pushed, users run `/plugin marketplace add sergiparpal/Burgess` then `/plugin install burgess@sergiparpal`.
-4. **Optional interactive smoke** (the one thing that can't be scripted): `claude --plugin-dir /home/sergi/Burgess` in a scratch project, set the `source_path` userConfig when prompted, run `/kg-build` → `/kg-ground` → `/kg-query` and `/kg-diverge "any brief"` end-to-end in chat. Every underlying surface is already test-verified (1000 passed, 2 skipped; MCP handshake 27 tools; provisioning both paths).
-5. Donors remain untouched and pinned (I11 final check green); re-syncing to any future upstream Sproutgraph/Cambrian commits is a post-release decision (D5).
+1. ✅ **Pushed:** `main` (2906cac..179fed8) + annotated tag `v0.1.0` → https://github.com/sergiparpal/Burgess
+2. ✅ **GitHub Release created:** https://github.com/sergiparpal/Burgess/releases/tag/v0.1.0 (notes from CHANGELOG 0.1.0).
+3. ✅ **Marketplace live + installed:** `claude plugin marketplace add sergiparpal/Burgess` → `claude plugin install burgess@sergiparpal` (user scope). Component inventory verified: 10 skills, 6 agents, 2 hooks, 1 MCP server (~1.5k always-on tokens).
+4. ✅ **Production smoke through the INSTALLED plugin** (real headless Claude Code sessions in a scratch project): SessionStart hook auto-provisioned the venv into the plugin data dir (divergence deps probe OK); `kg_ping` → `{version: 0.1.0, pack_loaded: true, …}`; `kg_diverge_init` → project-local `.kg/diverge/<brief>/` state with session.json + ephemeral session/ zone. Note: the MCP server correctly does NOT start until the REQUIRED `source_path` userConfig is set — it was set at user scope to `~/.claude/burgess-demo-source.md` (a copy of examples/source.md); reconfigure per project with `/plugin configure burgess@sergiparpal` for real use.
+5. Donors remain untouched and pinned (I11 green at and after every commit); re-syncing to any future upstream Sproutgraph/Cambrian commits is a post-release decision (D5).
 
 | Stage | Status | Commit(s) | Notes |
 |---|---|---|---|
