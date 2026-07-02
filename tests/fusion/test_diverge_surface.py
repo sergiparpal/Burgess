@@ -39,7 +39,8 @@ class FakeMCP:
 
 
 DIVERGE_TOOLS = {"kg_diverge_init", "kg_diverge_ingest", "kg_diverge_remember",
-                 "kg_diverge_parents", "kg_diverge_metrics", "kg_diverge_recall"}
+                 "kg_diverge_parents", "kg_diverge_metrics", "kg_diverge_recall",
+                 "kg_diverge_materialize"}
 
 
 def _round(tag: str, n: int = 6) -> list[dict]:
@@ -114,11 +115,11 @@ def test_graphless_scripted_session_end_to_end(tmp_path, monkeypatch):
     assert not (derived / "index.sqlite").exists() and not (derived / "graph.json").exists()
 
 
-def test_mcp_surface_is_twenty_six_tools(engine):
+def test_mcp_surface_is_twenty_seven_tools(engine):
     mcp = FakeMCP()
     _register(mcp, engine)
     assert DIVERGE_TOOLS <= set(mcp.tools), sorted(mcp.tools)
-    assert len(mcp.tools) == 26, sorted(mcp.tools)
+    assert len(mcp.tools) == 27, sorted(mcp.tools)
 
 
 def test_resolve_axes_source_paths(tmp_path, monkeypatch):

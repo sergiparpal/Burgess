@@ -222,6 +222,20 @@ class State:
         return self.root / "axes.json"
 
     @property
+    def materialized_path(self) -> Path:
+        """Durable ledger of pins that entered the graph (candidate_id -> graph ids).
+        Written by kg_diverge_materialize; read by the failed-fate sync that folds
+        grounding failures back into this project's discard memory (I8). Durable —
+        it maps BRIEF state to GRAPH state, and both survive the session."""
+        return self.root / "materialized.json"
+
+    def read_materialized(self) -> Dict[str, Any]:
+        return self.read_json(self.materialized_path, {}) or {}
+
+    def write_materialized(self, data: Dict[str, Any]) -> None:
+        self.write_json(self.materialized_path, data)
+
+    @property
     def session_dir(self) -> Path:
         """I10 ephemeral zone: every geometry artifact (the MAP-Elites archive and
         everything derived from embeddings) lives here and here only, so wiping one

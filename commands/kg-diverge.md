@@ -1,7 +1,7 @@
 ---
 description: Turn any creative brief into a diverse, non-cliché slate of ideas — pure divergence, no graph and no source document required. Cliché map → mechanism-first generation → engine geometry (MAP-Elites, k-NN novelty, DPP slate, anti-collapse monitor) → the user pins/discards in chat. Pinned ideas can later be materialized into the hypothesized lane.
 argument-hint: "<brief> [domain-template]"
-allowed-tools: Read, mcp__plugin_burgess_burgess__kg_diverge_init, mcp__plugin_burgess_burgess__kg_diverge_ingest, mcp__plugin_burgess_burgess__kg_diverge_remember, mcp__plugin_burgess_burgess__kg_diverge_parents, mcp__plugin_burgess_burgess__kg_diverge_metrics, mcp__plugin_burgess_burgess__kg_diverge_recall
+allowed-tools: Read, mcp__plugin_burgess_burgess__kg_diverge_init, mcp__plugin_burgess_burgess__kg_diverge_ingest, mcp__plugin_burgess_burgess__kg_diverge_remember, mcp__plugin_burgess_burgess__kg_diverge_parents, mcp__plugin_burgess_burgess__kg_diverge_metrics, mcp__plugin_burgess_burgess__kg_diverge_recall, mcp__plugin_burgess_burgess__kg_diverge_materialize
 ---
 
 # /kg-diverge — standalone divergence (FUSION Stage 3)
@@ -125,6 +125,17 @@ it verbatim and wait; convergence tools are unaffected by design (I9).
 - **Importing old Cambrian state:** `python -m kg_engine.divergence import-cambrian
   --project <slug> [--from ~/.cambrian/<old-project>]` maps a Cambrian project's pins/
   discards/comparisons into `.kg/diverge/<slug>/` (best-effort, read-only on the source).
+- **Materializing pins (explicit, kickoff Q5).** When the user asks to carry pinned ideas
+  into the knowledge graph, call `kg_diverge_materialize(project[, candidate_ids])` — each
+  pin becomes a node in the HYPOTHESIZED lane (`provenance=hypothesized`,
+  `epistemic_state=unverified`, full `[diverge]` lineage in the body), routed exclusively
+  through the propose door. Nothing enters the graph implicitly: only on the user's word,
+  only pins, only during a session that still holds the idea's record (I10 — a stale pin is
+  reported `skipped`; re-ingest it first). No source in the project? The ideas simply WAIT
+  in the lane. Optional `edges` link materialized ideas to existing nodes (same boundary:
+  forged verdicts stripped, text claims refused). Materialized pins may be ground FIRST by
+  /kg-ground (priority is ordering only — verdict-neutral by test). If grounding later FAILS
+  a materialized idea, the next `kg_diverge_init`/`recall` folds it into this brief's
+  discards automatically (unified negative memory, I8) and tells you.
 - Everything the engine computes is **advisory ordering** — embeddings measure dispersion,
-  never truth (FUSION invariant I5). Materializing pins into the graph is a separate,
-  explicit step (see /kg-generate and, from Stage 4 on, the pin-materialization flow).
+  never truth (FUSION invariant I5).

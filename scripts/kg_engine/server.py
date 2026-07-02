@@ -32,10 +32,12 @@ from .model import (
     Disposition,
     Edge,
     EpistemicState,
+    FAILURE_STATES,
     GROUNDABLE_STATES,
     Node,
     Provenance,
     UNDECLARED_TYPE,
+    edge_id,
     normalize_text,
     slug,
     utcnow,
@@ -1972,8 +1974,14 @@ def _register(mcp, engine: KGEngine) -> None:
         survive. Returns the resolved domain, session id, and state paths."""
         from kg_engine.divergence import config as dconfig
         from kg_engine.divergence import pipeline as dpipe
-        return dpipe.init_project(project, dconfig.resolve_axes_source(axes),
-                                  seed=seed, home=_diverge_home(), session=session)
+        out = dpipe.init_project(project, dconfig.resolve_axes_source(axes),
+                                 seed=seed, home=_diverge_home(), session=session)
+        # Unified negative memory (I8): fold grounding failures of previously
+        # materialized pins into this brief's discards before the round starts.
+        fates = _sync_materialized_fates(project)
+        if fates:
+            out["materialized_failures_discarded"] = fates
+        return out
 
     @mcp.tool()
     @_tool_result
@@ -2027,9 +2035,170 @@ def _register(mcp, engine: KGEngine) -> None:
     def kg_diverge_recall(project: str, k: int = 10) -> dict:
         """Preference memory for injection at session start: recent pins, discards, and
         comparison summaries for this brief — so a resumed brief generates AWAY from what
-        the human already discarded and TOWARD what they pinned."""
+        the human already discarded and TOWARD what they pinned. Also syncs the fate of
+        previously materialized pins: one whose graph item was FAILED/REJECTED by grounding
+        joins this brief's discards (unified negative memory, I8)."""
         from kg_engine.divergence import pipeline as dpipe
-        return dpipe.recall(project, k=k, home=_diverge_home())
+        out = dpipe.recall(project, k=k, home=_diverge_home())
+        fates = _sync_materialized_fates(project)
+        if fates:
+            out["materialized_failures_discarded"] = fates
+        return out
+
+    def _sync_materialized_fates(project: str) -> list:
+        """Unified negative memory (FUSION Stage 4, I8): grounding failures flow BACK
+        into the brief's discard store. For every materialized pin, read the CURRENT
+        epistemic state of its graph items from canon (reads only — verdicts remain
+        kg_ground's monopoly); any candidate whose node/edge landed in a FAILURE state
+        is added to the discards for this brief, so no future slate or parent pool
+        ever re-proposes it. Idempotent; fates are stamped in materialized.json."""
+        from kg_engine.divergence.session import Session as _DSession
+
+        sess = _DSession(project, home=_diverge_home())
+        state = sess.state
+        ledger = state.read_materialized()
+        if not ledger:
+            return []
+        try:
+            domain = sess.domain
+        except Exception:  # no axes snapshot yet — nothing to sync into
+            return []
+        newly_discarded: list = []
+        changed = False
+        for cid, entry in ledger.items():
+            if cid == "_edges":
+                continue  # extra edges with no candidate mapping: nothing to discard
+            if entry.get("fate") in ("failed", "rejected"):
+                continue  # already folded into discards
+            failed_state = None
+            for node_id in entry.get("nodes", ()):
+                try:
+                    node = engine.canon.read_node(node_id)
+                except FileNotFoundError:
+                    continue
+                if node and node.epistemic_state in FAILURE_STATES:
+                    failed_state = node.epistemic_state.value
+            for ref in entry.get("edges", ()):
+                owner, edge_id_ = ref.get("owner"), ref.get("id")
+                try:
+                    node = engine.canon.read_node(owner) if owner else None
+                except FileNotFoundError:
+                    continue
+                for e in (node.edges if node else ()):
+                    if e.id == edge_id_ and e.epistemic_state in FAILURE_STATES:
+                        failed_state = e.epistemic_state.value
+            if failed_state:
+                state.add_discard(domain, cid)
+                entry["fate"] = failed_state
+                newly_discarded.append({"candidate": cid, "fate": failed_state})
+                changed = True
+        if changed:
+            state.write_materialized(ledger)
+        return newly_discarded
+
+    @mcp.tool()
+    @_tool_result
+    def kg_diverge_materialize(project: str, candidate_ids: list | None = None,
+                               node_type: str = "claim",
+                               edges: list | None = None) -> dict:
+        """Materialize PINNED ideas into the graph — the EXPLICIT action (nothing enters the
+        graph implicitly; kickoff Q5). Each pinned candidate becomes a node in the
+        hypothesized lane via the propose door (kg_propose -> kg_write -> boundary): it lands
+        `provenance=hypothesized, epistemic_state=unverified`, carrying its full lineage
+        ([diverge] pinned / brief / session / mechanism / operator) in the node body. No
+        source present? It simply WAITS in the lane — /kg-ground later promotes it only with
+        support (span or citation) and may fail it into permanent negative memory.
+        `candidate_ids` defaults to every pin with a live session record; a pin from an
+        ENDED session has no record left (I10) — re-ingest it first (reported as skipped).
+        Optional `edges` are extra propose-lane edges linking materialized ideas to existing
+        nodes ({source, target, relation[, notes]}); they transit the SAME boundary: claimed
+        verdicts are stripped, text-claim provenance is refused, unknown fields are rejected.
+        Pinned items may be ORDERED FIRST in the grounding queue; being pinned never changes
+        a grounding VERDICT (verdict neutrality, I5)."""
+        from kg_engine.divergence.session import Session as _DSession
+
+        sess = _DSession(project, home=_diverge_home())
+        state = sess.state
+        domain = sess.domain
+        spec = sess.spec
+        open_axis = spec.primary_axis
+        session_id = state.read_session().get("session_id", "")
+        pins = state.read_pins(domain)
+        cand_store = state.read_candidates()
+
+        wanted = [str(c) for c in candidate_ids] if candidate_ids is not None else list(pins)
+        results: list[dict] = []
+        nodes_payload: list[dict] = []
+        node_for_cid: dict[str, str] = {}
+        for cid in wanted:
+            if cid not in pins:
+                results.append({"candidate": cid, "status": "refused",
+                                "reason": "not-pinned: materialization is an explicit "
+                                          "action on PINNED ideas only"})
+                continue
+            rec = cand_store.get(cid)
+            if not rec or not rec.get("text"):
+                results.append({"candidate": cid, "status": "skipped",
+                                "reason": "no-session-record: geometry state is session-"
+                                          "ephemeral (I10) — re-ingest this idea in the "
+                                          "current session, then materialize"})
+                continue
+            text = str(rec["text"]).strip()
+            descriptor = rec.get("descriptor") or {}
+            mechanism = str(descriptor.get(open_axis.name, "")) if open_axis else ""
+            operator = str((rec.get("genealogy") or {}).get("operator_id", ""))
+            node_id = f"idea-{slug(project)}-{slug(cid)}"
+            label = text if len(text) <= 80 else text[:77] + "..."
+            lineage = (f"[diverge] pinned candidate={cid} brief={project} "
+                       f"session={session_id} mechanism={mechanism!r} operator={operator}")
+            nodes_payload.append({"id": node_id, "label": label, "node_type": node_type,
+                                  "body": f"{text}\n\n{lineage}\n"})
+            node_for_cid[cid] = node_id
+
+        edges_payload: list[dict] = []
+        for e in (edges or []):
+            e = dict(e or {})
+            # candidate_id is OUR routing key (ledger mapping), not a boundary field —
+            # the boundary's extra="forbid" would rightly reject it as schema-invalid.
+            e.pop("candidate_id", None)
+            marker = (f"[diverge] pinned brief={project} session={session_id}")
+            e["notes"] = f"{e.get('notes', '')} {marker}".strip()
+            edges_payload.append(e)
+
+        if not nodes_payload and not edges_payload:
+            return {"ok": True, "materialized": 0, "results": results}
+
+        out = engine.kg_propose({"nodes": nodes_payload, "edges": edges_payload},
+                                message="kg_diverge_materialize")
+
+        by_id = {d.get("id"): d for d in out.get("details", [])}
+        ledger = state.read_materialized()
+        for cid, node_id in node_for_cid.items():
+            detail = by_id.get(node_id, {})
+            status = detail.get("disposition", "UNKNOWN")
+            results.append({"candidate": cid, "status": status, "node": node_id,
+                            "reason": detail.get("reason", "")})
+            if status in ("ACCEPTED", "DEMOTED"):
+                entry = ledger.setdefault(cid, {"nodes": [], "edges": []})
+                if node_id not in entry["nodes"]:
+                    entry["nodes"].append(node_id)
+                entry["session"] = session_id
+        for e, raw in zip(edges_payload, edges or []):
+            eid = edge_id(e.get("source", ""), e.get("relation", ""), e.get("target", ""))
+            detail = by_id.get(eid, {})
+            if detail.get("disposition") in ("ACCEPTED", "DEMOTED"):
+                cid = str((raw or {}).get("candidate_id", "")) or "_edges"
+                entry = ledger.setdefault(cid, {"nodes": [], "edges": []})
+                ref = {"id": eid, "owner": e.get("source", "")}
+                if ref not in entry["edges"]:
+                    entry["edges"].append(ref)
+                entry["session"] = session_id
+        state.write_materialized(ledger)
+
+        return {"ok": bool(out.get("dispositions", {}).get("ACCEPTED", 0)
+                           or out.get("dispositions", {}).get("DEMOTED", 0)),
+                "materialized": sum(1 for r in results if r.get("status") in ("ACCEPTED", "DEMOTED")),
+                "results": results, "propose": out}
 
 
 def _start_watchdog() -> "_Watchdog | None":

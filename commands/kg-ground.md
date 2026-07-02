@@ -166,3 +166,12 @@ deliberate node-merge tool: it rewrites + dedups the colliding edges (negative i
   `unverified|grounded|rejected|failed`, verdict reason `vague` for generality-confound rejections (§1.6).
 - Rejected and failed edges are kept forever and reported as `falsification_counters.failed_or_rejected_edges`
   (§1.7); this command surfaces that count rather than pruning anything.
+
+## Materialized pins go first (FUSION Stage 4 — ordering only)
+
+When choosing what to ground next among `unverified` items, prefer edges/nodes whose
+notes/body carry the `[diverge] pinned` lineage marker — the human explicitly selected
+these ideas, so they earn the queue's front. This is PURELY an ordering preference:
+the verdict logic is identical for pinned and unpinned items (verdict neutrality is
+test-enforced), a pin never lowers the evidence bar, and promotion still requires
+support (span or citation) like any hypothesis.
