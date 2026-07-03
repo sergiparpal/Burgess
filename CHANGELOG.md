@@ -1,9 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.1.1 — 2026-07-03
 
-Fixes from the 2026-07 full-codebase review (review-r4; regression-tested in
-`tests/test_review_r4.py`).
+Patch release: every finding from the 2026-07 full-codebase review (review-r4;
+regression-tested in `tests/test_review_r4.py`), plus a stale-doc scrub and a
+CLAUDE.md repo guide.
 
 ### Fixed
 
