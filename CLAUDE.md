@@ -74,7 +74,7 @@ Burgess was fused from two pinned donor repos expected as siblings: `../Sproutgr
 
 ## Conventions and gotchas
 
-- Comments and docs cite plan sections (`§1.5`, `§2.2`) and invariant/decision IDs (`I1`–`I11`, `D1`–`D5`). The decision record lives in `FUSION_PLAN.md` and `docs/fusion/` (DECISIONS.md, PLAN_STATE.md, EXPERIMENT.md, ATTRIBUTION.md) — consult it before changing invariant-adjacent behavior; code comments here carry rationale, keep that density when editing.
+- Comments and docs cite plan sections (`§1.5`, `§2.2`) and invariant/decision IDs (`I1`–`I11`, `D1`–`D5`). The decision record lives in `docs/fusion/` (FUSION_PLAN.md, DECISIONS.md, PLAN_STATE.md, EXPERIMENT.md, ATTRIBUTION.md) — consult it before changing invariant-adjacent behavior; code comments here carry rationale, keep that density when editing.
 - The donor's `ARCHITECTURE.md` was deliberately not vendored (`docs/fusion/ATTRIBUTION.md`) — the engine source is the authority. When in doubt about a field or symbol, grep `scripts/kg_engine` rather than guessing.
 - Runtime/session state at the project root (`.kg/`, `.kg-ground-audit.jsonl*`, `.kg-reconcile-state.json`, `derived/`) is gitignored engine state, never canon.
 - `canon/*.md` routes through the `kgcanon` semantic merge driver (`.gitattributes`); activation is an opt-in `git config` per clone (see the comment in `.gitattributes`).
