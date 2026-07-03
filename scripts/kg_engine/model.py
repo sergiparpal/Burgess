@@ -6,6 +6,8 @@ this code is authoritative.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import unicodedata
 from dataclasses import dataclass, field, asdict
@@ -74,6 +76,11 @@ VERDICT_STATES = {EpistemicState.GROUNDED, EpistemicState.REJECTED, EpistemicSta
 GROUNDABLE_STATES = VERDICT_STATES | {EpistemicState.OBSOLETE}
 # Negative information that the projector must never prune (§1.7).
 FAILURE_STATES = {EpistemicState.REJECTED, EpistemicState.FAILED}
+# The same set in raw-string form, for the many sites that compare dict/JSON/SQL values rather than
+# Enum members (projector rows, agenda edges, export, the materialized-fate ledger, the graph.html
+# template). Single-homed here so extending the negative-memory vocabulary can never silently skip
+# a consumer that had re-typed ("failed", "rejected") by hand (review-r5).
+FAILURE_STATE_VALUES = frozenset(s.value for s in FAILURE_STATES)
 UNDECLARED_TYPE = "undeclared-type"
 # The three shared provenance axes that must be unwrapped from Enum to str on egress (§1.3). Stated
 # once so Edge.to_dict and Node.frontmatter cannot drift; a raw Enum leak here would break the
@@ -110,6 +117,15 @@ def utcnow() -> str:
 # --------------------------------------------------------------------------- text / span
 
 _WS = re.compile(r"\s+")
+# Typographic folds applied by normalize_text: curly quotes/dashes to ASCII, NBSP to a plain
+# space. One translate table (with every codepoint spelled as an escape — the old replace chain
+# ended in an INVISIBLE literal NBSP that rendered as .replace(" ", " ") in most editors).
+_TYPOGRAPHIC_FOLDS = str.maketrans({
+    "\u2018": "'", "\u2019": "'",   # curly single quotes
+    "\u201c": '"', "\u201d": '"',   # curly double quotes
+    "\u2013": "-", "\u2014": "-",   # en/em dashes
+    "\u00a0": " ",                   # no-break space
+})
 
 # Windows reserved device names (case-insensitive). A file whose base name (the part before the first
 # dot) equals one of these is a device alias and UNWRITABLE on Windows, so a node id like `con` slugging
@@ -142,12 +158,7 @@ def normalize_text(s: str) -> str:
     s = s.replace("İ", "i")
     # drop zero-width / format controls (Cf) that are invisible but break a substring match
     s = "".join(ch for ch in s if unicodedata.category(ch) != "Cf")
-    s = (
-        s.replace("‘", "'").replace("’", "'")
-        .replace("“", '"').replace("”", '"')
-        .replace("–", "-").replace("—", "-")
-        .replace(" ", " ")
-    )
+    s = s.translate(_TYPOGRAPHIC_FOLDS)
     return _WS.sub(" ", s).strip().casefold()
 
 
@@ -235,9 +246,6 @@ class Edge:
         self.source, self.relation, self.target = str(self.source), str(self.relation), str(self.target)
         self.id = edge_id(self.source, self.relation, self.target)
 
-    @property
-    def identity(self) -> tuple[str, str, str]:
-        return (self.source, self.relation, self.target)
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -253,7 +261,7 @@ class Edge:
         # literal string "None" by __post_init__ (str(None)). Mirroring node_from_markdown, drop the
         # None so the field default applies instead — and, for `source`, so the resolved owning-node id
         # below fills it (setdefault after the drop, so a null `source` still resolves to `source`).
-        known = {f for f in cls.__dataclass_fields__}
+        known = set(cls.__dataclass_fields__)
         kw = {k: v for k, v in d.items() if k in known and v is not None}
         if source is not None:
             kw.setdefault("source", source)
@@ -313,6 +321,19 @@ def node_to_markdown(node: Node) -> str:
     return f"---\n{fm}---\n\n{body}\n" if body else f"---\n{fm}---\n"
 
 
+def node_content_hash(node: Node) -> str:
+    """Content hash of a note EXCLUDING the created_at/updated_at timestamps — THE shared rule
+    behind both the projector's content-driven staleness gate (``_file_hash``) and the canon's
+    idempotent-no-op write detection (``_content_hash``), whose agreement is load-bearing
+    (review-r5: they were two byte-identical copies coupled only by comments). Timestamps are
+    metadata, not content: a hand-authored note that omits them gets a fresh ``utcnow()`` on every
+    parse (``Node.__post_init__``), which would churn the hash — forcing redundant reprojection on
+    every read, or an updated_at bump on a no-op re-write (review-low: timestamp staleness churn).
+    A real edge/axis/verdict change still moves the hash."""
+    fm = {k: v for k, v in node.frontmatter().items() if k not in ("created_at", "updated_at")}
+    return hashlib.sha256((json.dumps(fm, sort_keys=True) + node.body).encode()).hexdigest()
+
+
 def node_from_markdown(text: str, *, fallback_id: str | None = None) -> Node:
     # Tolerate a leading UTF-8 BOM (U+FEFF): every canon read decodes with encoding="utf-8", which
     # preserves a BOM as a leading ﻿ character, and the frontmatter regex then fails to match —
@@ -321,7 +342,7 @@ def node_from_markdown(text: str, *, fallback_id: str | None = None) -> Node:
     # failure memory with it. Stripping it here (the single parse chokepoint) fixes every caller
     # (canon, reconciler, canonmerge) at once; engine writes never emit a BOM, so this is a no-op on
     # engine-authored notes and the note is re-serialized BOM-less on its next write.
-    text = text.lstrip("﻿")
+    text = text.lstrip("\ufeff")  # escape-spelled: the BOM is invisible as a literal (review-r5)
     m = _FRONTMATTER_RE.match(text)
     if not m:
         raise ValueError("note has no YAML frontmatter")
@@ -350,7 +371,7 @@ def node_from_markdown(text: str, *, fallback_id: str | None = None) -> Node:
     # static default (incl. "prose", and the enum defaults via coerce_axes). Then inject the two values
     # that are NOT plain field defaults: the resolved `id` (resolved once above) and the pre-parsed
     # `edges` (with the malformed-entry skipping above), plus the parsed body.
-    known = {f for f in Node.__dataclass_fields__}
+    known = set(Node.__dataclass_fields__)
     fields = {k: v for k, v in fm.items() if k in known and v is not None}
     fields["id"] = resolved_id
     fields["body"] = body

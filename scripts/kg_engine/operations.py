@@ -21,9 +21,9 @@ from collections import defaultdict
 
 from .generate import regroup
 from .graphio import node_attr
-from .model import slug
+from .model import Provenance, slug
 
-HYP = "hypothesized"
+HYP = Provenance.HYPOTHESIZED.value  # the propose-lane provenance, from its enum home (review-r5)
 
 # Per-operation default fan-out knobs. server.py's kg_operate imports these (`k or ops.DEFAULT_REGROUP_K`
 # / `k or ops.DEFAULT_OPEN_POINTS`) instead of re-literalizing, so each default lives in exactly one place.
@@ -134,7 +134,7 @@ def explode_payload(G, *, target=None, k=None, label="", body=""):
 
 
 def regroup_payload(G, *, failures=None, k=DEFAULT_REGROUP_K):
-    cands = regroup(G, pack=None, corpus=None, failures=failures or set(), k=k)
+    cands = regroup(G, failures=failures or set(), k=k)
     if not cands:
         return None, "re-partition surfaced no invisible bridges"
     edges = [{"source": c.source, "target": c.target, "relation": c.relation, "provenance": HYP,

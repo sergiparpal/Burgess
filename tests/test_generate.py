@@ -49,7 +49,7 @@ def test_bridge_proposes_cross_community_nonadjacent(canon: Canon):
     edges = [("a1", "a2"), ("a2", "a3"), ("a1", "a3"),
              ("b1", "b2"), ("b2", "b3"), ("b1", "b3"), ("a1", "b1")]
     G = _ranked(canon, edges)
-    cands = gen.bridge(G, pack=None, corpus=[_UNIFORM], failures=set(), k=10)
+    cands = gen.bridge(G, failures=set(), k=10)
     assert cands
     _well_formed(cands, "bridge")
     for c in cands:
@@ -67,7 +67,7 @@ def test_seed_ranks_abnormally_connectable_above_trivial(canon: Canon):
     star = [("h", "l1"), ("h", "l2"), ("h", "l3"), ("h", "l4"), ("h", "l5")]
     k23 = [("p", "m1"), ("p", "m2"), ("p", "m3"), ("q", "m1"), ("q", "m2"), ("q", "m3")]
     G = _ranked(canon, star + k23)
-    cands = gen.seed(G, pack=None, corpus=[_UNIFORM], failures=set(), k=10)
+    cands = gen.seed(G, failures=set(), k=10)
     assert cands
     _well_formed(cands, "seed")
     top = cands[0]
@@ -89,7 +89,7 @@ def test_compression_mdl_and_specificity_screen(canon: Canon):
                        + ["## s the system idea thing notion common system idea thing"] * 15
                        + ["## s betweenness specificity reconciler falsification rare technical terms"])
     G = _ranked(canon, A + B, corpus=corpus)
-    cands = gen.compression(G, pack=None, corpus=[corpus], failures=set(), k=10)
+    cands = gen.compression(G, failures=set(), k=10)
     assert cands
     _well_formed(cands, "compression")
     for c in cands:
@@ -101,7 +101,7 @@ def test_compression_mdl_and_specificity_screen(canon: Canon):
 def test_compression_rejects_sparse_cluster_no_mdl_saving(canon: Canon):
     # a 3-node PATH (2 internal edges) is too sparse to save bits via a star -> MDL screen rejects it
     G = _ranked(canon, [("x", "y"), ("y", "z")])
-    cands = gen.compression(G, pack=None, corpus=[_UNIFORM], failures=set(), k=10)
+    cands = gen.compression(G, failures=set(), k=10)
     assert cands == []
 
 
@@ -115,7 +115,7 @@ def test_regroup_surfaces_pair_invisible_under_prior_partition(canon: Canon):
     edges = [p for p in itertools.combinations(nodes, 2) if p != ("1", "6")]
     G = _ranked(canon, edges)
     assert len({G.nodes[n].get("community") for n in nodes}) == 1     # one community at stored resolution
-    cands = gen.regroup(G, pack=None, corpus=[_UNIFORM], failures=set(), k=10)
+    cands = gen.regroup(G, failures=set(), k=10)
     assert cands
     _well_formed(cands, "regroup")
     assert {frozenset((c.source, c.target)) for c in cands} == {frozenset(("1", "6"))}
@@ -128,7 +128,7 @@ def test_regroup_short_circuits_when_repartition_fails(canon: Canon, monkeypatch
     edges = [p for p in itertools.combinations(nodes, 2) if p != ("1", "6")]
     G = _ranked(canon, edges)
     monkeypatch.setattr(gen, "_repartition", lambda *a, **k: None)
-    assert gen.regroup(G, pack=None, corpus=[_UNIFORM], failures=set(), k=10) == []
+    assert gen.regroup(G, failures=set(), k=10) == []
 
 
 # --------------------------------------------------------------------------- transplant (§5)
@@ -138,7 +138,7 @@ def test_transplant_imports_hub_pattern_into_absorptive_community(canon: Canon):
     edges = [("a1", "a2"), ("a2", "a3"), ("a1", "a3"),
              ("b1", "b2"), ("b2", "b3"), ("b1", "b3"), ("a1", "b1")]
     G = _ranked(canon, edges)
-    cands = gen.transplant(G, pack=None, corpus=[_UNIFORM], failures=set(), k=10)
+    cands = gen.transplant(G, failures=set(), k=10)
     assert cands
     _well_formed(cands, "transplant")
     for c in cands:
@@ -153,7 +153,7 @@ def test_ensemble_degrades_to_regroup_without_second_graph(canon: Canon):
     nodes = [str(i) for i in range(1, 7)]
     edges = [p for p in itertools.combinations(nodes, 2) if p != ("1", "6")]
     G = _ranked(canon, edges)
-    cands = gen.ensemble(G, pack=None, corpus=[_UNIFORM], failures=set(), k=10)
+    cands = gen.ensemble(G, failures=set(), k=10)
     assert cands
     _well_formed(cands, "ensemble")
     for c in cands:
@@ -179,7 +179,7 @@ def test_ensemble_with_second_graph_surfaces_cross_construction_bridge(canon: Ca
     p = tmp_path / "graph2.json"
     p.write_text(json.dumps(_node_link_data(g2)))
     G2 = load_second_graph(str(p))
-    cands = gen.ensemble(G, pack=None, corpus=[_UNIFORM], failures=set(), k=10, second_graph=G2)
+    cands = gen.ensemble(G, failures=set(), k=10, second_graph=G2)
     assert cands
     _well_formed(cands, "ensemble")
     assert any({c.source, c.target} == {"a", "c"} for c in cands)   # the cross-construction bridge
@@ -211,7 +211,7 @@ def test_run_generators_dedups_reversed_orientation_bridge_from_exo(canon: Canon
     p = tmp_path / "graph2.json"
     p.write_text(json.dumps(_node_link_data(g2)))
     G2 = load_second_graph(str(p))
-    out = gen.run_generators(G, mechanism="all", pack=None, corpus=[_UNIFORM], failures=set(), k=20,
+    out = gen.run_generators(G, mechanism="all", failures=set(), k=20,
                              second_graph=G2)
     bridges = [c for c in out if c.kind == "edge" and c.relation == "bridges"]
     keys = [frozenset((c.source, c.target)) for c in bridges]
@@ -230,7 +230,7 @@ def test_transplant_skips_hub_with_only_blank_relations(canon: Canon):
               key=lambda n: (float(G.nodes[n].get("degree", 0)), n))
     for _, _, data in G.out_edges(hub, data=True):
         data["relation"] = ""
-    cands = gen.transplant(G, pack=None, corpus=[_UNIFORM], failures=set(), k=10)
+    cands = gen.transplant(G, failures=set(), k=10)
     assert all(c.source != hub for c in cands)               # no candidate emitted from the blank-relation hub
     assert all(c.relation != "" for c in cands)              # never a relation='' candidate
 
@@ -258,15 +258,13 @@ def test_generators_drop_failure_memory(canon: Canon):
     edges = [("a1", "a2"), ("a2", "a3"), ("a1", "a3"),
              ("b1", "b2"), ("b2", "b3"), ("b1", "b3"), ("a1", "b1")]
     G = _ranked(canon, edges)
-    base = {frozenset((c.source, c.target)) for c in gen.bridge(G, pack=None, corpus=[_UNIFORM],
-                                                               failures=set(), k=20)}
+    base = {frozenset((c.source, c.target)) for c in gen.bridge(G, failures=set(), k=20)}
     assert frozenset(("a1", "b2")) in base or frozenset(("a2", "b1")) in base  # something to drop
     # seed the FORWARD identity of one candidate as failure memory; its reverse must drop too
     victim = next(iter(base))
     u, v = tuple(victim)
     failures = {edge_id(u, "bridges", v)}
-    after = {frozenset((c.source, c.target)) for c in gen.bridge(G, pack=None, corpus=[_UNIFORM],
-                                                                failures=failures, k=20)}
+    after = {frozenset((c.source, c.target)) for c in gen.bridge(G, failures=failures, k=20)}
     assert victim not in after  # forward OR reverse collision with failure memory -> dropped
 
 
@@ -318,7 +316,7 @@ _PERIPHERY_EDGES = [("h1", "a1"), ("h1", "a2"), ("h1", "a3"),
 
 def test_periphery_sources_from_low_degree_not_hubs(canon: Canon):
     G = _ranked(canon, _PERIPHERY_EDGES)
-    cands = gen.periphery(G, pack=None, corpus=[_UNIFORM], failures=set(), k=20)
+    cands = gen.periphery(G, failures=set(), k=20)
     assert cands
     _well_formed(cands, "periphery")
     und_adj = gen._undirected_adjacency(G)
@@ -334,12 +332,12 @@ def test_periphery_sources_from_low_degree_not_hubs(canon: Canon):
 def test_periphery_respects_failure_memory(canon: Canon):
     G = _ranked(canon, _PERIPHERY_EDGES)
     base = {frozenset((c.source, c.target))
-            for c in gen.periphery(G, pack=None, corpus=[_UNIFORM], failures=set(), k=20)}
+            for c in gen.periphery(G, failures=set(), k=20)}
     assert frozenset(("a1", "a2")) in base                          # something periphery proposes, to drop
     # seed the FORWARD identity; its reverse must be dropped too (failure memory is symmetric, §13)
     failures = {edge_id("a1", "bridges", "a2")}
     after = {frozenset((c.source, c.target))
-             for c in gen.periphery(G, pack=None, corpus=[_UNIFORM], failures=failures, k=20)}
+             for c in gen.periphery(G, failures=failures, k=20)}
     assert frozenset(("a1", "a2")) not in after
 
 
@@ -355,7 +353,7 @@ def test_periphery_specificity_controlled(canon: Canon):
                        + ["## s falsification rare technical term"])
     G = _ranked(canon, edges, corpus=corpus, labels=labels)
     assert float(G.nodes["zzz"].get("specificity", 0)) > float(G.nodes["aaa"].get("specificity", 0))
-    cands = gen.periphery(G, pack=None, corpus=[corpus], failures=set(), k=20)
+    cands = gen.periphery(G, failures=set(), k=20)
     u_cand = next(c for c in cands if c.source == "u")
     assert u_cand.target == "zzz"                                   # the specific anchor, not the vaguer 'aaa'
 
@@ -369,14 +367,13 @@ def test_periphery_in_all_set_and_readonly(canon: Canon):
     # the run_generators ladder genuinely dispatches periphery — single-mechanism dispatch exercises the
     # IDENTICAL `elif fn is periphery` branch the "all" slate uses, so a non-empty well-formed result here
     # proves periphery is wired into "all", not merely listed.
-    via_dispatch = gen.run_generators(G, mechanism="periphery", pack=None, corpus=[_UNIFORM],
-                                      failures=set(), k=20)
+    via_dispatch = gen.run_generators(G, mechanism="periphery", failures=set(), k=20)
     assert via_dispatch and all(c.mechanism == "periphery" for c in via_dispatch)
     _well_formed(via_dispatch, "periphery")
     # the full slate runs periphery too and stays well-formed + READ-ONLY. periphery's duplicates of
     # regroup/bridge pairs are correctly collapsed by the orientation-independent dedup (periphery is
     # last, so it loses ties) — that absorption is by design (generate offensively; judge later).
-    out = gen.run_generators(G, mechanism="all", pack=None, corpus=[_UNIFORM], failures=set(), k=20)
+    out = gen.run_generators(G, mechanism="all", failures=set(), k=20)
     _well_formed(out)
     assert {n.id for n in canon.all_nodes()} == before_nodes
     assert {e.id for e in canon.all_edges()} == before_edges
@@ -393,10 +390,11 @@ _CONVERGENCE_EDGES = [("a1", "a2"), ("a2", "a3"), ("a1", "a3"), ("b1", "b2"), ("
 
 
 def _proposers(G, pair, mechs=("bridge", "seed", "regroup", "transplant", "periphery")):
-    """The set of DISTINCT mechanisms that independently propose `pair` (an undirected frozenset)."""
+    """The set of DISTINCT mechanisms that independently propose `pair` (an undirected frozenset).
+    (_DISPATCH rows are (fn, lazy-structure needs) since review-r5 — unpack the fn.)"""
     return {m for m in mechs
             if any(frozenset((c.source, c.target)) == pair
-                   for c in gen._DISPATCH[m](G, pack=None, corpus=[_UNIFORM], failures=set(), k=40)
+                   for c in gen._DISPATCH[m][0](G, failures=set(), k=40)
                    if c.kind == "edge")}
 
 
@@ -405,7 +403,7 @@ def test_convergence_counts_distinct_mechanisms(canon: Canon):
     pair = frozenset(("a3", "b2"))
     proposers = _proposers(G, pair)
     assert len(proposers) >= 2, proposers                         # two distinct mechanisms agree on it
-    out = gen.run_generators(G, mechanism="all", pack=None, corpus=[_UNIFORM], failures=set(), k=40)
+    out = gen.run_generators(G, mechanism="all", failures=set(), k=40)
     surv = next(c for c in out if c.kind == "edge" and frozenset((c.source, c.target)) == pair)
     assert surv.convergence == len(proposers) >= 2                # advisory count == # distinct mechanisms
 
@@ -413,7 +411,7 @@ def test_convergence_counts_distinct_mechanisms(canon: Canon):
 def test_convergence_default_is_one(canon: Canon):
     G = _ranked(canon, _CONVERGENCE_EDGES)
     # a SINGLE-mechanism run: every surviving edge was proposed by exactly one mechanism -> convergence 1
-    out = gen.run_generators(G, mechanism="bridge", pack=None, corpus=[_UNIFORM], failures=set(), k=40)
+    out = gen.run_generators(G, mechanism="bridge", failures=set(), k=40)
     assert out
     assert all(c.convergence == 1 for c in out if c.kind == "edge")
     # and a freshly-constructed Candidate defaults to convergence 1
@@ -427,7 +425,7 @@ def test_convergence_not_inflated_by_ensemble_degrade(canon: Canon):
     pair = frozenset(("a1", "a2"))
     proposers = _proposers(G, pair)                               # {regroup, periphery} — the GENUINE two
     assert "regroup" in proposers
-    out = gen.run_generators(G, mechanism="all", pack=None, corpus=[_UNIFORM], failures=set(), k=60)
+    out = gen.run_generators(G, mechanism="all", failures=set(), k=60)
     surv = next(c for c in out if c.kind == "edge" and frozenset((c.source, c.target)) == pair)
     # the degraded-ensemble shadow of the regroup edge is folded back into regroup, so convergence is the
     # count of GENUINE distinct mechanisms — NOT len(proposers)+1 (which is what no-collapse would give).

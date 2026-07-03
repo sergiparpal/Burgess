@@ -21,6 +21,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+# The shared env-value cleaner (review-r5): KG_PACK_PATH reads here go through the same ${...}
+# placeholder filter as the engine's. Directionally legal — the I3 firewall forbids the verdict
+# path importing divergence, not divergence importing an engine leaf.
+from ..envconfig import clean_env
+
 try:  # pyyaml is a hard dependency, but keep the import error legible.
     import yaml
 except ImportError as exc:  # pragma: no cover - exercised only without deps
@@ -241,16 +246,24 @@ class EngineConfig:
     # by default: zero cost, output unchanged. Never affects selection or any gate.
     gap_probe: bool = False
 
+    def phase_for_generation(self, generation: int) -> str:
+        """``"explore"`` during the first ``explore_until_generation`` generations (0 = never),
+        else ``"refine"`` — THE one home of the phase rule (review-r5: the predicate was written
+        three times, so the weight schedule and the reported phase label could drift apart)."""
+        if self.explore_until_generation > 0 and generation < self.explore_until_generation:
+            return "explore"
+        return "refine"
+
     def ask_sim_weight_for_generation(self, generation: int) -> float:
         """Effective ask-pair similarity weight for a 0-indexed generation.
 
         Default (explore_until_generation == 0): the configured flat
-        ``ask_sim_weight`` for every generation. When explore_until_generation > 0,
-        the first that-many generations use a region-separating (explore) weight,
-        ``-abs(ask_sim_weight)``; later generations use ``ask_sim_weight`` (refine).
+        ``ask_sim_weight`` for every generation. Explore-phase generations (see
+        ``phase_for_generation``) use a region-separating weight,
+        ``-abs(ask_sim_weight)``; refine generations use ``ask_sim_weight``.
         One knob: the explore magnitude tracks the refine magnitude by design.
         """
-        if self.explore_until_generation > 0 and generation < self.explore_until_generation:
+        if self.phase_for_generation(generation) == "explore":
             return -abs(self.ask_sim_weight)
         return self.ask_sim_weight
 
@@ -474,6 +487,18 @@ class Niche:
     fitness: float = 0.0
     novelty: float = 0.0
 
+    def challenge(self, elite_id: Optional[str], fitness: float, novelty: float,
+                  coords: Dict[str, Any]) -> bool:
+        """Apply THE elite rule (review-r5: it lived as two hand-kept copies in archive.place and
+        the freeze-time rekey merge): higher fitness wins; ties break toward higher novelty. On a
+        win the challenger replaces this niche's elite (all four fields) and True is returned; on
+        a loss the niche is untouched."""
+        if (fitness > self.fitness) or (fitness == self.fitness and novelty > self.novelty):
+            self.elite_id, self.fitness, self.novelty, self.coords = (
+                elite_id, fitness, novelty, coords)
+            return True
+        return False
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "id": self.id,
@@ -498,11 +523,7 @@ class Niche:
 # Axes loading & validation
 # --------------------------------------------------------------------------- #
 def _coerce_range(value: Any, axis_name: str) -> Tuple[float, float]:
-    if (
-        not isinstance(value, (list, tuple))
-        or len(value) != 2
-        or isinstance(value, str)
-    ):
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
         raise ConfigError(
             f"axis {axis_name!r}: 'range' must be a [lo, hi] pair"
         )
@@ -611,6 +632,18 @@ def _load_config_dict(source: Union[str, Path, Dict[str, Any]]) -> Dict[str, Any
     return data
 
 
+def _divergence_axes_section(d: Any) -> "Optional[Dict[str, Any]]":
+    """The embedded ``divergence:`` axes section of a pack dict, or None — THE one predicate for
+    "this pack carries a divergence domain config" (review-r5: it was written twice, with slightly
+    different guards, in the unwrap path and in ``resolve_axes_source``)."""
+    if not isinstance(d, dict):
+        return None
+    dv = d.get("divergence")
+    if isinstance(dv, dict) and dv.get("axes"):
+        return dv
+    return None
+
+
 def _unwrap_divergence_section(d: Dict[str, Any]) -> Dict[str, Any]:
     """One domain-pack format (FUSION_PLAN Stage 3): a Burgess ``pack.yaml`` may
     embed the behavior-axes descriptor under a ``divergence:`` key beside the
@@ -620,8 +653,8 @@ def _unwrap_divergence_section(d: Dict[str, Any]) -> Dict[str, Any]:
     loader (kg_engine.pack) validates only the section's shallow shape — the deep
     validation stays HERE so nothing on the convergence path imports this package
     (I3)."""
-    dv = d.get("divergence")
-    if isinstance(dv, dict) and dv.get("axes") and "axes" not in d:
+    dv = _divergence_axes_section(d)
+    if dv is not None and "axes" not in d:
         merged = dict(dv)
         if not merged.get("domain") and d.get("domain"):
             merged["domain"] = d["domain"]
@@ -682,18 +715,20 @@ def load_axes_and_engine(
     return axes_spec_from_dict(d), EngineConfig.from_dict(d)
 
 
-def generic_axes_path() -> Path:
+def generic_axes_path(pack_path: "Union[str, Path, None]" = None) -> Path:
     """Absolute path to the bundled neutral fallback ``generic.yaml``.
 
     Domain templates ship as pack fragments under ``pack/domains/`` (FUSION_PLAN
     Stage 3: one domain-pack format). Resolution order: (1) beside the configured
-    pack — the installed plugin sets ``KG_PACK_PATH`` in .mcp.json, and a wheel
-    install has no repo layout to walk; (2) the repo/plugin-root layout for dev
-    checkouts and tests: ``<root>/pack/domains/generic.yaml``.
+    pack — an explicit ``pack_path`` (the engine's resolved pack, review-r5) wins
+    over the ``KG_PACK_PATH`` env read (now through the shared ``${...}``
+    placeholder filter), since the installed plugin sets it in .mcp.json and a
+    wheel install has no repo layout to walk; (2) the repo/plugin-root layout for
+    dev checkouts and tests: ``<root>/pack/domains/generic.yaml``.
     """
-    pack_path = os.environ.get("KG_PACK_PATH")
-    if pack_path:
-        beside_pack = Path(pack_path).resolve().parent / "domains" / "generic.yaml"
+    pack = str(pack_path) if pack_path else clean_env("KG_PACK_PATH")
+    if pack:
+        beside_pack = Path(pack).resolve().parent / "domains" / "generic.yaml"
         if beside_pack.exists():
             return beside_pack
     # config.py -> divergence -> kg_engine -> scripts -> <repo/plugin root>
@@ -706,7 +741,9 @@ def load_generic_axes() -> AxesSpec:
 
 
 def resolve_axes_source(
-    axes: Union[None, str, Path, Dict[str, Any]] = None
+    axes: Union[None, str, Path, Dict[str, Any]] = None,
+    *,
+    pack_path: "Union[str, Path, None]" = None,
 ) -> Union[Path, Dict[str, Any]]:
     """Resolve the ``axes`` argument of the kg_diverge_* MCP tools to a source
     every loader accepts.
@@ -716,9 +753,16 @@ def resolve_axes_source(
       is used as that file;
     * any other string is a bundled domain-template name, resolved under
       ``pack/domains/`` then ``pack/domains/examples/``;
-    * ``None`` prefers the configured pack (``KG_PACK_PATH``) when it embeds a
-      ``divergence:`` section — the one-domain-pack-format path — and falls
-      back to the bundled neutral ``generic.yaml``.
+    * ``None`` prefers the configured pack when it embeds a ``divergence:``
+      section — the one-domain-pack-format path — and falls back to the bundled
+      neutral ``generic.yaml``.
+
+    ``pack_path`` is the ENGINE's resolved pack, threaded in by the kg_diverge_*
+    tool bodies (review-r5): before it existed this function re-read
+    ``KG_PACK_PATH`` from env — unset in a dev launch where the server had
+    resolved ``<project>/pack/pack.yaml``, so the engine and the divergence
+    tools silently loaded DIFFERENT domain configs in one process. The env read
+    remains as the CLI fallback, now through the shared placeholder filter.
     """
     if isinstance(axes, dict):
         return axes
@@ -728,7 +772,7 @@ def resolve_axes_source(
             p = Path(raw).expanduser()
             if p.exists() or p.suffix.lower() in (".yaml", ".yml", ".json"):
                 return p
-            domains = generic_axes_path().parent
+            domains = generic_axes_path(pack_path).parent
             for cand in (domains / f"{raw}.yaml", domains / "examples" / f"{raw}.yaml"):
                 if cand.exists():
                     return cand
@@ -736,16 +780,14 @@ def resolve_axes_source(
                 f"unknown axes source {raw!r}: not a file and not a bundled "
                 f"domain template under {domains}"
             )
-    pack_path = os.environ.get("KG_PACK_PATH", "").strip()
-    if pack_path:
-        p = Path(pack_path)
+    pack = str(pack_path) if pack_path else (clean_env("KG_PACK_PATH") or "")
+    if pack:
+        p = Path(pack)
         if p.exists():
             try:
                 raw_pack = yaml.safe_load(p.read_text(encoding="utf-8"))
             except yaml.YAMLError:
                 raw_pack = None
-            if (isinstance(raw_pack, dict)
-                    and isinstance(raw_pack.get("divergence"), dict)
-                    and raw_pack["divergence"].get("axes")):
+            if _divergence_axes_section(raw_pack) is not None:
                 return p
-    return generic_axes_path()
+    return generic_axes_path(pack_path)

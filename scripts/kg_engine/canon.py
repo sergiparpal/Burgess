@@ -17,16 +17,18 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from .atomicio import _fsync_dir, atomic_write_bytes, atomic_write_text
+from .atomicio import atomic_write_bytes, atomic_write_text, fsync_dir
 from .model import (
     Edge,
     EpistemicState,
     GROUNDABLE_STATES,
     Node,
     UNDECLARED_TYPE,
+    node_content_hash,
     node_from_markdown,
     node_to_markdown,
     slug,
+    utcnow,
 )
 
 LOCK_NAME = ".kg-session-lock"
@@ -71,6 +73,10 @@ LOCK_REPLACE_RETRY_TIMEOUT = 5.0
 # Grounding audit log (kg_ground tamper-evidence). Defined here — the lowest layer that must keep it
 # out of git — and re-exported by reconciler so server/tests have one source of truth.
 GROUND_AUDIT = ".kg-ground-audit.jsonl"
+# The reconciler's mtime/size pre-filter cache — named here for the same reason as GROUND_AUDIT
+# (the cleanup/git-exclude patterns below reference it) and consumed by reconciler's default
+# state_path (review-r5: the filename was re-typed in both files).
+RECONCILE_STATE_NAME = ".kg-reconcile-state.json"
 
 
 # --------------------------------------------------------------------------- git helpers
@@ -424,7 +430,7 @@ class Canon:
         # The grounding audit log is runtime tamper-evidence, NOT canon content: it must never be
         # committed by `git add -A` nor swept by a rollback. (Even with the snapshot-scoped rollback
         # below it is untouched, but excluding it keeps it out of commits and out of `stash -u`.)
-        patterns = [LOCK_NAME, ".tmp-*", ".kg-reconcile-state.json", GROUND_AUDIT]
+        patterns = [LOCK_NAME, ".tmp-*", RECONCILE_STATE_NAME, GROUND_AUDIT]
         try:
             info.mkdir(parents=True, exist_ok=True)
             current = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
@@ -438,7 +444,11 @@ class Canon:
             pass
 
     # ---- single-writer lease (re-entrant within this process)
-    def _acquire_lock(self) -> None:
+    def acquire_lock(self) -> None:
+        """Bounded-BLOCKING writer acquire (raises RuntimeError when the vault stays held past the
+        budget). Public like its counterpart ``release_lock`` and the non-blocking
+        ``try_acquire_lock`` — three sibling modules consume this seam, so the old underscore name
+        mis-signalled "don't depend on me" (review-r5)."""
         if self._lock_depth == 0 and not self._acquire_lease_blocking():
             raise RuntimeError("canon vault is locked by another live session")
         self._lock_depth += 1
@@ -479,16 +489,20 @@ class Canon:
             time.sleep(min(backoff, deadline - now))
             backoff = min(backoff * 2, LOCK_RETRY_MAX)
 
-    def _release_lock(self) -> None:
+    def release_lock(self) -> None:
         self._lock_depth -= 1
         if self._lock_depth <= 0:
             self._lock_depth = 0
             self.lock.release()
 
+    # Back-compat aliases for the pre-review-r5 underscore names (external pins may hold them).
+    _acquire_lock = acquire_lock
+    _release_lock = release_lock
+
     def try_acquire_lock(self) -> bool:
         """Non-raising acquire for best-effort callers (the lazy projector): take the single-writer
         lease if free/ours, else return False so the caller can serve what it has instead of blocking
-        or crashing. Re-entrant within this process like _acquire_lock."""
+        or crashing. Re-entrant within this process like acquire_lock."""
         if self._lock_depth == 0:
             try:
                 if not self.lock.acquire():
@@ -641,14 +655,13 @@ class Canon:
 
     # ---- single-file atomic write
     def write_one(self, node: Node) -> None:
-        from .model import utcnow
         node.updated_at = utcnow()
-        self._acquire_lock()
+        self.acquire_lock()
         try:
             self._check_slug_collision(node)
             _atomic_write(self.node_path(node.id), node_to_markdown(node))
         finally:
-            self._release_lock()
+            self.release_lock()
 
     # ---- multi-file mutation with snapshot-restore rollback
     def write_nodes(self, nodes: list[Node], *, message: str, commit: bool = True,
@@ -662,8 +675,7 @@ class Canon:
         writes have durably landed, a git failure (unset user.name/email, a rejecting hook, index.lock
         contention) must NOT revert the already-fsynced canon — mirror kg_rename (write, then check=False
         add/commit)."""
-        repo = self.root
-        self._acquire_lock()
+        self.acquire_lock()
         try:
             snapshot = {}
             try:
@@ -675,75 +687,81 @@ class Canon:
                 for n in nodes:
                     p = self.node_path(n.id)
                     snapshot[p] = p.read_bytes() if p.exists() else None
-                from .model import utcnow
-                # Throttle the lease heartbeat: each heartbeat is a full durable lock rewrite
-                # (mkstemp+fsync+replace+dir-fsync). Lease correctness comes from the TTL + CAS
-                # acquire/reclaim, NOT cadence — refresh at most once per ttl/HEARTBEAT_REFRESHES_PER_TTL
-                # so a long batch stays comfortably fresh inside the TTL window. A sub-interval batch
-                # heartbeats once.
-                hb_interval = self.lock.ttl / HEARTBEAT_REFRESHES_PER_TTL
-                last_hb = time.monotonic()
-                self.lock.heartbeat()  # one refresh up front, then only when hb_interval has elapsed
-                for node in nodes:
-                    now_mono = time.monotonic()
-                    if (now_mono - last_hb) > hb_interval:
-                        # refresh the lease while a long batch is in flight so a concurrent session can't
-                        # judge it stale (TTL) and steal the lock mid-write, breaking single-writer.
-                        self.lock.heartbeat()
-                        last_hb = now_mono
-                    merged = self._merge_into_existing(node) if merge else node
-                    p = self.node_path(merged.id)
-                    # Idempotent no-op guard: if the note already on disk is byte-identical to what we
-                    # would write EXCEPT for created_at/updated_at, skip both the write and the
-                    # updated_at bump. Otherwise an idempotent re-run (edges all deduped, source nodes
-                    # re-written) would rewrite each note with a fresh timestamp — non-byte-stable canon
-                    # and timestamp-only commits. Compare a content hash that ignores the timestamps,
-                    # mirroring projector._file_hash (the same excluded fields).
-                    if p.exists():
-                        try:
-                            existing = node_from_markdown(
-                                p.read_text(encoding="utf-8"), fallback_id=merged.id
-                            )
-                        except Exception:  # noqa: BLE001 — unreadable existing note: fall through to write
-                            existing = None
-                        if existing is not None and self._content_hash(existing) == self._content_hash(merged):
-                            continue  # real content unchanged — leave the note (and its timestamp) as-is
-                    merged.updated_at = utcnow()
-                    _atomic_write(p, node_to_markdown(merged))
+                self._write_batch(nodes, merge)
             except Exception as e:  # noqa: BLE001 — rollback must catch everything
                 return self._rollback(str(e), snapshot)
-            # The writes have durably landed. Commit OUTSIDE the rollback try: a non-zero git exit must
-            # not revert fsynced canon (F2). check=False so a commit failure is non-fatal and never
-            # leaves content staged-but-reverted — same posture as kg_rename's success-path commit.
-            if commit and _git_ok(repo):
-                # Stage only this batch's paths (`snapshot` already knows them); `git add -A` would
-                # rescan the whole working tree per boundary batch. Still best-effort (check=False) —
-                # outside the rollback scope, must stay fail-open.
-                if snapshot:
-                    _git(repo, "add", "--", *[str(p) for p in snapshot], check=False)
-                # No --allow-empty: an idempotent/no-op batch (deduped edges, an identical re-write)
-                # would otherwise force an EMPTY commit that pollutes vault history. A no-op commit
-                # exits non-zero, which check=False already ignores harmlessly — the writes have
-                # durably landed regardless of whether the commit records anything.
-                # Scope the commit to this batch's paths too (mirror the scoped `add` above): a bare
-                # `git commit` with no pathspec would record the WHOLE staged index — including any
-                # unrelated file another process staged concurrently — into the vault history. The
-                # pathspec restricts the commit to exactly the notes this batch touched.
-                if snapshot:
-                    _git(repo, "commit", "-m", message, "--",
-                         *[str(p) for p in snapshot], check=False)
-            return RollbackInfo(False)
+            # The writes have durably landed; the commit is OUTSIDE the rollback try (F2).
+            if commit:
+                self._commit_batch(message, snapshot)
+            return RollbackInfo(rolled_back=False)
         finally:
-            self._release_lock()
+            self.release_lock()
+
+    def _write_batch(self, nodes: list[Node], merge: bool) -> None:
+        """The write half of write_nodes — everything INSIDE the rollback scope (review-r5: the
+        heartbeat cadence and merge/no-op logic were inlined between the snapshot and the commit,
+        burying the one thing that must stay obvious there: the rollback boundary).
+
+        Throttles the lease heartbeat: each heartbeat is a full durable lock rewrite
+        (mkstemp+fsync+replace+dir-fsync), and lease correctness comes from the TTL + CAS
+        acquire/reclaim, NOT cadence — so refresh at most once per ttl/HEARTBEAT_REFRESHES_PER_TTL
+        (a long batch stays comfortably fresh inside the TTL window; a sub-interval batch
+        heartbeats once)."""
+        hb_interval = self.lock.ttl / HEARTBEAT_REFRESHES_PER_TTL
+        last_hb = time.monotonic()
+        self.lock.heartbeat()  # one refresh up front, then only when hb_interval has elapsed
+        for node in nodes:
+            now_mono = time.monotonic()
+            if (now_mono - last_hb) > hb_interval:
+                # refresh the lease while a long batch is in flight so a concurrent session can't
+                # judge it stale (TTL) and steal the lock mid-write, breaking single-writer.
+                self.lock.heartbeat()
+                last_hb = now_mono
+            merged = self._merge_into_existing(node) if merge else node
+            p = self.node_path(merged.id)
+            # Idempotent no-op guard: if the note already on disk is byte-identical to what we
+            # would write EXCEPT for created_at/updated_at, skip both the write and the
+            # updated_at bump. Otherwise an idempotent re-run (edges all deduped, source nodes
+            # re-written) would rewrite each note with a fresh timestamp — non-byte-stable canon
+            # and timestamp-only commits. Compare a content hash that ignores the timestamps
+            # (model.node_content_hash — the same rule the projector's staleness gate consumes).
+            if p.exists():
+                try:
+                    existing = node_from_markdown(
+                        p.read_text(encoding="utf-8"), fallback_id=merged.id
+                    )
+                except Exception:  # noqa: BLE001 — unreadable existing note: fall through to write
+                    existing = None
+                if existing is not None and self._content_hash(existing) == self._content_hash(merged):
+                    continue  # real content unchanged — leave the note (and its timestamp) as-is
+            merged.updated_at = utcnow()
+            _atomic_write(p, node_to_markdown(merged))
+
+    def _commit_batch(self, message: str, snapshot: dict) -> None:
+        """The best-effort git tail of write_nodes, AFTER the writes durably landed: a non-zero git
+        exit (unset user.name/email, a rejecting hook, index.lock contention) must NOT revert the
+        already-fsynced canon (F2) — everything here is check=False and outside the rollback scope.
+
+        Stage only this batch's paths (`snapshot` already knows them): `git add -A` would rescan the
+        whole working tree per boundary batch. No --allow-empty: an idempotent/no-op batch (deduped
+        edges, an identical re-write) would otherwise force an EMPTY commit that pollutes vault
+        history — a no-op commit exits non-zero, which check=False ignores harmlessly. The COMMIT is
+        scoped to the same pathspec (a bare `git commit` would record the WHOLE staged index,
+        including any unrelated file another process staged concurrently)."""
+        if not (snapshot and _git_ok(self.root)):
+            return
+        paths = [str(p) for p in snapshot]
+        _git(self.root, "add", "--", *paths, check=False)
+        _git(self.root, "commit", "-m", message, "--", *paths, check=False)
 
     @staticmethod
     def _content_hash(node: Node) -> str:
-        """Content hash of a note EXCLUDING the created_at/updated_at timestamps — the same fields
-        projector._file_hash ignores. Used by write_nodes to detect an idempotent no-op re-write so it
-        does not churn the note's updated_at (and thus its bytes / git history) when nothing real
-        changed."""
-        fm = {k: v for k, v in node.frontmatter().items() if k not in ("created_at", "updated_at")}
-        return hashlib.sha256((json.dumps(fm, sort_keys=True) + node.body).encode()).hexdigest()
+        """Content hash of a note excluding timestamps — model.node_content_hash, the ONE rule this
+        and projector._file_hash both consume (review-r5: their agreement is load-bearing and used
+        to rest on two byte-identical copies). Used by write_nodes to detect an idempotent no-op
+        re-write so it does not churn the note's updated_at (and thus its bytes / git history) when
+        nothing real changed."""
+        return node_content_hash(node)
 
     def _merge_into_existing(self, node: Node) -> Node:
         """Apply the single-canonical-edge rule: merge incoming edges into an existing note."""
@@ -824,7 +842,7 @@ class Canon:
                         # (atomic_write_bytes dir-fsyncs after os.replace). Without this, a crash right
                         # after rollback can resurrect the just-deleted note's dirent, leaving a phantom
                         # node the projector treats as real — the restore branch below is already durable.
-                        _fsync_dir(p.parent)
+                        fsync_dir(p.parent)
                     else:
                         # atomic + fsynced restore, consistent with the rest of the module — a crash mid
                         # rollback must not leave a half-written note (review-low: rollback non-atomic).
@@ -833,4 +851,4 @@ class Canon:
                     restore_errors.append(f"{p.name}: {ex}")
         if restore_errors:
             error = f"{error}; rollback restore failures: {'; '.join(restore_errors)}"
-        return RollbackInfo(True, error)
+        return RollbackInfo(rolled_back=True, error=error)

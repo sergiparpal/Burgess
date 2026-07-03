@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .config import ConfigError
-from .state import State
+from .state import State, read_jsonl
 
 _GEOMETRY_FILES = ("archive.json", "candidates.json", "embeddings.json",
                    "mech_embeddings.json", "open_nicher.json")
@@ -97,20 +97,16 @@ def import_cambrian(
 
         comp_path = ddir / "comparisons.jsonl"
         if comp_path.exists():
+            # the SAME tolerant-JSONL recovery policy State.read_comparisons uses (review-r5),
+            # with the corrupt-line count surfaced into this import's error report.
             try:
-                lines = comp_path.read_text(encoding="utf-8").splitlines()
+                events, corrupt = read_jsonl(comp_path)
             except OSError as exc:
                 report["errors"].append(f"{comp_path}: {exc}")
-                lines = []
-            for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    report["errors"].append(f"{comp_path}: skipped a corrupt line")
-                    continue
+                events, corrupt = [], 0
+            if corrupt:
+                report["errors"].append(f"{comp_path}: skipped {corrupt} corrupt line(s)")
+            for event in events:
                 state.append_comparison(domain, event)
                 counts["comparisons"] += 1
 

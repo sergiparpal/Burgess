@@ -1,45 +1,55 @@
 #!/usr/bin/env node
-// SessionStart hook dispatcher (cross-platform).
+// SessionStart provisioning hook — the SINGLE cross-platform implementation (review-r5).
 //
-// hooks.json registers ONE command — `node provision.mjs` — in place of the two
-// launchers (`sh provision.sh` + `powershell provision.ps1`) that would otherwise BOTH
-// run on every SessionStart. On each OS the wrong launcher's interpreter is absent
-// (`powershell` on Linux/macOS, `sh` on native Windows), so one always failed with a
-// "command not found" error — harmless under `async: true`, but noisy in hook logs.
-// Node is present wherever Claude Code runs, so we detect the platform here and invoke
-// only the launcher that exists.
+// This file used to be a dispatcher that picked provision.sh (POSIX) or provision.ps1 (Windows),
+// which encoded the same launcher twice in two shell dialects — root fallback, uv PATH prepend,
+// Python>=3.10 probe, bootstrap hand-off — with interpreter-candidate lists that had already
+// drifted apart. Node is present wherever Claude Code runs, so the whole job now lives here on the
+// shared resolver (_engine_resolve.mjs systemPython, which absorbed the versioned python3.x probe
+// tail). provision.sh / provision.ps1 remain as one-line dev shims that exec this script.
 //
-// The launcher finds a Python >= 3.10 and hands off to scripts/bootstrap.py, which does
-// the real, idempotent provisioning in a DETACHED background process and returns in
-// milliseconds — so the synchronous wait below is cheap and the detached worker
-// outlives this script.
+// The launcher finds a Python >= 3.10 and hands off to scripts/bootstrap.py, which does the real,
+// idempotent provisioning in a DETACHED background process and returns in milliseconds — so the
+// bounded synchronous spawn below is cheap and the detached worker outlives this script.
 //
-// Failure is silent by design (this is a background hook): if anything goes wrong — no
-// Node on PATH, no launcher, no suitable Python — the MCP launcher provisions in the
-// foreground the first time the server is spawned.
+// NB: no pointer-only fast path here. The interpreter pointer (engine-python.txt) survives a
+// plugin update that changes dependencies, so short-circuiting on its existence would skip the
+// background rebuild on exactly the update case it's meant to handle. Always hand off to
+// `bootstrap.py --background`, which checks the content STAMP (the real freshness gate) and
+// returns in milliseconds when current.
+//
+// Failure is silent by design (this is a background hook): if anything goes wrong — no suitable
+// Python, no bootstrap script — the MCP launcher provisions in the foreground the first time the
+// server is spawned, with a clear, actionable message.
 import { spawnSync } from "node:child_process";
-import { dirname, join } from "node:path";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { PROBE_TIMEOUT_MS, clean, systemPython } from "../scripts/_engine_resolve.mjs";
 
 try {
   const hooksDir = dirname(fileURLToPath(import.meta.url));
-  const [cmd, args] =
-    process.platform === "win32"
-      ? [
-          "powershell",
-          ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
-           join(hooksDir, "provision.ps1")],
-        ]
-      : ["sh", [join(hooksDir, "provision.sh")]];
-  // stdio ignored so the launcher never writes to the hook log; the launcher and
-  // bootstrap.py handle their own (background) logging to provision.log.
-  // Defensive timeout: the never-block guarantee rests on bootstrap.py --background
-  // returning fast, but the OS launcher's own Python version probe is unbounded — a
-  // hanging shim (network-mounted interpreter, AV-scanned first run, a `py` launcher
-  // prompting) would block this synchronous spawn with no inner cutoff on a runtime
-  // without async hook support. Bound it so the dispatcher always returns; if the
-  // detached worker never spawned, the foreground MCP catch-up still self-heals.
-  spawnSync(cmd, args, { stdio: "ignore", timeout: 15000, killSignal: "SIGKILL" });
+  // Dev fallback (`--plugin-dir .` without the var, or run by hand): hooks/ -> repo root.
+  const root = clean(process.env.CLAUDE_PLUGIN_ROOT) || dirname(hooksDir);
+  const boot = join(root, "scripts", "bootstrap.py");
+  if (existsSync(boot)) {
+    // Prepend uv's usual install dir (~/.local/bin on POSIX, %USERPROFILE%\.local\bin on Windows)
+    // BEFORE the probe, so both a standalone-installed uv (bootstrap's shutil.which('uv') fast
+    // path) and a user-local Python not yet on the inherited PATH are found. Harmless if absent.
+    process.env.PATH = [join(homedir(), ".local", "bin"), process.env.PATH || ""].join(delimiter);
+    const py = systemPython(); // >= 3.10, each candidate probe bounded by PROBE_TIMEOUT_MS
+    if (py) {
+      // stdio ignored so bootstrap never writes to the hook log (it logs to provision.log).
+      // Defensive timeout: `--background` returns in ms after spawning the detached worker, but a
+      // wedged interpreter must not block this synchronous spawn forever.
+      spawnSync(py, [boot, "--background"], {
+        stdio: "ignore",
+        timeout: PROBE_TIMEOUT_MS,
+        killSignal: "SIGKILL",
+      });
+    }
+  }
 } catch {
   // never surface an error from a background hook
 }

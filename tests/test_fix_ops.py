@@ -138,8 +138,8 @@ def test_transplant_output_unchanged_and_deterministic(canon: Canon):
     # the perf hoist (to_undirected once, loop-invariant absorption) must be byte-for-byte identical:
     # running twice over the same graph yields the same candidate dicts in the same order.
     G = _ranked(canon, _transplant_edges())
-    run1 = [c.to_dict() for c in gen.transplant(G, pack=None, corpus=[_UNIFORM], failures=set(), k=10)]
-    run2 = [c.to_dict() for c in gen.transplant(G, pack=None, corpus=[_UNIFORM], failures=set(), k=10)]
+    run1 = [c.to_dict() for c in gen.transplant(G, failures=set(), k=10)]
+    run2 = [c.to_dict() for c in gen.transplant(G, failures=set(), k=10)]
     assert run1  # the fixture actually produces candidates
     assert run1 == run2  # deterministic, including the scores that used the (now hoisted) absorption
 
@@ -149,7 +149,7 @@ def test_transplant_score_uses_loop_invariant_absorption(canon: Canon):
     # invariant, all candidates from one call must share the same absorption factor -> score / degree
     # is constant across them. Guards against accidentally recomputing a per-candidate value.
     G = _ranked(canon, _transplant_edges())
-    cands = gen.transplant(G, pack=None, corpus=[_UNIFORM], failures=set(), k=10)
+    cands = gen.transplant(G, failures=set(), k=10)
     assert len(cands) >= 1
     hub_degrees = {c.source for c in cands}
     assert len(hub_degrees) == 1  # one hub

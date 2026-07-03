@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from .config import Axis, AxesSpec, Niche
+from .embed import l2_normalize
 
 # Niche-key slug: lowercase alnum-only, for stable categorical bucket labels.
 _NICHE_SLUG_RE = re.compile(r"[^a-z0-9]+")
@@ -33,21 +34,14 @@ def _niche_slug(value: Any) -> str:
     return s or "none"
 
 
-def _l2_rows(mat: np.ndarray) -> np.ndarray:
-    """L2-normalize each row (zero rows pass through unchanged)."""
-    mat = np.asarray(mat, dtype=np.float32)
-    norms = np.linalg.norm(mat, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    return (mat / norms).astype(np.float32)
-
-
-class CVTNicher:
+class FrozenVoronoiNicher:
     """A **frozen** Voronoi partition of the open-axis embedding space.
 
-    Despite the historical name this is *not* a running centroidal Voronoi
-    tessellation: the centroids are fixed for the life of the nicher and a point
-    is assigned to the centroid of maximum cosine similarity, so it always lands
-    in the same cell. There are two ways to obtain the centroids:
+    (Renamed from the donor's ``CVTNicher`` in review-r5: it is not a running
+    centroidal Voronoi tessellation.) The centroids are fixed for the life of
+    the nicher and a point is assigned to the centroid of maximum cosine
+    similarity, so it always lands in the same cell. There are two ways to
+    obtain the centroids:
 
     * **cold start** (the default constructor) — deterministic unit directions
       seeded by ``seed``. The boundaries are arbitrary w.r.t. the data, but they
@@ -69,18 +63,20 @@ class CVTNicher:
         centroids: Optional[np.ndarray] = None,
     ):
         self.seed = int(seed)
+        # unit rows via the shared embed.l2_normalize — the "cosine == dot" contract has one home
+        # (review-r5: a local copy here could drift on zero-row/dtype handling)
         if centroids is not None:
-            self.centroids = _l2_rows(centroids)
+            self.centroids = l2_normalize(centroids)
             self.k = int(self.centroids.shape[0])
             self.dim = int(self.centroids.shape[1])
             return
         self.dim = int(dim)
         self.k = int(k)
         rng = np.random.default_rng(seed)
-        self.centroids = _l2_rows(rng.standard_normal((self.k, self.dim)))
+        self.centroids = l2_normalize(rng.standard_normal((self.k, self.dim)))
 
     @classmethod
-    def fit(cls, vecs: np.ndarray, k: int, seed: int = 0) -> "CVTNicher":
+    def fit(cls, vecs: np.ndarray, k: int, seed: int = 0) -> "FrozenVoronoiNicher":
         """Fit k-means **once** over accumulated embeddings; return a frozen nicher.
 
         Uses ``sklearn.cluster.KMeans(random_state=seed)`` (deterministic) and
@@ -127,7 +123,7 @@ class CVTNicher:
         }
 
     @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> "CVTNicher":
+    def from_dict(cls, d: Dict[str, Any]) -> "FrozenVoronoiNicher":
         return cls(
             dim=int(d.get("dim", 0)),
             k=int(d.get("k", 0)),
@@ -165,6 +161,13 @@ def axis_bucket(axis: Axis, value: Any, open_cell: Optional[int] = None) -> str:
     return f"cell{open_cell}"
 
 
+def niche_id_from_coords(spec: AxesSpec, coords: Dict[str, str]) -> str:
+    """The canonical niche id: one ``axis=bucket`` segment per spec axis, ``|``-joined — the ONE
+    home of the key format (review-r5: ``compute_niche`` and the freeze-time ``rekey_open_axis``
+    each built it by hand). A coordinate missing from ``coords`` reads as ``none``."""
+    return "|".join(f"{a.name}={coords.get(a.name, 'none')}" for a in spec.axes)
+
+
 def compute_niche(
     descriptor: Dict[str, Any],
     spec: AxesSpec,
@@ -173,14 +176,11 @@ def compute_niche(
     """Return ``(niche_id, coords)`` for a candidate's descriptor."""
     open_cells = open_cells or {}
     coords: Dict[str, str] = {}
-    parts: List[str] = []
     for axis in spec.axes:
         val = descriptor.get(axis.name)
         cell = open_cells.get(axis.name) if axis.type == "open" else None
-        bucket = axis_bucket(axis, val, open_cell=cell)
-        coords[axis.name] = bucket
-        parts.append(f"{axis.name}={bucket}")
-    return "|".join(parts), coords
+        coords[axis.name] = axis_bucket(axis, val, open_cell=cell)
+    return niche_id_from_coords(spec, coords), coords
 
 
 class Archive:
@@ -225,16 +225,9 @@ class Archive:
                 fitness=fitness, novelty=novelty,
             )
             return True
-        better = (fitness > cur.fitness) or (
-            fitness == cur.fitness and novelty > cur.novelty
-        )
-        if better:
-            cur.elite_id = candidate_id
-            cur.fitness = fitness
-            cur.novelty = novelty
-            cur.coords = coords
-            return True
-        return False
+        # the elite rule itself lives on Niche.challenge — one home, shared with the
+        # freeze-time rekey merge (review-r5)
+        return cur.challenge(candidate_id, fitness, novelty, coords)
 
     def rekey_open_axis(
         self,
@@ -262,9 +255,7 @@ class Archive:
             cell = new_cell_by_nid.get(old_nid)
             if cell is not None:
                 coords[open_axis_name] = f"cell{cell}"
-            new_nid = "|".join(
-                f"{a.name}={coords.get(a.name, 'none')}" for a in spec.axes
-            )
+            new_nid = niche_id_from_coords(spec, coords)
             remap[old_nid] = new_nid
             cur = new_niches.get(new_nid)
             if cur is None:
@@ -273,14 +264,8 @@ class Archive:
                     fitness=niche.fitness, novelty=niche.novelty,
                 )
             else:
-                better = (niche.fitness > cur.fitness) or (
-                    niche.fitness == cur.fitness and niche.novelty > cur.novelty
-                )
-                if better:
-                    cur.elite_id = niche.elite_id
-                    cur.fitness = niche.fitness
-                    cur.novelty = niche.novelty
-                    cur.coords = coords
+                # collision after re-keying: merge by the SAME elite rule placement uses
+                cur.challenge(niche.elite_id, niche.fitness, niche.novelty, coords)
             new_counts[new_nid] = new_counts.get(new_nid, 0) + self.counts.get(
                 old_nid, 0
             )

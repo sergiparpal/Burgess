@@ -15,25 +15,26 @@ import json
 import os
 import re
 import sqlite3
-import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, NamedTuple, Callable
 
 import networkx as nx
 
+from . import envconfig
 from .atomicio import atomic_write_text as _atomic_write
-from .canon import Canon
-from .graphio import _node_link_data
+from .canon import Canon, _git
+from .graphio import node_link_data
 from .harness import idf_seeds, node_specificity
 from .harness import specificity as _specificity_gate
-from .model import EpistemicState, FAILURE_STATES, Provenance
+from .model import EpistemicState, FAILURE_STATE_VALUES, Provenance, node_content_hash
+from .sources import section_corpus
 
 if TYPE_CHECKING:  # type-only; the projector duck-types .verifies/.concat at runtime
     from .sources import SourceSet
 
 GRAPH_JSON = "graph.json"
-INDEX_DB = "index.sqlite"
+INDEX_DB = envconfig.INDEX_DB_NAME  # value hosted in the envconfig leaf (the hook's pre-check reads it)
 # The full set of `nodes` columns the current schema declares. The four generative-layer columns
 # (betweenness/spec_betweenness/specificity/gate_on, PLAN Stage 2) were added after the original 11;
 # an index.sqlite built before them lacks the columns, so a projection that finds them missing forces
@@ -87,6 +88,12 @@ _EDGE_COLUMN_NAMES = tuple(name for name, _ in _EDGE_COLUMNS)
 # serialize the entire edge table into one response (server-4). The limit clamp on query_graph is the
 # row-count analogue.
 MAX_CONTEXT_TOKENS = 100_000
+# Reader-facing bounds/knobs, named (review-r5: these were inline magic numbers):
+BRIDGE_LIMIT = 10          # top-N structural-bridge rows kg_context serves; export's report consumes it
+MAX_QUERY_LIMIT = 10_000   # clamp for query_graph's LIMIT (a negative LIMIT is unbounded in SQLite)
+MAX_AGENDA_LIMIT = 50      # clamp for kg_agenda's limit
+_CHARS_PER_TOKEN = 4       # the crude chars-per-token estimate the context budget fill uses
+_STALE_PREVIEW_LABELS = 3  # how many stale-verdict labels the advisory names inline
 # Cap the R3 stale-verdict advisory list in kg_context so it can't bypass the token budget (review-low).
 _STALE_VERDICTS_CAP = 50
 
@@ -160,6 +167,14 @@ class ProjectReport:
     contended: bool = False
 
 
+class _ParseCache(NamedTuple):
+    """The canon parse is_stale() stashes for the project() that follows (projector-5/-11), keyed by
+    the cheap dir signature (review-r5: it was an anonymous tuple consumed as cache[1]/cache[2])."""
+    sig: str
+    nodes: list
+    hashes: dict
+
+
 @dataclass
 class Ranks:
     """All precomputed per-node signals from one projection (PLAN Stage 2). Computed OFF the hot path
@@ -188,7 +203,7 @@ class Projector:
                  source_set: "Callable[[], SourceSet] | None" = None,
                  specificity_seeds: "dict | Callable[[], dict] | None" = None):
         self.canon = canon
-        self.derived = Path(derived_dir) if derived_dir else (canon.root / "derived")
+        self.derived = Path(derived_dir) if derived_dir else (canon.root / envconfig.DERIVED_DIRNAME)
         self.derived.mkdir(parents=True, exist_ok=True)
         self.graph_path = self.derived / GRAPH_JSON
         self.db_path = self.derived / INDEX_DB
@@ -209,7 +224,7 @@ class Projector:
         # The parse is_stale() did for the content-hash check, stashed (keyed by cheap_sig) so the very
         # next project() reuses it instead of re-parsing the whole canon a second time (projector-5/-11).
         # Consumed once; the cheap_sig key guarantees a writer touching the vault in between invalidates it.
-        self._parse_cache: "tuple[str, list, dict] | None" = None
+        self._parse_cache: "_ParseCache | None" = None
 
     def _spec_seeds(self) -> dict:
         s = self._specificity_seeds() if callable(self._specificity_seeds) else self._specificity_seeds
@@ -229,12 +244,14 @@ class Projector:
         return src or ""
 
     def _corpus(self) -> list[str]:
-        """The source split into sections (on `\\n## `) for IDF — the corpus `harness.idf_seeds`
-        consumes. Empty when no source is configured."""
+        """The source split into per-section documents for IDF — the corpus `harness.idf_seeds`
+        consumes. Empty when no source is configured. The split rule and document shape are
+        single-homed in ``sources.section_corpus`` (review-r5), shared with the harness
+        ``specificity`` CLI so the two corpora stay bit-identical by construction."""
         src = self._src_text()
         if not src:
             return []
-        return [s for s in src.split("\n## ") if s.strip()]
+        return section_corpus(src)
 
     # ---- helpers
     def _head(self) -> str:
@@ -242,34 +259,23 @@ class Projector:
         # real reprojection; in the DETACHED MCP server process a `git` call with an inherited/absent
         # stdin can block forever on a credential/identity prompt, and on a NON-GIT canon (e.g. a
         # cloud-synced Documents folder) there is no HEAD to read anyway. A wedged _head() exceeds
-        # KG_HANDLER_TIMEOUT and the supervisor force-exits the engine (exit 71), dropping the MCP
-        # connection on the next stale reprojection. So: skip git entirely without a .git entry
-        # (.exists() — not .is_dir() — so a `.git` FILE worktree/submodule still counts), and bound +
-        # de-prompt the call for the git-repo case, degrading to "" on any timeout/spawn failure.
+        # KG_HANDLER_TIMEOUT and the supervisor force-exits the engine (exit 71). So: skip git
+        # entirely without a .git entry (.exists() — not .is_dir() — so a `.git` FILE
+        # worktree/submodule still counts), and route the git-repo case through canon._git — the ONE
+        # hardened git seam (bounded, DEVNULL stdin, de-prompted env, degrading to a non-zero result
+        # on timeout/spawn failure), which this method used to re-implement inline (review-r5).
         root = self.canon.root
         if not (root / ".git").exists():
             return ""  # non-git canon has no HEAD; never spawn git
-        try:
-            r = subprocess.run(
-                ["git", "-C", str(root), "rev-parse", "HEAD"],
-                capture_output=True, text=True,
-                timeout=5, stdin=subprocess.DEVNULL,
-                env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"},
-            )
-        except (subprocess.TimeoutExpired, OSError):
-            return ""  # a hung/absent git degrades to an empty commit pin; the projector tolerates it
+        r = _git(root, "rev-parse", "HEAD", check=False)
         return r.stdout.strip() if r.returncode == 0 else ""
 
     @staticmethod
     def _file_hash(node) -> str:
-        # hash the canonical edge/axis content (not mtime) so reprojection is content-driven. EXCLUDE the
-        # created_at/updated_at timestamps: they are metadata, not content, and a hand-authored note that
-        # omits them gets a fresh utcnow() on every parse (model.Node.__post_init__) — which would churn
-        # this hash and force a redundant reprojection on every read until the note is written back
-        # (review-low: timestamp staleness churn). A real edge/axis/verdict change still moves the hash.
-        fm = {k: v for k, v in node.frontmatter().items() if k not in ("created_at", "updated_at")}
-        payload = json.dumps(fm, sort_keys=True) + node.body
-        return hashlib.sha256(payload.encode()).hexdigest()
+        # the content-not-mtime hash that makes reprojection content-driven. The rule (and its
+        # deliberate timestamp exclusion) is model.node_content_hash — shared with canon's
+        # idempotent-write detection, whose agreement with this gate is load-bearing (review-r5).
+        return node_content_hash(node)
 
     def _build_graph(self, nodes):
         # MultiDiGraph (not DiGraph): two canon edges can share (source, target) but differ in
@@ -314,7 +320,7 @@ class Projector:
         # grounder stamps its attacked_by/confounded_by counter-edges `failed`, so counting them would
         # make "more refutation -> higher apparent centrality". Excluding only the edges keeps every
         # node present (an attacked hub whose edges are all refuted still ranks honestly at degree 0).
-        _fail = {s.value for s in FAILURE_STATES}
+        _fail = FAILURE_STATE_VALUES
         live = nx.MultiDiGraph()
         live.add_nodes_from(G.nodes(data=True))
         live.add_edges_from((u, v, k, d) for u, v, k, d in G.edges(keys=True, data=True)
@@ -400,7 +406,11 @@ class Projector:
             gate_on = 1 if verdict.get("gate_on") else 0
         except Exception:  # noqa: BLE001 — a gate-computation hiccup must never break projection
             gate_on = 0
-        return Ranks(comm, degree, bridges, betweenness, spec_betweenness, specificity, gate_on, topo_sig)
+        # keyword construction (review-r5): six of these are indistinguishable bare dicts, so a
+        # positional transposition would type-check and pass construction silently.
+        return Ranks(community=comm, degree=degree, bridges=bridges, betweenness=betweenness,
+                     spec_betweenness=spec_betweenness, specificity=specificity,
+                     gate_on=gate_on, topo_sig=topo_sig)
 
     # ---- main
     def project(self, incremental: bool = True) -> ProjectReport:
@@ -425,13 +435,13 @@ class Projector:
             if not self.db_path.exists() or self._schema_outdated():
                 self._connect().close()
             if not self.graph_path.exists():
-                _atomic_write(self.graph_path, json.dumps(_node_link_data(nx.MultiDiGraph())))
+                _atomic_write(self.graph_path, json.dumps(node_link_data(nx.MultiDiGraph())))
             return ProjectReport(up_to_date=self.db_path.exists() and self.graph_path.exists(),
                                  contended=True)
         try:
             return self._project_locked(incremental)
         finally:
-            self.canon._release_lock()
+            self.canon.release_lock()
 
     def _project_locked(self, incremental: bool) -> ProjectReport:
         # Reuse the parse is_stale() just did for this same canon state (projector-5/-11): the cheap_sig
@@ -440,8 +450,8 @@ class Projector:
         cache = self._parse_cache
         self._parse_cache = None  # consume once, whether or not it hits
         cur_sig = self._cheap_sig()
-        if cache and cache[0] == cur_sig:
-            nodes, cur_hashes = cache[1], cache[2]
+        if cache and cache.sig == cur_sig:
+            nodes, cur_hashes = cache.nodes, cache.hashes
         else:
             nodes = self.canon.all_nodes()
             cur_hashes = {n.id: self._file_hash(n) for n in nodes}
@@ -505,7 +515,7 @@ class Projector:
 
         # graph.json is always written in full (cheap projection, must round-trip). Write atomically
         # (temp + os.replace) so a concurrent reader never observes a half-written file.
-        data = _node_link_data(G)
+        data = node_link_data(G)
         data.setdefault("graph", {})["built_from_commit"] = head
         _atomic_write(self.graph_path, json.dumps(data, indent=2))
 
@@ -908,10 +918,203 @@ class Projector:
         # genuinely stale -> stash this parse so the project() that follows reuses it rather than parsing
         # the whole canon a second time (projector-5/-11). cur_sig keys the cache so a concurrent write
         # in the gap invalidates it.
-        self._parse_cache = (cur_sig, nodes, cur_hashes)
+        self._parse_cache = _ParseCache(sig=cur_sig, nodes=nodes, hashes=cur_hashes)
         return True
 
-    # ---- query surface (read precomputed ranks O(1); NO centrality in-request)
+
+    # ---- the read-only query surface, delegated to DerivedReader (review-r5: ~420 lines of
+    # query methods lived inside this writer class while touching nothing of it but db_path —
+    # readers of the hot query path had to scroll past locking/DDL/heal machinery they could
+    # never affect). The seam every consumer holds (a Projector) is unchanged: these thin
+    # delegates forward to the composed reader.
+
+    @property
+    def reader(self) -> "DerivedReader":
+        return DerivedReader(self.db_path)
+
+    def _ro(self):
+        return self.reader._ro()
+
+    def load_graph(self):
+        return self.reader.load_graph()
+
+    def owner_of_edge(self, edge_id: str) -> "str | None":
+        return self.reader.owner_of_edge(edge_id)
+
+    def get_node(self, node_id: str) -> "dict | None":
+        return self.reader.get_node(node_id)
+
+    def get_neighbors(self, node_id: str, *, relation: "str | None" = None) -> "list[dict]":
+        return self.reader.get_neighbors(node_id, relation=relation)
+
+    def query_graph(self, **kw) -> dict:
+        return self.reader.query_graph(**kw)
+
+    def shortest_path(self, source: str, target: str) -> "list[str] | None":
+        return self.reader.shortest_path(source, target)
+
+    def kg_context(self, query: "str | None" = None, *, budget: int = 2000) -> dict:
+        return self.reader.kg_context(query, budget=budget)
+
+    def kg_agenda(self, *, limit: int = 5) -> dict:
+        return self.reader.kg_agenda(limit=limit)
+
+    def _agenda_reader(self):
+        return self.reader._agenda_reader()
+
+
+
+def _agenda_signals(n: dict) -> dict:
+    """The honest signals carried on each suggestion so the ranking is transparent — degree (the
+    advisory), the structural-bridge / betweenness / specificity columns, never a minted scalar."""
+    return {
+        "degree": n.get("degree") or 0,
+        "community": n.get("community"),
+        "structural_bridge": n.get("structural_bridge") or 0,
+        "betweenness": n.get("betweenness") or 0.0,
+        "spec_betweenness": n.get("spec_betweenness") or 0.0,
+        "specificity": n.get("specificity"),
+    }
+
+
+def _neighbor_labels(nid: str, live_edges: list, by_id: dict, *, cap: int = 4) -> list:
+    names, seen = [], set()
+    for e in live_edges:
+        other = e.get("target") if e.get("source") == nid else e.get("source")
+        if other == nid or other in seen:
+            continue
+        seen.add(other)
+        names.append((by_id.get(other) or {}).get("label") or other)
+        if len(names) >= cap:
+            break
+    return names
+
+
+def _agenda_from_rows(nodes: list, edges: list, *, limit: int = 5) -> dict:
+    """Pure R6 agenda builder over precomputed derived rows (no DB, no canon — testable in isolation).
+
+    Detectors (each node matches at most one): orphan (degree 0), hypothesized-only (every live edge a
+    proposal), well-grounded hub (answerable), under-grounded hub (blocked), plus edgeless-communities
+    (a disconnected cluster of >=2 nodes). Ranked by the gate-aware honest signal — `spec_betweenness`
+    ONLY when `gate_on=1`, else `structural_bridge`/betweenness/degree (mirroring kg_context's switch;
+    never raw betweenness as lead). Split into the two lanes, each capped at `limit`. Read-only — it
+    only inspects rows and returns text."""
+    limit = max(1, min(int(limit), MAX_AGENDA_LIMIT))
+    gate_on = int(next((n.get("gate_on") for n in nodes if n.get("gate_on") is not None), 0) or 0)
+    # the gate-aware ranking — same source of truth as kg_context (gate_ranking); never raw betweenness
+    # as lead. The shared `rank_cols` keep the two surfaces' tie-break order from silently diverging.
+    ranked_by, rank_cols = gate_ranking(gate_on)
+    by_id = {n["id"]: n for n in nodes}
+
+    incident: dict = {n["id"]: [] for n in nodes}
+    for e in edges:
+        for endp in (e.get("source"), e.get("target")):
+            if endp in incident:
+                incident[endp].append(e)
+
+    def rank_key(n: dict):  # mirror kg_context's gate switch via the shared rank_cols
+        return tuple(_RANK_COERCE[c][0](n.get(c) or _RANK_COERCE[c][1]) for c in rank_cols)
+
+    gaps: list = []  # (rank_key, id, item) — the id is the deterministic tiebreak (see the final sort)
+    emitted: set = set()  # node ids already surfaced by a node-level detector (one detector per node)
+
+    for n in nodes:
+        nid = n["id"]
+        label = n.get("label") or nid
+        deg = n.get("degree") or 0
+        live = [e for e in incident[nid] if e.get("epistemic_state") not in FAILURE_STATE_VALUES]
+        grounded = sum(1 for e in live if e.get("epistemic_state") == "grounded")
+        unverified = sum(1 for e in live if e.get("epistemic_state") == "unverified")
+        decided = grounded + unverified
+
+        if deg == 0:
+            item = {"detector": "orphan", "lane": "blocked_on_grounding", "focus": [nid],
+                    "question": f"'{label}' is isolated — it has no live relations. What should connect "
+                                f"to it, and can that be grounded?"}
+        elif live and all(e.get("provenance") == "hypothesized" for e in live):
+            item = {"detector": "hypothesized-only", "lane": "blocked_on_grounding", "focus": [nid],
+                    "question": f"Every relation on '{label}' is a hypothesis — its role is unverified. "
+                                f"Ground them (/kg-ground) before treating it as established."}
+        elif deg >= _HUB_DEGREE and decided and grounded / decided >= _GROUNDED_RATIO:
+            nbrs = _neighbor_labels(nid, live, by_id)
+            item = {"detector": "well-grounded", "lane": "answerable_now", "focus": [nid],
+                    "question": f"'{label}' is a well-grounded hub (degree {deg}, {grounded} grounded) — "
+                                f"how do its neighbours ({', '.join(nbrs)}) interrelate?"}
+        elif deg >= _HUB_DEGREE and decided and grounded / decided < _GROUNDED_RATIO:
+            item = {"detector": "under-grounded-hub", "lane": "blocked_on_grounding", "focus": [nid],
+                    "question": f"Hub '{label}' (degree {deg}) is under-grounded — only {grounded}/{decided} "
+                                f"of its edges are grounded. Drain its unverified queue (/kg-ground) to trust it."}
+        else:
+            continue
+        item["signals"] = _agenda_signals(n)
+        gaps.append((rank_key(n), nid, item))
+        emitted.add(nid)  # this node is now covered — don't re-surface it in an edgeless-communities item
+
+    # edgeless communities: a disconnected cluster (>=2 nodes, no LIVE inter-community edge) — a coverage
+    # gap, never answerable now. A single isolated node is already an `orphan`, so require >=2 members.
+    comm_of = {n["id"]: n.get("community") for n in nodes}
+    present = {c for c in comm_of.values() if c is not None and c != -1}
+    if len(present) > 1:
+        crossing: set = set()
+        for e in edges:
+            if e.get("epistemic_state") in FAILURE_STATE_VALUES:
+                continue
+            a, b = comm_of.get(e.get("source")), comm_of.get(e.get("target"))
+            if a is not None and b is not None and a != b:
+                crossing.add(a)
+                crossing.add(b)
+        for c in sorted(present - crossing):
+            # exclude members already surfaced by a node-level detector — so a lone island (an `orphan`)
+            # and a small cluster whose nodes are each already a gap (e.g. a freshly-proposed
+            # hypothesized-only pair) are NOT re-surfaced here (one detector per node). Fire only when
+            # >=2 members remain genuinely uncovered.
+            fresh = [m for m in nodes if m.get("community") == c and m["id"] not in emitted]
+            if len(fresh) < 2:
+                continue
+            rep = max(fresh, key=lambda m: m.get("degree") or 0)
+            labels = ", ".join((m.get("label") or m["id"]) for m in fresh[:_STALE_PREVIEW_LABELS])
+            more = "…" if len(fresh) > _STALE_PREVIEW_LABELS else ""
+            gaps.append((rank_key(rep), rep["id"], {
+                "detector": "edgeless-communities", "lane": "blocked_on_grounding",
+                "focus": [m["id"] for m in fresh],
+                "question": f"The '{rep.get('label') or rep['id']}' cluster ({labels}{more}) is disconnected "
+                            f"from the rest of the graph — what relation bridges it?",
+                "signals": _agenda_signals(rep)}))
+
+    # Deterministic order: rank_key DESC, then node id ASC as the unique tiebreak — the input `nodes`
+    # arrive from an unordered `SELECT * FROM nodes`, so without the id the order among rank-tied
+    # suggestions (the common case: most nodes share betweenness/spec_betweenness 0.0 and a small degree)
+    # is not reproducible across reprojections. A stable pre-sort by id ASC, then a stable sort by
+    # rank_key DESC (reverse=True), leaves ties ordered by id ASC.
+    gaps.sort(key=lambda gi: gi[1])           # id ASC (stable base order for ties)
+    gaps.sort(key=lambda gi: gi[0], reverse=True)
+    answerable: list = []
+    blocked: list = []
+    for _, _id, item in gaps:
+        bucket = answerable if item["lane"] == "answerable_now" else blocked
+        if len(bucket) < limit:
+            bucket.append(item)
+    return {
+        "answerable_now": answerable,
+        "blocked_on_grounding": blocked,
+        "count": len(answerable) + len(blocked),
+        "limit": limit,
+        "gate_on": gate_on,
+        "ranked_by": ranked_by,
+        "note": ("structural suggestions — a heuristic, not a guarantee. answerable_now reads grounded "
+                 "content; blocked_on_grounding needs grounding (or extraction) first."),
+    }
+
+
+class DerivedReader:
+    """The read-only query surface over one derived index (review-r5: extracted from Projector,
+    whose other half is the derived-layer WRITER — locking, DDL, heal, ranks). Everything here
+    reads precomputed columns O(1); NO centrality is computed in-request. Constructed cheaply from
+    the db path alone, so the writer composes one on demand and the two concerns can no longer
+    couple accidentally."""
+
+    def __init__(self, db_path):
+        self.db_path = db_path
     def _ro(self) -> sqlite3.Connection:
         con = sqlite3.connect(self.db_path)
         con.execute("PRAGMA busy_timeout=5000")  # tolerate a concurrent reprojection mid-read
@@ -975,7 +1178,7 @@ class Projector:
 
     def query_graph(self, *, node_type: str | None = None, relation: str | None = None,
                     epistemic_state: str | None = None, limit: int = 50) -> dict:
-        limit = max(0, min(int(limit), 10_000))  # a negative LIMIT is unbounded in SQLite; clamp it
+        limit = max(0, min(int(limit), MAX_QUERY_LIMIT))  # a negative LIMIT is unbounded in SQLite
         con = self._ro()
         try:
             nq, na = "SELECT * FROM nodes", []
@@ -1079,7 +1282,7 @@ class Projector:
         # the top-10 heavily tied — without a unique tiebreak WHICH 10 surface is not reproducible
         # across reprojections / SQLite versions / planner changes.
         bm_sql = ("SELECT id,label,degree,betweenness,spec_betweenness,specificity FROM nodes ORDER BY "
-                  + ", ".join(f"{c} DESC" for c in rank_cols) + ", id ASC LIMIT 10")
+                  + ", ".join(f"{c} DESC" for c in rank_cols) + f", id ASC LIMIT {BRIDGE_LIMIT}")
         return {
             "gate_on": gate_on,
             "ranked_by": ranked_by,
@@ -1095,8 +1298,9 @@ class Projector:
         budget = max(0, min(int(budget), MAX_CONTEXT_TOKENS))  # enforce an upper ceiling (server-4)
         con = self._ro()
         try:
-            # falsification counters (memory of failures, §1.7) — surfaced, never pruned
-            fail_states = [s.value for s in FAILURE_STATES]
+            # falsification counters (memory of failures, §1.7) — surfaced, never pruned.
+            # sorted() so the generated SQL text is deterministic (FAILURE_STATE_VALUES is a set).
+            fail_states = sorted(FAILURE_STATE_VALUES)
             qmarks = ",".join("?" * len(fail_states))
             counters = {
                 "failed_or_rejected_edges": con.execute(
@@ -1117,7 +1321,7 @@ class Projector:
                 rows, used = [], 0
                 for r in con.execute(f"SELECT {cols} FROM edges WHERE {where_sql} ORDER BY {order_sql}", args):
                     rec = dict(r)
-                    tok = max(1, len(json.dumps(rec)) // 4)
+                    tok = max(1, len(json.dumps(rec)) // _CHARS_PER_TOKEN)
                     if used + tok > cap:
                         break
                     used += tok
@@ -1130,7 +1334,11 @@ class Projector:
             # ...and never a refuted/obsolete edge: failed/rejected are negative information (surfaced
             # only via falsification_counters, never as an answer) and obsolete is superseded content,
             # so the answer lane must exclude them. falsification_counters above still counts them.
-            iwhere = "provenance != 'hypothesized' AND epistemic_state NOT IN ('failed','rejected','obsolete')"
+            # the excluded set = the failure vocabulary (single-homed in model, review-r5) plus the
+            # superseded lifecycle state; sorted for a deterministic SQL text.
+            excluded = ",".join(repr(s) for s in
+                                sorted(FAILURE_STATE_VALUES | {EpistemicState.OBSOLETE.value}))
+            iwhere = f"provenance != 'hypothesized' AND epistemic_state NOT IN ({excluded})"
             iargs = list(term_args)
             if term_clause:
                 iwhere += " AND " + term_clause
@@ -1147,7 +1355,7 @@ class Projector:
             hypotheses, hused = _fill(hwhere, hargs, "confidence_score DESC, id ASC", budget - used)
             bridges = [dict(r) for r in con.execute(
                 "SELECT id,label,degree,bridge_communities FROM nodes WHERE structural_bridge=1 "
-                "ORDER BY degree DESC, id ASC LIMIT 10")]
+                f"ORDER BY degree DESC, id ASC LIMIT {BRIDGE_LIMIT}")]
             bridge_metric = self._bridge_metric_block(con)
             stale_verdicts, stale_total = self._read_stale_advisory(con)
             return {
@@ -1190,145 +1398,3 @@ class Projector:
 
 
 # --------------------------------------------------------------------------- R6 agenda builder (pure)
-
-
-def _agenda_signals(n: dict) -> dict:
-    """The honest signals carried on each suggestion so the ranking is transparent — degree (the
-    advisory), the structural-bridge / betweenness / specificity columns, never a minted scalar."""
-    return {
-        "degree": n.get("degree") or 0,
-        "community": n.get("community"),
-        "structural_bridge": n.get("structural_bridge") or 0,
-        "betweenness": n.get("betweenness") or 0.0,
-        "spec_betweenness": n.get("spec_betweenness") or 0.0,
-        "specificity": n.get("specificity"),
-    }
-
-
-def _neighbor_labels(nid: str, live_edges: list, by_id: dict, *, cap: int = 4) -> list:
-    names, seen = [], set()
-    for e in live_edges:
-        other = e.get("target") if e.get("source") == nid else e.get("source")
-        if other == nid or other in seen:
-            continue
-        seen.add(other)
-        names.append((by_id.get(other) or {}).get("label") or other)
-        if len(names) >= cap:
-            break
-    return names
-
-
-def _agenda_from_rows(nodes: list, edges: list, *, limit: int = 5) -> dict:
-    """Pure R6 agenda builder over precomputed derived rows (no DB, no canon — testable in isolation).
-
-    Detectors (each node matches at most one): orphan (degree 0), hypothesized-only (every live edge a
-    proposal), well-grounded hub (answerable), under-grounded hub (blocked), plus edgeless-communities
-    (a disconnected cluster of >=2 nodes). Ranked by the gate-aware honest signal — `spec_betweenness`
-    ONLY when `gate_on=1`, else `structural_bridge`/betweenness/degree (mirroring kg_context's switch;
-    never raw betweenness as lead). Split into the two lanes, each capped at `limit`. Read-only — it
-    only inspects rows and returns text."""
-    limit = max(1, min(int(limit), 50))
-    gate_on = int(next((n.get("gate_on") for n in nodes if n.get("gate_on") is not None), 0) or 0)
-    # the gate-aware ranking — same source of truth as kg_context (gate_ranking); never raw betweenness
-    # as lead. The shared `rank_cols` keep the two surfaces' tie-break order from silently diverging.
-    ranked_by, rank_cols = gate_ranking(gate_on)
-    by_id = {n["id"]: n for n in nodes}
-
-    incident: dict = {n["id"]: [] for n in nodes}
-    for e in edges:
-        for endp in (e.get("source"), e.get("target")):
-            if endp in incident:
-                incident[endp].append(e)
-
-    def rank_key(n: dict):  # mirror kg_context's gate switch via the shared rank_cols
-        return tuple(_RANK_COERCE[c][0](n.get(c) or _RANK_COERCE[c][1]) for c in rank_cols)
-
-    gaps: list = []  # (rank_key, id, item) — the id is the deterministic tiebreak (see the final sort)
-    emitted: set = set()  # node ids already surfaced by a node-level detector (one detector per node)
-
-    for n in nodes:
-        nid = n["id"]
-        label = n.get("label") or nid
-        deg = n.get("degree") or 0
-        live = [e for e in incident[nid] if e.get("epistemic_state") not in ("failed", "rejected")]
-        grounded = sum(1 for e in live if e.get("epistemic_state") == "grounded")
-        unverified = sum(1 for e in live if e.get("epistemic_state") == "unverified")
-        decided = grounded + unverified
-
-        if deg == 0:
-            item = {"detector": "orphan", "lane": "blocked_on_grounding", "focus": [nid],
-                    "question": f"'{label}' is isolated — it has no live relations. What should connect "
-                                f"to it, and can that be grounded?"}
-        elif live and all(e.get("provenance") == "hypothesized" for e in live):
-            item = {"detector": "hypothesized-only", "lane": "blocked_on_grounding", "focus": [nid],
-                    "question": f"Every relation on '{label}' is a hypothesis — its role is unverified. "
-                                f"Ground them (/kg-ground) before treating it as established."}
-        elif deg >= _HUB_DEGREE and decided and grounded / decided >= _GROUNDED_RATIO:
-            nbrs = _neighbor_labels(nid, live, by_id)
-            item = {"detector": "well-grounded", "lane": "answerable_now", "focus": [nid],
-                    "question": f"'{label}' is a well-grounded hub (degree {deg}, {grounded} grounded) — "
-                                f"how do its neighbours ({', '.join(nbrs)}) interrelate?"}
-        elif deg >= _HUB_DEGREE and decided and grounded / decided < _GROUNDED_RATIO:
-            item = {"detector": "under-grounded-hub", "lane": "blocked_on_grounding", "focus": [nid],
-                    "question": f"Hub '{label}' (degree {deg}) is under-grounded — only {grounded}/{decided} "
-                                f"of its edges are grounded. Drain its unverified queue (/kg-ground) to trust it."}
-        else:
-            continue
-        item["signals"] = _agenda_signals(n)
-        gaps.append((rank_key(n), nid, item))
-        emitted.add(nid)  # this node is now covered — don't re-surface it in an edgeless-communities item
-
-    # edgeless communities: a disconnected cluster (>=2 nodes, no LIVE inter-community edge) — a coverage
-    # gap, never answerable now. A single isolated node is already an `orphan`, so require >=2 members.
-    comm_of = {n["id"]: n.get("community") for n in nodes}
-    present = {c for c in comm_of.values() if c is not None and c != -1}
-    if len(present) > 1:
-        crossing: set = set()
-        for e in edges:
-            if e.get("epistemic_state") in ("failed", "rejected"):
-                continue
-            a, b = comm_of.get(e.get("source")), comm_of.get(e.get("target"))
-            if a is not None and b is not None and a != b:
-                crossing.add(a)
-                crossing.add(b)
-        for c in sorted(present - crossing):
-            # exclude members already surfaced by a node-level detector — so a lone island (an `orphan`)
-            # and a small cluster whose nodes are each already a gap (e.g. a freshly-proposed
-            # hypothesized-only pair) are NOT re-surfaced here (one detector per node). Fire only when
-            # >=2 members remain genuinely uncovered.
-            fresh = [m for m in nodes if m.get("community") == c and m["id"] not in emitted]
-            if len(fresh) < 2:
-                continue
-            rep = max(fresh, key=lambda m: m.get("degree") or 0)
-            labels = ", ".join((m.get("label") or m["id"]) for m in fresh[:3])
-            more = "…" if len(fresh) > 3 else ""
-            gaps.append((rank_key(rep), rep["id"], {
-                "detector": "edgeless-communities", "lane": "blocked_on_grounding",
-                "focus": [m["id"] for m in fresh],
-                "question": f"The '{rep.get('label') or rep['id']}' cluster ({labels}{more}) is disconnected "
-                            f"from the rest of the graph — what relation bridges it?",
-                "signals": _agenda_signals(rep)}))
-
-    # Deterministic order: rank_key DESC, then node id ASC as the unique tiebreak — the input `nodes`
-    # arrive from an unordered `SELECT * FROM nodes`, so without the id the order among rank-tied
-    # suggestions (the common case: most nodes share betweenness/spec_betweenness 0.0 and a small degree)
-    # is not reproducible across reprojections. A stable pre-sort by id ASC, then a stable sort by
-    # rank_key DESC (reverse=True), leaves ties ordered by id ASC.
-    gaps.sort(key=lambda gi: gi[1])           # id ASC (stable base order for ties)
-    gaps.sort(key=lambda gi: gi[0], reverse=True)
-    answerable: list = []
-    blocked: list = []
-    for _, _id, item in gaps:
-        bucket = answerable if item["lane"] == "answerable_now" else blocked
-        if len(bucket) < limit:
-            bucket.append(item)
-    return {
-        "answerable_now": answerable,
-        "blocked_on_grounding": blocked,
-        "count": len(answerable) + len(blocked),
-        "limit": limit,
-        "gate_on": gate_on,
-        "ranked_by": ranked_by,
-        "note": ("structural suggestions — a heuristic, not a guarantee. answerable_now reads grounded "
-                 "content; blocked_on_grounding needs grounding (or extraction) first."),
-    }

@@ -504,28 +504,32 @@ def test_no_source_yields_empty_stale_list(vault):
 # forever, the handler exceeded KG_HANDLER_TIMEOUT, and the supervisor force-exited the engine.
 
 
+# (Since review-r5 _head routes its git invocation through canon._git — the one hardened seam — so
+# these pins patch subprocess.run where the spawn actually happens: kg_engine.canon.)
+
+
 def test_head_empty_on_non_git_canon_without_spawning_git(tmp_path, monkeypatch):
-    import kg_engine.projector as projector_mod
+    import kg_engine.canon as canon_mod
     canon = Canon(tmp_path / "nogit")  # a fresh canon dir with NO .git — not the git-backed vault
     proj = Projector(canon)
 
     def _must_not_spawn(*a, **k):  # the .git guard must short-circuit before any git fork
         raise AssertionError("git must not be spawned on a non-git canon")
 
-    monkeypatch.setattr(projector_mod.subprocess, "run", _must_not_spawn)
+    monkeypatch.setattr(canon_mod.subprocess, "run", _must_not_spawn)
     assert proj._head() == ""
 
 
 def test_head_empty_when_git_hangs(canon: Canon, monkeypatch):
     # git-backed canon (the .git guard passes), but git itself wedges -> a bounded _head() must degrade
     # to "" rather than let the TimeoutExpired propagate into the projection handler.
-    import kg_engine.projector as projector_mod
+    import kg_engine.canon as canon_mod
     proj = Projector(canon)
 
     def _hang(*a, **k):
-        raise projector_mod.subprocess.TimeoutExpired(cmd="git", timeout=5)
+        raise canon_mod.subprocess.TimeoutExpired(cmd="git", timeout=5)
 
-    monkeypatch.setattr(projector_mod.subprocess, "run", _hang)
+    monkeypatch.setattr(canon_mod.subprocess, "run", _hang)
     assert proj._head() == ""
 
 

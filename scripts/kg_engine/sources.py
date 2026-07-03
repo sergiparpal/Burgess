@@ -13,12 +13,62 @@ span-present, §1.5, and the deterministic tier). Pure stdlib + ``model.normaliz
 from __future__ import annotations
 
 import glob as _glob
+import re
 from pathlib import Path
 
 from .model import normalize_text, span_present_in
 
 _EXTS = (".md", ".txt")
 _GLOB_CHARS = "*?["
+
+# What starts a section: a level-2 ATX heading — `##` followed by whitespace. `###` and deeper never
+# match (the char after `##` is `#`, not whitespace) and stay inside their section's body.
+_SECTION_HEAD_RE = re.compile(r"^##\s+(.*)$")
+
+
+def split_sections(text: str, *, include_heading: bool = False,
+                   preamble_title: str = "") -> "list[tuple[str, str]]":
+    """Split a source document into ``(title, body)`` pairs at level-2 ``##`` headings — THE single
+    home for the section rule (review-r5: it previously existed as four implementations with three
+    algorithms across server/backend/projector/harness, all claiming to be "the SAME unit
+    /kg-build extracts per subagent").
+
+    ``include_heading`` keeps the raw heading line at the top of each section body (the extraction
+    payload unit — the model needs the heading for context); the default drops it (coverage matches
+    spans against body prose). Text before the first heading is emitted as one leading section
+    titled ``preamble_title`` whenever any preamble lines exist (blank ones included — the historic
+    behavior of every prior copy); an empty heading (``## `` alone) also falls back to
+    ``preamble_title``. A section left open at EOF is always emitted.
+    """
+    sections: "list[tuple[str, str]]" = []
+    title, buf = None, []  # title=None -> still in the preamble
+    for line in text.splitlines():
+        m = _SECTION_HEAD_RE.match(line)
+        if m:
+            if title is not None or buf:
+                sections.append((title or preamble_title, "\n".join(buf)))
+            title = m.group(1).strip()
+            buf = [line] if include_heading else []
+        else:
+            buf.append(line)
+    if title is not None or buf:
+        sections.append((title or preamble_title, "\n".join(buf)))
+    return sections
+
+
+def section_corpus(text: str) -> "list[str]":
+    """The source as a list of per-section documents for IDF — one ``"title\\nbody"`` string per
+    section, whitespace-only sections dropped. The projector's specificity gate and the harness
+    ``specificity`` CLI both consume exactly this, so the two stay bit-identical by construction
+    (they previously each hand-rolled a ``split("\\n## ")`` that treated a heading at byte 0
+    differently). Title terms deliberately stay in the document: a section's own heading words
+    count toward its term statistics, as they always have."""
+    docs = []
+    for title, body in split_sections(text):
+        doc = f"{title}\n{body}" if title else body
+        if doc.strip():
+            docs.append(doc)
+    return docs
 
 
 def _looks_like_glob(s: str) -> bool:

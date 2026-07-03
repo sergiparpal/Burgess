@@ -37,13 +37,13 @@ import { spawn, spawnSync } from "node:child_process";
 import { appendFileSync, mkdirSync, realpathSync, rmSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { venvDir, systemPython, enginePython, withPythonpath, clean, STAMP_NAME } from "./_engine_resolve.mjs";
+import { venvDir, systemPython, enginePython, withPythonpath, clean, PROBE_TIMEOUT_MS, STAMP_NAME } from "./_engine_resolve.mjs";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url)); // <repo>/scripts
 const ROOT = process.env.CLAUDE_PLUGIN_ROOT || dirname(SCRIPT_DIR);
 const SCRIPTS = join(ROOT, "scripts");
 const BOOTSTRAP = join(SCRIPTS, "bootstrap.py");
-const dir = venvDir(ROOT);
+const VENV_DIR = venvDir(ROOT);  // the resolved engine venv (review-r5: was `dir`)
 
 // A server that exits within this window of starting WITHOUT having written its readiness marker is
 // treated as a startup failure (an import error against a half-built / just-updated venv) and triggers
@@ -61,9 +61,8 @@ const EARLY_FAILURE_MS = 20000;
 // through to the startup self-heal path, exactly like a non-zero startup exit code.
 const CRASH_SIGNALS = new Set(["SIGSEGV", "SIGABRT", "SIGBUS", "SIGILL", "SIGFPE", "SIGKILL"]);
 
-// Interpreter-probe / bootstrap-check spawnSync timeout (review-low). On Windows the `py`/`python` App
-// Execution Alias stub can stall indefinitely; a timed-out probe is treated as "not found"/"not fresh".
-const PROBE_TIMEOUT_MS = 15000;
+// PROBE_TIMEOUT_MS (the interpreter-probe / bootstrap-check spawnSync bound) is imported from
+// _engine_resolve.mjs — its single home since review-r5.
 
 // The engine writes this marker (under the SAME KG_DATA dir — see serverLogDir / server.py
 // resolve_data_dir) as its stdio serve loop comes up. Its presence with an mtime newer than the current
@@ -204,22 +203,23 @@ function serverLog(msg) {
 // uv/pip output to ITS stdout; the MCP server (below) owns this process's stdout for JSON-RPC, so we
 // route the child's stdout OFF that channel. stdio = [ignore, 2, inherit] sends child stdout -> our
 // fd 2 (stderr) and child stderr -> our stderr, so the server's first frame is never preceded by noise.
-function foregroundCatchUp(sys, force) {
+function foregroundCatchUp(sysPy, force) {
   // `force` removes the install.stamp first so bootstrap's is_ready() fast-path cannot short-circuit:
   // needed for the self-heal retry below, where the stamp MATCHES but the deps are actually broken
   // (a stamp-fresh venv that still fails to import) — without this, provision would do nothing and the
   // retry would relaunch the identical broken server.
   if (force) {
     try {
-      rmSync(join(dir, STAMP_NAME), { force: true });
+      rmSync(join(VENV_DIR, STAMP_NAME), { force: true });
     } catch {
       /* best-effort */
     }
   }
-  const r = spawnSync(sys, [BOOTSTRAP, "--venv", dir], { stdio: ["ignore", 2, "inherit"] });
-  // Surface a spawn failure (ENOENT) or a non-zero bootstrap exit (2 = still provisioning past the wait
-  // deadline; 1 = build failed) instead of silently launching against a possibly-unready venv. The
-  // server's early-failure self-heal is still the net.
+  const r = spawnSync(sysPy, [BOOTSTRAP, "--venv", VENV_DIR], { stdio: ["ignore", 2, "inherit"] });
+  // Surface a spawn failure (ENOENT) or a non-zero bootstrap exit (bootstrap.py names these:
+  // EXIT_STILL_PROVISIONING=2 past the wait deadline; EXIT_BUILD_FAILED=1; EXIT_PY_TOO_OLD=3)
+  // instead of silently launching against a possibly-unready venv. The server's early-failure
+  // self-heal is still the net.
   if (r.error || (typeof r.status === "number" && r.status !== 0)) {
     process.stderr.write(
       "[burgess] engine provisioning did not complete" +
@@ -233,9 +233,9 @@ function foregroundCatchUp(sys, force) {
 // The venv is fresh only when bootstrap.py --check exits 0 (interpreter present AND install.stamp
 // matches the current pyproject). Checking interpreter existence alone would launch a STALE venv after
 // a deps-changing update left the old interpreter in place. --check prints nothing, so it is JSON-RPC-safe.
-function stampFresh(sys) {
-  if (!sys) return false;
-  const r = spawnSync(sys, [BOOTSTRAP, "--check", "--venv", dir], {
+function stampFresh(sysPy) {
+  if (!sysPy) return false;
+  const r = spawnSync(sysPy, [BOOTSTRAP, "--check", "--venv", VENV_DIR], {
     stdio: ["ignore", "ignore", "ignore"],
     timeout: PROBE_TIMEOUT_MS,
   });
@@ -367,16 +367,16 @@ export function createSupervisor({
 }
 
 function main() {
-  const sys = systemPython();
-  let py = enginePython(dir);
+  const sysPy = systemPython();
+  let py = enginePython(VENV_DIR);
 
   // Cold (no interpreter) OR stale (interpreter present but stamp out of date): run the foreground
   // catch-up so the server starts against a current venv. bootstrap.py is idempotent and lock-serialized
   // against the SessionStart background worker.
-  if (!py || !stampFresh(sys)) {
-    if (sys) {
-      foregroundCatchUp(sys);
-      py = enginePython(dir);
+  if (!py || !stampFresh(sysPy)) {
+    if (sysPy) {
+      foregroundCatchUp(sysPy);
+      py = enginePython(VENV_DIR);
     }
   }
 
@@ -397,9 +397,9 @@ function main() {
     // open across restarts, so the OS-level connection is never torn down when the engine relaunches.
     spawnEngine: () => spawn(py, ["-m", "kg_engine.server"], { stdio: "inherit", env }),
     heal: () => {
-      if (sys) {
-        foregroundCatchUp(sys, true);
-        const fixed = enginePython(dir);
+      if (sysPy) {
+        foregroundCatchUp(sysPy, true);
+        const fixed = enginePython(VENV_DIR);
         if (fixed) py = fixed;
       }
     },

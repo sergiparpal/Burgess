@@ -22,7 +22,8 @@ Wired as a git merge driver via ``.gitattributes`` (``canon/*.md merge=kgcanon``
 ``git config merge.kgcanon.driver`` pointing at ``scripts/canon_merge_driver.mjs`` (which runs this
 module's ``main`` through the resolved engine python). See README / CLAUDE.md for the install steps.
 
-Pure stdlib + the model layer; no network, no canon I/O, no audit log.
+Pure stdlib + the model layer + the atomicio leaf (shared crash-safe write); no network, no canon
+I/O, no audit log.
 """
 from __future__ import annotations
 
@@ -33,6 +34,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+from .atomicio import atomic_write_bytes
 from .model import EpistemicState, Node, node_from_markdown, node_to_markdown
 
 __all__ = ["merge_nodes", "merge_note_files", "main"]
@@ -67,11 +69,6 @@ def _parse(text: str) -> Node | None:
         return node_from_markdown(text)
     except Exception:  # noqa: BLE001 — any unparseable note must fail OPEN to the text 3-way, never raise
         return None
-
-
-def _load(path: str | Path) -> Node | None:
-    """Read+parse a canon file to a Node, or None on missing/empty/unparseable (public helper)."""
-    return _parse(_read(path))
 
 
 def _eprint(msg: str) -> None:
@@ -259,24 +256,15 @@ def merge_note_files(base_text: str, ours_text: str, theirs_text: str) -> tuple[
 
 
 def _write_atomic(path: Path, text: str) -> None:
-    """Atomic write (temp in the same dir + os.replace) so a crash mid-write never leaves git a
-    half-written canon note (review-low)."""
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".kgmerge-", suffix=".tmp")
-    try:
-        # newline="" suppresses newline translation: in default text mode Windows rewrites every '\n' to
-        # '\r\n', so the merge driver would emit a CRLF note while every engine write (atomicio, binary)
-        # emits LF — defeating byte-identical canon (clean git diffs / canonmerge byte-stability) and
-        # producing churn the next engine touch rewrites back to LF. node_to_markdown builds the text with
-        # literal '\n', so writing it verbatim keeps the note LF-terminated on every platform.
-        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
-            f.write(text)
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    """Atomic write via the shared ``atomicio`` protocol (review-r5: this module used to carry a
+    third temp+replace copy that silently skipped atomicio's fsync + Windows replace-retry, so a
+    merged note was not crash-durable). Bytes mode does the job the old ``newline=""`` did: no
+    newline translation, so the LF-built ``node_to_markdown`` text lands byte-identical on every
+    platform (a text-mode Windows write would emit CRLF and churn against the engine's LF notes).
+    The strict utf-8 ``encode`` raises UnicodeEncodeError on a lone surrogate (git's
+    surrogateescape decode of non-UTF-8 bytes), feeding ``main``'s fail-open path exactly as the
+    old in-function write did."""
+    atomic_write_bytes(path, text.encode("utf-8"), mkparents=False)
 
 
 def main(argv: list[str] | None = None) -> int:

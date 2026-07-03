@@ -26,6 +26,7 @@ highest-novelty idea in each slate.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import tempfile
 from collections import Counter
@@ -193,7 +194,7 @@ def _mechanism_vecs(candidates, spec, embedder, seed):
 # --------------------------------------------------------------------------- #
 # Orchestration
 # --------------------------------------------------------------------------- #
-def _diverse_engine_metrics(spec, settings, axes, seed, home, project):
+def _diverse_engine_metrics(settings, axes, seed, home, project):
     """Run the full engine loop with a stubbed human; return ``(metrics, state)``.
 
     ``state`` is the diverse project's handle, reused later for the file checks.
@@ -206,7 +207,7 @@ def _diverse_engine_metrics(spec, settings, axes, seed, home, project):
     for gen in range(SELFTEST_CYCLES):
         cands = diverse_candidates(settings.candidates_per_generation, gen=gen)
         last = pipeline.ingest(dproj, cands, axes, seed=seed, home=home)
-        _stub_human(pipeline, dproj, last, home)
+        _stub_human(dproj, last, home)
 
     slate = last["slate"] if last else []
     emb_store = state.read_embeddings()
@@ -256,7 +257,7 @@ def _dpp_isolation_metrics(spec, settings, embedder, seed, n_seeds=3):
     return dpp_example, firstn_example
 
 
-def _null_check(spec, settings, embedder, seed, trials=50, eps=0.02):
+def _null_check(spec, embedder, seed, trials=50, eps=0.02):
     """On a uniformly-diverse pool DPP must not regress below a random k-subset.
 
     There is nothing for selection to "gain" when every item is already spread
@@ -336,16 +337,12 @@ def _live_semantic_check(live: bool) -> Dict[str, Any]:
     missing or the model weights can't be downloaded offline.
     """
     if not live:
-        return {"ran": False, "skipped": True, "reason": "not a --live run"}
+        return _skipped("not a --live run")
     try:
         emb = embed.get_embedder()  # the live default (static), set by run()
         a = emb.embed(["a quiet library for focused study"])[0]
     except Exception as exc:  # pragma: no cover - depends on the environment
-        return {
-            "ran": False,
-            "skipped": True,
-            "reason": f"live embedder unavailable ({exc})",
-        }
+        return _skipped(f"embedder unavailable ({exc})")
     para = emb.embed(["a calm reading room for concentrated work"])[0]
     unrel = emb.embed(["an explosive monster-truck demolition derby"])[0]
     sim_para = float(np.dot(a, para))
@@ -401,7 +398,7 @@ def _originality_probe(spec, settings, embedder, seed) -> Dict[str, Any]:
         cvecs, _ = _place(cliche, spec, embedder, seed)
         cliche_vecs = cvecs[: spec.slate_size]
     except Exception as exc:  # pragma: no cover - depends on the environment
-        return {"ran": False, "skipped": True, "reason": f"embedder unavailable ({exc})"}
+        return _skipped(f"embedder unavailable ({exc})")
     slate = originality.originality_scores(slate_vecs, o_test_vecs)
     cliche_score = originality.originality_scores(cliche_vecs, o_test_vecs)
     return {
@@ -441,7 +438,7 @@ def _surface_mechanism_gap_probe(spec, settings, embedder, seed) -> Dict[str, An
         ]
         mech_mono = _mechanism_vecs(mono_cands, spec, embedder, seed)
     except Exception as exc:  # pragma: no cover - depends on the environment
-        return {"ran": False, "skipped": True, "reason": f"embedder unavailable ({exc})"}
+        return _skipped(f"embedder unavailable ({exc})")
     diverse_slate = gap.surface_mechanism_gap(slate_surf, mech_varied)
     monotone = gap.surface_mechanism_gap(slate_surf, mech_mono)
     return {
@@ -455,7 +452,7 @@ def _surface_mechanism_gap_probe(spec, settings, embedder, seed) -> Dict[str, An
     }
 
 
-def _collapse_reversal(spec, settings, axes, seed, home, project):
+def _collapse_reversal(settings, axes, seed, home, project):
     """A samey generation must trip the monitor; the next diverse one recovers.
 
     First warm up the monitor's rolling baseline with a couple of diverse
@@ -509,68 +506,29 @@ def run(project: str = "selftest", live: bool = False, seed: int = 0,
         with tempfile.TemporaryDirectory(prefix="burgess-selftest-") as tmp:
             return run(project=project, live=live, seed=seed, home=Path(tmp))
 
-    # Deterministic embedder unless a live run is explicitly requested. Save and
-    # restore $KG_DIVERGE_EMBEDDER so running the self-test never mutates the
-    # caller's global env (the test suite calls run() in-process); the cache is
-    # reset on both ends so neither the self-test nor the caller inherits a stale
-    # embedder built under the other's setting.
-    prev_embedder = os.environ.get(embed.ENV_VAR)
     # A live run exercises the real default embedder (the torch-free multilingual
     # 'static' model); non-live stays on the deterministic, download-free 'hash'.
-    os.environ[embed.ENV_VAR] = embed.DEFAULT_PROVIDER if live else "hash"
-    embed.reset_cache()
-    try:
+    with _forced_embedder(embed.DEFAULT_PROVIDER if live else "hash"):
         spec = config.load_generic_axes()
         settings = config.load_session_settings(config.generic_axes_path())
         axes = spec.to_dict()
         embedder = embed.get_embedder()
 
         engine_metrics, state = _diverse_engine_metrics(
-            spec, settings, axes, seed, home, project
+            settings, axes, seed, home, project
         )
         base_metrics = _single_shot_metrics(spec, settings, embedder, seed)
         dpp_metrics, firstn_metrics = _dpp_isolation_metrics(
             spec, settings, embedder, seed
         )
 
-        null_check = _null_check(spec, settings, embedder, seed)
+        null_check = _null_check(spec, embedder, seed)
         value_check = _value_elite_wins_niche(axes, seed, home, project)
 
-        variety_gate = {
-            "engine": engine_metrics,
-            "single_shot": base_metrics,
-            "dpp_on_pool": dpp_metrics,
-            "first_n_on_pool": firstn_metrics,
-            "null_check": null_check,
-            "value_check": value_check,
-            # This gate validates VARIETY geometry plus one narrow VALUE assertion
-            # (higher within-niche fitness wins its niche). State plainly what is
-            # still uncovered so the name can't be mistaken for a full value gate.
-            "coverage_gaps": [
-                "originality: no external referent is checked (advisory probe only)",
-                "value: partial — higher within-niche fitness is asserted to win "
-                "its niche; cross-niche value (which niches matter) is unguarded",
-            ],
-            "checks": {
-                "mpd_beats_single_shot": engine_metrics["mean_pairwise_distance"]
-                > base_metrics["mean_pairwise_distance"] + MARGIN_MPD,
-                "vendi_beats_single_shot": engine_metrics["vendi"]
-                > base_metrics["vendi"] + MARGIN_VENDI,
-                "entropy_beats_single_shot": engine_metrics["niche_entropy"]
-                > base_metrics["niche_entropy"],
-                # averaged over shuffled seeds, so it isn't an artifact of pool order
-                "dpp_beats_first_n": dpp_metrics["mean_pairwise_distance_avg"]
-                > firstn_metrics["mean_pairwise_distance_avg"] + MARGIN_DPP,
-                # DPP doesn't regress below random when there's nothing to gain
-                "null_no_regression": null_check["passed"],
-                # first VALUE check: higher within-niche fitness wins its niche
-                # (and the swap sanity flips the elite). See _value_elite_wins_niche.
-                "value_elite_wins_niche": value_check["passed"],
-            },
-        }
-        variety_gate["passed"] = all(variety_gate["checks"].values())
+        variety_gate = _build_variety_gate(engine_metrics, base_metrics, dpp_metrics,
+                                           firstn_metrics, null_check, value_check)
 
-        reversal = _collapse_reversal(spec, settings, axes, seed, home, project)
+        reversal = _collapse_reversal(settings, axes, seed, home, project)
         semantic = _live_semantic_check(live)
         # Advisory only: measures distance-to-obvious against a held-out half. It is
         # deliberately NOT added to variety_gate["checks"] and NOT part of `ok`.
@@ -606,15 +564,75 @@ def run(project: str = "selftest", live: bool = False, seed: int = 0,
             "cycles": SELFTEST_CYCLES,
             "embedder": embed.DEFAULT_PROVIDER if live else "hash",
         }
+
+
+def _skipped(reason: str) -> Dict[str, Any]:
+    """The uniform not-run probe record (review-r5: the shape was pasted at three sites whose
+    excuse strings had already drifted)."""
+    return {"ran": False, "skipped": True, "reason": reason}
+
+
+@contextlib.contextmanager
+def _forced_embedder(name: str):
+    """Force ``$KG_DIVERGE_EMBEDDER`` for the duration (review-r5: run() inlined the env
+    save/restore + cache-reset pair around its whole body). Restores the caller's env — the test
+    suite calls run() in-process — and resets the embedder cache on BOTH ends so neither side
+    inherits a model built under the other's setting."""
+    prev = os.environ.get(embed.ENV_VAR)
+    os.environ[embed.ENV_VAR] = name
+    embed.reset_cache()
+    try:
+        yield
     finally:
-        if prev_embedder is None:
+        if prev is None:
             os.environ.pop(embed.ENV_VAR, None)
         else:
-            os.environ[embed.ENV_VAR] = prev_embedder
+            os.environ[embed.ENV_VAR] = prev
         embed.reset_cache()
 
 
-def _stub_human(pipeline, project, result, home) -> None:
+def _build_variety_gate(engine_metrics, base_metrics, dpp_metrics, firstn_metrics,
+                        null_check, value_check) -> Dict[str, Any]:
+    """Assemble the variety gate — the audit-critical part of the report: `checks` are exactly what
+    feeds `passed` (and so `ok`); everything else in the block is context (review-r5: this literal
+    was buried mid-run() under environment bookkeeping)."""
+    gate = {
+        "engine": engine_metrics,
+        "single_shot": base_metrics,
+        "dpp_on_pool": dpp_metrics,
+        "first_n_on_pool": firstn_metrics,
+        "null_check": null_check,
+        "value_check": value_check,
+        # This gate validates VARIETY geometry plus one narrow VALUE assertion
+        # (higher within-niche fitness wins its niche). State plainly what is
+        # still uncovered so the name can't be mistaken for a full value gate.
+        "coverage_gaps": [
+            "originality: no external referent is checked (advisory probe only)",
+            "value: partial — higher within-niche fitness is asserted to win "
+            "its niche; cross-niche value (which niches matter) is unguarded",
+        ],
+        "checks": {
+            "mpd_beats_single_shot": engine_metrics["mean_pairwise_distance"]
+            > base_metrics["mean_pairwise_distance"] + MARGIN_MPD,
+            "vendi_beats_single_shot": engine_metrics["vendi"]
+            > base_metrics["vendi"] + MARGIN_VENDI,
+            "entropy_beats_single_shot": engine_metrics["niche_entropy"]
+            > base_metrics["niche_entropy"],
+            # averaged over shuffled seeds, so it isn't an artifact of pool order
+            "dpp_beats_first_n": dpp_metrics["mean_pairwise_distance_avg"]
+            > firstn_metrics["mean_pairwise_distance_avg"] + MARGIN_DPP,
+            # DPP doesn't regress below random when there's nothing to gain
+            "null_no_regression": null_check["passed"],
+            # first VALUE check: higher within-niche fitness wins its niche
+            # (and the swap sanity flips the elite). See _value_elite_wins_niche.
+            "value_elite_wins_niche": value_check["passed"],
+        },
+    }
+    gate["passed"] = all(gate["checks"].values())
+    return gate
+
+
+def _stub_human(project, result, home) -> None:
     """Pick the best idea by a blend of judge ``fitness`` and intra-session ``novelty``.
 
     Ranks each slate item by ``0.5 * fitness + 0.5 * novelty`` (previously novelty

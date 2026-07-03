@@ -139,11 +139,9 @@ def test_literal_placeholder_identity_is_in_returned_map():
     assert mapping.get("⟦PERSON:1⟧") == "⟦PERSON:1⟧", mapping
 
 
-def test_reset_clears_reserved_literal_namespace():
-    # reset() must also drop the cumulative reserved-literal set, or a fresh session would keep skipping
-    # numbers it has no reason to. (reset() is uncalled today; this pins its documented full-clear.)
-    sc = Scrubber("high")
-    sc.scrub("marker ⟦EMAIL:5⟧ here")
-    assert "⟦EMAIL:5⟧" in sc._reserved_placeholders
-    sc.reset()
-    assert sc._reserved_placeholders == set() and sc._mapping == {} and sc._counters == {}
+def test_reset_footgun_is_removed():
+    # scrub-reset, resolved for good in review-r5: reset() invalidated every previously-issued
+    # placeholder while consumers (the MCP server's _scrub_map) kept their accumulated restore maps —
+    # a documented canon-corruption footgun with no production caller. The API is gone; a fresh
+    # scrubbing session is a fresh Scrubber() instance, so the hazard class cannot recur.
+    assert not hasattr(Scrubber, "reset")

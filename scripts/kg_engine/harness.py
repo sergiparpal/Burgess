@@ -13,6 +13,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 from .graphio import node_link_graph
+from .sources import section_corpus
 
 # --------------------------------------------------------------------------- Krippendorff's alpha
 
@@ -276,6 +277,9 @@ _SENT = re.compile(r"[.!?]+\s+")
 _KEY_TERM_MIN_LEN = 5
 _KEY_TERMS_PER_SENTENCE = 3              # cap on key terms sampled per sentence
 _UTILITY_SATURATION = 5                  # utility hits saturate the per-output score at this count
+# The causal/structural marker terms whose presence counts as "utility" in an ideation output —
+# named beside its saturation knob instead of living inline in the scoring loop (review-r5).
+_UTILITY_MARKERS = re.compile(r"\bbecause\b|\bif\b|\btherefore\b|\bbridge|\bconnect")
 _UNSUPPORTED_SLACK = 0.05                # hallucination-guard slack allowed on unsupported_rate in _beats
 
 
@@ -300,7 +304,7 @@ def _score_condition(outputs: list[str], source_text: str) -> dict:
         # an empty/too-short output has no n-grams; score it 0 novelty rather than a free 1.0, so a
         # condition can't game the experiment by emitting blank or one-word "ideas".
         novelties.append(1.0 - overlap if ong else 0.0)
-        util.append(min(1.0, len(re.findall(r"\bbecause\b|\bif\b|\btherefore\b|\bbridge|\bconnect", o.lower())) / _UTILITY_SATURATION))
+        util.append(min(1.0, len(_UTILITY_MARKERS.findall(o.lower())) / _UTILITY_SATURATION))
         # only sentences that have >=1 scorable key term can be judged supported/unsupported.
         # a sentence whose words are all short (<= _KEY_TERM_MIN_LEN chars) yields no key terms — we
         # can't decide it either way, so it's excluded from BOTH numerator and denominator rather than
@@ -354,6 +358,15 @@ def _ordered_conditions(outputs_by_condition: dict):
             yield cond, outs
 
 
+
+def _arm_beats(a, b) -> "bool | None":
+    """One experiment arm's outcome: None when either side lacks data (the guard every arm used to
+    repeat, review-r5), else whether `a` beats `b` under the hallucination-guarded rule (_beats)."""
+    if not (a and b and a["n"] and b["n"]):
+        return None
+    return _beats(a, b)
+
+
 def ideation(outputs_by_condition: dict, source_text: str = "") -> dict:
     """Score pooled outputs per condition and emit a verdict.
 
@@ -376,34 +389,43 @@ def ideation(outputs_by_condition: dict, source_text: str = "") -> dict:
         raise ValueError("outputs must be a {condition: [outputs]} object")
     table = {cond: _score_condition(outs, source_text) for cond, outs in _ordered_conditions(outputs_by_condition)}
     g, c = table.get("graph"), table.get("control")
-    verdict = "insufficient data"
-    if g and c and g["n"] and c["n"]:
-        verdict = ("graph condition produced more diverse/novel ideas without more unsupported claims"
-                   if _beats(g, c) else "graph condition did NOT clearly beat control")
-    out = {"table": table, "verdict": verdict}
+    out = {"table": table, "verdict": "insufficient data"}
+
+    # One arm = one _arm_beats call (review-r5: each of the four arms — and history says arms keep
+    # being ADDED; dpp and lightrag were already accretions — copy-pasted the same
+    # both-sides-have-data guard around _beats).
+    res = _arm_beats(g, c)
+    if res is not None:
+        out["verdict"] = ("graph condition produced more diverse/novel ideas without more unsupported claims"
+                          if res else "graph condition did NOT clearly beat control")
+
     gg = table.get("graph+generate")
-    if gg and c and gg["n"] and c["n"]:
-        if _beats(gg, c):
+    res = _arm_beats(gg, c)
+    if res is not None:
+        if res:
             exceeds_graph = bool(g and g["n"]) and (gg["diversity"] > g["diversity"] or gg["novelty"] > g["novelty"])
             out["generate_verdict"] = ("graph+generate beat control on diversity/novelty without more "
                                        "unsupported claims" + (" — and exceeded graph alone" if exceeds_graph
                                                                else " (on par with graph alone)"))
         else:
             out["generate_verdict"] = "graph+generate did NOT clearly beat control"
-    gdpp = table.get("graph+generate+dpp")
-    if gdpp and gg and gdpp["n"] and gg["n"]:
-        # FUSION Stage 6: the D1 comparison arm — the SAME hypothesized slate, presented in
-        # advisory-DPP order with geometry labels. Beating graph+generate here means the
-        # PRESENTATION (order + labels) lifted ideation, since the candidate set is identical.
+
+    # FUSION Stage 6: the D1 comparison arm — the SAME hypothesized slate, presented in
+    # advisory-DPP order with geometry labels. Beating graph+generate here means the
+    # PRESENTATION (order + labels) lifted ideation, since the candidate set is identical.
+    res = _arm_beats(table.get("graph+generate+dpp"), gg)
+    if res is not None:
         out["dpp_verdict"] = (
             "graph+generate+dpp beat graph+generate on diversity/novelty without more "
-            "unsupported claims" if _beats(gdpp, gg)
+            "unsupported claims" if res
             else "graph+generate+dpp did NOT clearly beat graph+generate")
-    lr = table.get("lightrag")
-    if lr and g and lr["n"] and g["n"]:
+
+    # NB the operands invert here: the question is whether GRAPH beats the baseline.
+    res = _arm_beats(g, table.get("lightrag"))
+    if res is not None:
         out["lightrag_verdict"] = (
             "graph condition beat the LightRAG GraphRAG baseline on diversity/novelty without more "
-            "unsupported claims" if _beats(g, lr)
+            "unsupported claims" if res
             else "graph condition did NOT clearly beat the LightRAG GraphRAG baseline")
     return out
 
@@ -452,72 +474,102 @@ def _main(argv: list[str]) -> int:
         return 2
 
 
+def _positional_path(argv: list[str], index: int = 1, default=None):
+    """The optional positional file path most harness commands take (review-r5: the pluck was
+    repeated per command)."""
+    return argv[index] if len(argv) > index else default
+
+
+def _cmd_agreement(argv: list[str]) -> int:
+    demo = [{"e1": "correct", "e2": "vague", "e3": "correct"},
+            {"e1": "correct", "e2": "vague", "e3": "fabricated"}]
+    label_sets, _ = _load_json_or_demo(_positional_path(argv), demo,
+                                       notice="no labels file; using demo label sets")
+    a = agreement(label_sets)
+    print(f"krippendorff_alpha: {a:.3f}")
+    reliable = f"RELIABLE (>={_ALPHA_RELIABLE})" if a >= _ALPHA_RELIABLE else "BELOW THRESHOLD — grounding signal stays advisory"
+    print(f"verdict: {reliable}")
+    return 0
+
+
+def _cmd_specificity(argv: list[str]) -> int:
+    gpath = _positional_path(argv, 1, "derived/graph.json")
+    spath = _positional_path(argv, 2)
+    demo = {"directed": True, "nodes": [{"id": "a", "label": "system"}, {"id": "b", "label": "entropy"},
+            {"id": "c", "label": "time"}, {"id": "d", "label": "thermodynamic arrow"}],
+            "links": [{"source": "a", "target": "b"}, {"source": "a", "target": "c"},
+                      {"source": "b", "target": "d"}, {"source": "c", "target": "d"}]}
+    gdata, _ = _load_json_or_demo(gpath, demo, notice="no graph.json; using demo graph")
+    # Split the source into per-section IDF documents, mirroring projector._corpus(). Feeding the
+    # whole file as ONE document makes n=1, every term's document-frequency d=1, so every term
+    # gets an identical IDF — specificity collapses to a single value, spread≈0, and the gate
+    # verdict is ALWAYS the degenerate "corpus too small / no IDF spread", never reflecting the
+    # real graph. The production projector path already splits; this standalone CLI must too.
+    if spath:
+        # a GIVEN-but-missing source path must NOT silently fall back to the demo corpus — that
+        # would yield a degenerate gate verdict read as a real measurement (mirrors
+        # _load_json_or_demo, which only falls back when NO path was supplied).
+        if not Path(spath).exists():
+            raise _LoadError(f"source path not found: {spath}")
+        text = Path(spath).read_text(encoding="utf-8")
+        # the SAME per-section corpus the projector wires (single home: sources.section_corpus,
+        # review-r5) — the gate verdict here only means what the projector computes if the two
+        # corpora are bit-identical.
+        corpus = section_corpus(text) or [text]
+    else:
+        print("[harness] no source; using demo IDF corpus", file=sys.stderr)
+        corpus = _demo_corpus()
+    res = specificity(gdata, corpus)
+    print(json.dumps(res, indent=2))
+    return 0
+
+
+def _cmd_ideation(argv: list[str]) -> int:
+    demo = {"source": "entropy grounds the arrow of time",
+            "outputs": {"control": ["A is connected to B."],
+                        "graph": ["A bridges B and C because entropy grounds time."],
+                        "rag": ["A relates to B somehow."]}}
+    blob, _ = _load_json_or_demo(_positional_path(argv), demo,
+                                 notice="no outputs file; using demo outputs")
+    src_text = blob.get("source", "")
+    # when outputs aren't nested under "outputs", treat the rest of the blob as conditions but
+    # never let the top-level "source" string leak in as a fake (char-iterated) condition.
+    obc = blob.get("outputs", {k: v for k, v in blob.items() if k != "source"})
+    res = ideation(obc, src_text)
+    print(json.dumps(res, indent=2))
+    return 0
+
+
+def _cmd_convergence(argv: list[str]) -> int:
+    # demo: the high band (convergence>=2) grounds at 0.75, the low band (==1) at 0.25 — a clean
+    # separation across enough samples, so the gate fires ON (mirrors the specificity/ideation demos).
+    demo = [{"convergence": 2, "grounded": True}, {"convergence": 2, "grounded": True},
+            {"convergence": 2, "grounded": True}, {"convergence": 2, "grounded": False},
+            {"convergence": 1, "grounded": True}, {"convergence": 1, "grounded": False},
+            {"convergence": 1, "grounded": False}, {"convergence": 1, "grounded": False}]
+    history, _ = _load_json_or_demo(_positional_path(argv), demo,
+                                    notice="no history file; using demo convergence history")
+    res = convergence(history)
+    print(json.dumps(res, indent=2))
+    return 0
+
+
+# command table (review-r5: a fifth metric used to mean copying a whole if-branch inside one long
+# _dispatch; now it is one _cmd_* function + one row here).
+_COMMANDS = {
+    "agreement": _cmd_agreement,
+    "specificity": _cmd_specificity,
+    "ideation": _cmd_ideation,
+    "convergence": _cmd_convergence,
+}
+
+
 def _dispatch(cmd: str, argv: list[str]) -> int:
-    if cmd == "agreement":
-        path = argv[1] if len(argv) > 1 else None
-        demo = [{"e1": "correct", "e2": "vague", "e3": "correct"},
-                {"e1": "correct", "e2": "vague", "e3": "fabricated"}]
-        label_sets, _ = _load_json_or_demo(path, demo, notice="no labels file; using demo label sets")
-        a = agreement(label_sets)
-        print(f"krippendorff_alpha: {a:.3f}")
-        reliable = f"RELIABLE (>={_ALPHA_RELIABLE})" if a >= _ALPHA_RELIABLE else "BELOW THRESHOLD — grounding signal stays advisory"
-        print(f"verdict: {reliable}")
-        return 0
-    if cmd == "specificity":
-        gpath = argv[1] if len(argv) > 1 else "derived/graph.json"
-        spath = argv[2] if len(argv) > 2 else None
-        demo = {"directed": True, "nodes": [{"id": "a", "label": "system"}, {"id": "b", "label": "entropy"},
-                {"id": "c", "label": "time"}, {"id": "d", "label": "thermodynamic arrow"}],
-                "links": [{"source": "a", "target": "b"}, {"source": "a", "target": "c"},
-                          {"source": "b", "target": "d"}, {"source": "c", "target": "d"}]}
-        gdata, _ = _load_json_or_demo(gpath, demo, notice="no graph.json; using demo graph")
-        # Split the source into per-section IDF documents, mirroring projector._corpus(). Feeding the
-        # whole file as ONE document makes n=1, every term's document-frequency d=1, so every term
-        # gets an identical IDF — specificity collapses to a single value, spread≈0, and the gate
-        # verdict is ALWAYS the degenerate "corpus too small / no IDF spread", never reflecting the
-        # real graph. The production projector path already splits; this standalone CLI must too.
-        if spath:
-            # a GIVEN-but-missing source path must NOT silently fall back to the demo corpus — that
-            # would yield a degenerate gate verdict read as a real measurement (mirrors
-            # _load_json_or_demo, which only falls back when NO path was supplied).
-            if not Path(spath).exists():
-                raise _LoadError(f"source path not found: {spath}")
-            text = Path(spath).read_text(encoding="utf-8")
-            corpus = [s for s in text.split("\n## ") if s.strip()] or [text]
-        else:
-            print("[harness] no source; using demo IDF corpus", file=sys.stderr)
-            corpus = _demo_corpus()
-        res = specificity(gdata, corpus)
-        print(json.dumps(res, indent=2))
-        return 0
-    if cmd == "ideation":
-        path = argv[1] if len(argv) > 1 else None
-        demo = {"source": "entropy grounds the arrow of time",
-                "outputs": {"control": ["A is connected to B."],
-                            "graph": ["A bridges B and C because entropy grounds time."],
-                            "rag": ["A relates to B somehow."]}}
-        blob, _ = _load_json_or_demo(path, demo, notice="no outputs file; using demo outputs")
-        src = blob.get("source", "")
-        # when outputs aren't nested under "outputs", treat the rest of the blob as conditions but
-        # never let the top-level "source" string leak in as a fake (char-iterated) condition.
-        obc = blob.get("outputs", {k: v for k, v in blob.items() if k != "source"})
-        res = ideation(obc, src)
-        print(json.dumps(res, indent=2))
-        return 0
-    if cmd == "convergence":
-        path = argv[1] if len(argv) > 1 else None
-        # demo: the high band (convergence>=2) grounds at 0.75, the low band (==1) at 0.25 — a clean
-        # separation across enough samples, so the gate fires ON (mirrors the specificity/ideation demos).
-        demo = [{"convergence": 2, "grounded": True}, {"convergence": 2, "grounded": True},
-                {"convergence": 2, "grounded": True}, {"convergence": 2, "grounded": False},
-                {"convergence": 1, "grounded": True}, {"convergence": 1, "grounded": False},
-                {"convergence": 1, "grounded": False}, {"convergence": 1, "grounded": False}]
-        history, _ = _load_json_or_demo(path, demo, notice="no history file; using demo convergence history")
-        res = convergence(history)
-        print(json.dumps(res, indent=2))
-        return 0
-    print(f"unknown command: {cmd}", file=sys.stderr)
-    return 2
+    handler = _COMMANDS.get(cmd)
+    if handler is None:
+        print(f"unknown command: {cmd}", file=sys.stderr)
+        return 2
+    return handler(argv)
 
 
 if __name__ == "__main__":

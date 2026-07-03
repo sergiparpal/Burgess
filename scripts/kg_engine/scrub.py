@@ -61,6 +61,14 @@ def _is_personal_name(match: str) -> bool:
     return first in _GIVEN_NAMES
 
 
+# The bare Title-Case bigram PERSON rule — defined here and placed into _PATTERNS by reference, so
+# scrub()'s identity check (`pat is _BARE_PERSON_RE`) gates exactly this rule behind the given-name
+# lexicon no matter how the list is reordered (review-r5: it used to be re-bound from the list by
+# POSITION, `_PATTERNS[-2][1]`, defended only by an assert). Groups (first | gap | second) so scrub()
+# can resume at the SECOND token's start when the first is a non-name (F6): a real full name
+# beginning inside a spared bigram is still re-tested, not skipped.
+_BARE_PERSON_RE = re.compile(r"\b([A-Z][a-z]+)(\s+)([A-Z][a-z]+)\b")
+
 # Order matters: most specific / highest-risk first so a secret isn't partially eaten by a weaker rule.
 # Every SECRET-class rule precedes EMAIL/PHONE/CC so a structured secret is consumed WHOLE — never left
 # with only a digit fragment redacted by the phone/CC rule while the rest leaks verbatim (scrub-3).
@@ -147,18 +155,9 @@ _PATTERNS: list[tuple[str, re.Pattern]] = [
     # Person heuristic (high only): a courtesy title is sufficient; a bare Title-Case bigram is gated
     # behind the given-name lexicon (_is_personal_name) so concept bigrams survive (scrub-4).
     ("PERSON", re.compile(r"\b(?:Mr|Mrs|Ms|Dr|Prof)\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?\b")),
-    # Groups (first | gap | second) so scrub() can resume at the SECOND token's start when the first is
-    # a non-name (F6): a real full name beginning inside a spared bigram is still re-tested, not skipped.
-    ("PERSON", re.compile(r"\b([A-Z][a-z]+)(\s+)([A-Z][a-z]+)\b")),  # gated by _is_personal_name in scrub()
+    ("PERSON", _BARE_PERSON_RE),  # gated by _is_personal_name in scrub() (identity check on this object)
     ("ADDRESS", re.compile(r"\b\d{1,5}\s+[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*\s+(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Lane|Ln|Dr|Drive)\b")),
 ]
-
-# The bare PERSON bigram pattern is the second-from-last rule; it (and only it) is gated by the
-# lexicon. Bound by position but asserted by pattern so a future reorder/insertion fails LOUDLY here
-# instead of silently gating the wrong rule (e.g. turning off PERSON or mis-gating ADDRESS).
-_BARE_PERSON_RE = _PATTERNS[-2][1]
-assert _BARE_PERSON_RE.pattern == r"\b([A-Z][a-z]+)(\s+)([A-Z][a-z]+)\b", \
-    "PERSON rule order changed — re-bind _BARE_PERSON_RE to the bare Title-Case bigram pattern"
 
 assert {cat for cat, _ in _PATTERNS} <= ALL_CATEGORIES, \
     "_PATTERNS names a category outside ALL_CATEGORIES"
@@ -205,16 +204,10 @@ class Scrubber:
             if term
         ]
 
-    def reset(self) -> None:
-        """Clear the accumulated placeholder namespace (start a fresh scrubbing session).
-
-        WARNING: this INVALIDATES every previously-issued placeholder — after reset() the counter
-        restarts at 1, so ``⟦EMAIL:1⟧`` may be re-issued for a different value. A consumer that keeps a
-        SEPARATE restore accumulator (e.g. the MCP server's ``_scrub_map``) MUST clear it in lockstep, or
-        a reused placeholder will restore to the wrong original (scrub-reset). It is currently uncalled.
-        """
-        self._counters, self._value_to_ph, self._mapping = {}, {}, {}
-        self._reserved_placeholders = set()
+    # NB deliberately no reset() method (scrub-reset, removed review-r5): clearing the accumulated
+    # placeholder namespace mid-session would re-issue ⟦CAT:1⟧ for a different value while consumers
+    # (the MCP server's _scrub_map) keep their accumulated restore maps — a canon-corruption footgun
+    # that had no production caller. A fresh scrubbing session is a fresh Scrubber() instance.
 
     def _active(self) -> set[str]:
         return SENSITIVITY.get(self.sensitivity, SENSITIVITY["medium"])

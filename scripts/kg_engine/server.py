@@ -23,7 +23,7 @@ import traceback
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from . import __version__
+from . import __version__, envconfig
 from .boundary import DEFAULT_MAX_EDGES_PER_KB, MIN_SPAN_CHARS, merge_results_into_nodes, validate_payload
 from .canon import Canon
 from .groundaudit import GroundAuditLog
@@ -33,6 +33,7 @@ from .model import (
     Edge,
     EpistemicState,
     FAILURE_STATES,
+    FAILURE_STATE_VALUES,
     GROUNDABLE_STATES,
     Node,
     Provenance,
@@ -46,7 +47,7 @@ from .pack import load_pack
 from .projector import Projector
 from .reconciler import GROUND_AUDIT, Reconciler
 from .scrub import Scrubber
-from .sources import SourceSet
+from .sources import SourceSet, split_sections
 
 # Module logger. The engine had no logging seam, so silent `except Exception: pass` fallbacks were
 # invisible to an operator. Stays quiet by default (no handler attached) per the library convention; an
@@ -59,6 +60,13 @@ VALID_VERDICTS = {s.value for s in GROUNDABLE_STATES}
 # The known verdict actors, derived from the AuthoredBy enum (mirroring how VALID_VERDICTS derives from
 # GROUNDABLE_STATES) so the clamp tracks the model instead of an inline literal that can drift.
 VALID_ACTORS = {a.value for a in AuthoredBy}
+# The dispositions that mean "this item persisted to the canon" — derived from the Disposition enum
+# (like the two sets above) for kg_write's rollback re-bucketing and the materialize ledger, which
+# previously re-typed the two names as raw string literals (review-r5).
+PERSISTED_DISPOSITIONS = (Disposition.ACCEPTED.value, Disposition.DEMOTED.value)
+# The "not found" read shape, defined once for the engine's degraded-miss and the MCP wrapper's
+# plain-miss (review-r5: the literal lived in two places). Callers copy before mutating.
+_NOT_FOUND = {"error": "not found"}
 
 # Absolute filesystem paths (Windows drive/UNC, or a POSIX path of >=2 segments) — redacted from any
 # error string before it crosses the §1.9 egress boundary back to the session, so a raw exception can't
@@ -133,21 +141,18 @@ DEFAULT_HANDLER_TIMEOUT = 300.0
 _WRITE_CACHE_MAX = 256
 
 
-def _clean_env(key: str) -> str | None:
-    """Read an env var, treating empty OR an unsubstituted ``${...}`` placeholder as unset (mirrors
-    ``bootstrap._clean`` / ``launch_server.clean``). Lifted to module scope so the logging path and
-    ``build_engine_from_env`` resolve project/data/source identically."""
-    v = (os.environ.get(key) or "").strip()
-    return None if not v or v.startswith("${") else v
+# The canonical env-value cleaner (empty / ${...} placeholder / bare sentinel → unset). The rule
+# itself is single-homed in envconfig (review-r5) — shared with bootstrap, the PreToolUse hook, and
+# the lightrag arm; launch_server.clean is its declared JS mirror.
+_clean_env = envconfig.clean_env
 
 
 def resolve_data_dir() -> Path:
     """The engine data dir (where the derived layer + server.log live), resolved exactly as a
-    KGEngine would: ``KG_DATA`` if set, else ``<project>/.kg-data``. Used to place the server log
-    BEFORE the engine is constructed, so even an engine-construction error is captured."""
-    proj = _clean_env("KG_PROJECT_DIR") or _clean_env("CLAUDE_PROJECT_DIR") or os.getcwd()
-    data = _clean_env("KG_DATA")
-    return Path(data) if data else (Path(proj) / ".kg-data")
+    KGEngine would: ``KG_DATA`` if set, else ``<project>/.kg-data`` — the rule lives in
+    ``envconfig.resolve_data_dir``, shared with the PreToolUse hook (review-r5). Used to place the
+    server log BEFORE the engine is constructed, so even an engine-construction error is captured."""
+    return envconfig.resolve_data_dir(envconfig.resolve_project(os.getcwd()))
 
 
 def server_log_path(data_dir=None) -> Path:
@@ -393,18 +398,20 @@ class _SourceResolver:
         self.source_path = Path(source_path) if source_path else None
         self._cache: "tuple[tuple, SourceSet] | None" = None  # (signature, SourceSet) memo
 
-    def set(self) -> SourceSet:
+    def resolve(self) -> SourceSet:
+        """The current SourceSet (memoized on the file signature). Named `resolve` — the old name
+        `set()` read as a mutator when it is the getter (review-r5)."""
         sig = SourceSet.signature(self.source_path)
         if self._cache is None or self._cache[0] != sig:
             self._cache = (sig, SourceSet(self.source_path))
         return self._cache[1]
 
     def text(self) -> str:
-        return self.set().concat
+        return self.resolve().concat
 
     def set_path(self, source_path) -> None:
-        """Re-point at a new source (and drop the memo) IN PLACE, so a holder of .set/.text — e.g. the
-        already-wired projector — sees the change without being reconstructed."""
+        """Re-point at a new source (and drop the memo) IN PLACE, so a holder of .resolve/.text —
+        e.g. the already-wired projector — sees the change without being reconstructed."""
         self.source_path = Path(source_path) if source_path else None
         self._cache = None
 
@@ -417,8 +424,21 @@ def _wire_projector(canon, derived_dir, *, sources, pack, metrics_mode) -> Proje
     never write a degraded empty-corpus derived layer the server then serves as fresh (finding:
     precontext-bypasses-facade). `sources` is a _SourceResolver; `pack` may be None."""
     return Projector(canon, derived_dir, metrics_mode=metrics_mode,
-                     source_text=sources.text, source_set=sources.set,
+                     source_text=sources.text, source_set=sources.resolve,
                      specificity_seeds=lambda: dict(getattr(pack, "specificity_seeds", {}) or {}))
+
+
+def _load_pack_or_none(pack_path):
+    """Load the pack at `pack_path`, or None when the path is absent/nonexistent or the pack is
+    invalid — a bad pack must DEGRADE (no vocabulary enforcement, no specificity seeds), never crash
+    the server or the read-only hook projector (review-r5: this try/except lived in both
+    constructors)."""
+    if not (pack_path and Path(pack_path).exists()):
+        return None
+    try:
+        return load_pack(pack_path)
+    except Exception:  # noqa: BLE001 — a bad pack must not crash engine construction
+        return None
 
 
 class KGEngine:
@@ -428,7 +448,7 @@ class KGEngine:
                  sensitivity="medium", metrics_mode="structure_only",
                  max_edges_per_kb=DEFAULT_MAX_EDGES_PER_KB):
         self.project_dir = Path(project_dir)
-        self.data_dir = Path(data_dir) if data_dir else (self.project_dir / ".kg-data")
+        self.data_dir = Path(data_dir) if data_dir else (self.project_dir / envconfig.DATA_DIRNAME)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.canon = Canon(self.project_dir)
         self.reconciler = Reconciler(self.canon)
@@ -440,15 +460,14 @@ class KGEngine:
         self._sources = _SourceResolver(source_path)
         # Load the pack BEFORE constructing the projector so its specificity_seeds are wired through the
         # SAME _wire_projector seam the read-only hook uses — no construction-site drift between the two
-        # (finding: precontext-bypasses-facade).
-        self.pack = None
-        if pack_path and Path(pack_path).exists():
-            try:
-                self.pack = load_pack(pack_path)
-            except Exception:  # noqa: BLE001 — a bad pack must not crash the server
-                self.pack = None
+        # (finding: precontext-bypasses-facade). The resolved PATH is kept alongside the loaded pack so
+        # the kg_diverge_* tools can hand the SAME pack to divergence axes resolution instead of it
+        # re-reading KG_PACK_PATH from env — which, unset in a dev launch, silently sent the engine and
+        # the divergence tools to DIFFERENT domain configs in one process (review-r5: pack split-brain).
+        self.pack_path = Path(pack_path) if (pack_path and Path(pack_path).exists()) else None
+        self.pack = _load_pack_or_none(self.pack_path)
         # The projector reads source/specificity lazily, once per real reprojection, off the hot path.
-        self.projector = _wire_projector(self.canon, self.data_dir / "derived",
+        self.projector = _wire_projector(self.canon, self.data_dir / envconfig.DERIVED_DIRNAME,
                                          sources=self._sources, pack=self.pack, metrics_mode=metrics_mode)
         self.scrubber = Scrubber(sensitivity)
         self._scrub_map: dict[str, str] = {}  # accumulated egress placeholder -> original (§1.9)
@@ -477,7 +496,7 @@ class KGEngine:
     def source_set(self) -> SourceSet:
         """The resolved {basename → text} view over the configured source(s) (R4), memoized off the hot
         path. A single configured file is a one-entry SourceSet, byte-identical to the prior path."""
-        return self._sources.set()
+        return self._sources.resolve()
 
     def source_text(self) -> str:
         """The configured source(s) concatenated — feeds the flood-budget size and the projector's IDF
@@ -497,21 +516,21 @@ class KGEngine:
 
     @classmethod
     def read_only_projector(cls, project_dir, data_dir, *, source_path=None, pack_path=None,
-                            metrics_mode="structure_only") -> Projector:
+                            metrics_mode="structure_only", lease_ttl=None) -> Projector:
         """A Projector wired IDENTICALLY to a live engine's (same source corpus + specificity seeds +
         metrics_mode) but over a no-side-effect Canon(ensure_layout=False) — for the read-only PreToolUse
         hook. Goes through the SAME _wire_projector seam as __init__, so the hook can never project a
         degraded (empty-corpus) derived layer the server then serves as fresh (finding:
         precontext-bypasses-facade). The pack is loaded eagerly (the hook holds no engine); a missing or
-        bad pack degrades to no specificity seeds, exactly as __init__ does."""
+        bad pack degrades to no specificity seeds, exactly as __init__ does. ``lease_ttl`` shortens the
+        canon lease for callers that can be SIGKILLed mid-projection (the hook's 5s cap — review-r4:
+        hook-kill-wedges-windows-writers) — a constructor seam instead of the reach-through
+        ``proj.canon.lock.ttl`` mutation the hook used to do (review-r5)."""
         canon = Canon(project_dir, ensure_layout=False)
-        pack = None
-        if pack_path and Path(pack_path).exists():
-            try:
-                pack = load_pack(pack_path)
-            except Exception:  # noqa: BLE001 — a bad pack must not break the read hook
-                pack = None
-        return _wire_projector(canon, Path(data_dir) / "derived",
+        if lease_ttl is not None:
+            canon.lock.ttl = float(lease_ttl)
+        pack = _load_pack_or_none(pack_path)
+        return _wire_projector(canon, Path(data_dir) / envconfig.DERIVED_DIRNAME,
                                sources=_SourceResolver(source_path), pack=pack, metrics_mode=metrics_mode)
 
     # ---- tools -----------------------------------------------------------
@@ -564,6 +583,43 @@ class KGEngine:
             if wd is not None:
                 wd.end_critical()
 
+    _LOCKED_ERROR = "canon vault is locked by another live session"
+
+    def _try_writer_lease(self) -> bool:
+        """Take the single-writer lease with the bounded-BLOCKING acquire — the shared preamble of
+        every canon-mutating handler (kg_ground/kg_rename/kg_merge; review-r5: the pattern and its
+        rationale were triplicated). Acquire the lease FIRST, then read canon state FRESH under it:
+        reading before locking let a concurrent cross-process writer be clobbered by a stale
+        in-memory copy (lost update, F17/L5). The lease then stays held across the whole audit +
+        write (+ unlink + commit) sequence so the records and their compensating truncate are atomic
+        w.r.t. other writers (server-3); write_one/write_nodes re-acquire re-entrantly.
+        Bounded-BLOCKING (never try_acquire_lock): a verdict/rename/merge is a WRITER, so brief
+        cross-process contention (the detached reconcile worker, a headless backend holding the
+        lease for one note) must SERIALIZE cleanly instead of failing outright; the 30s budget stays
+        well under the watchdog timeout (review: writers-use-nonblocking-lock). Returns False when
+        the vault stays held past the budget — the caller returns its own
+        ``{ok: False, error: _LOCKED_ERROR, ...}`` shape."""
+        try:
+            self.canon.acquire_lock()
+            return True
+        except RuntimeError:
+            return False
+
+    def _commit_paths(self, touched, removed_id: str, message: str) -> None:
+        """Best-effort git stage + commit of exactly ONE mutation's paths — shared by kg_rename and
+        kg_merge (review-r5: the block was duplicated verbatim, comments included). Stage only the
+        rewritten notes + the removed note, never a whole-tree `git add -A` re-scan (server-9), and
+        scope the COMMIT to the same pathspec — a bare `git commit` would sweep any externally-staged
+        files in the user's project repo into an engine commit (review:
+        unscoped-commit-sweeps-staged-index)."""
+        from .canon import _git, _git_ok
+        if not _git_ok(self.canon.root):
+            return
+        paths = [str(self.canon.node_path(n.id)) for n in touched]
+        paths.append(str(self.canon.node_path(removed_id)))
+        _git(self.canon.root, "add", "--", *paths, check=False)
+        _git(self.canon.root, "commit", "-m", message, "--allow-empty", "--", *paths, check=False)
+
     def _canon_baseline(self) -> "dict[str, Node]":
         """The {id: Node} canon baseline for kg_write's dedup/flood seeding, cached on the projector's
         cheap dir signature. The signature is computed BEFORE the parse: if a foreign writer lands
@@ -611,7 +667,6 @@ class KGEngine:
         idempotency replay branch tell a genuine retry (identical content) apart from a same-ids payload
         whose text CHANGED (e.g. a corrected span) — the latter must be processed, not silently replayed
         (review: receipt-id-only-drops-content-correction)."""
-        from .model import edge_id as _edge_id
         items = []
         for n in (payload or {}).get("nodes") or []:
             n = n or {}
@@ -623,8 +678,8 @@ class KGEngine:
                          + json.dumps(content, sort_keys=True, ensure_ascii=True, default=str))
         for e in (payload or {}).get("edges") or []:
             e = e or {}
-            eid = _edge_id(str(e.get("source", "")), str(e.get("relation", "")),
-                           str(e.get("target", "")))
+            eid = edge_id(str(e.get("source", "")), str(e.get("relation", "")),
+                          str(e.get("target", "")))
             content = {k: e.get(k) for k in
                        ("span", "notes", "note", "confidence", "confidence_score", "provenance",
                         "authored_by", "epistemic_state", "source_file") if k in e}
@@ -692,9 +747,8 @@ class KGEngine:
         # written_nodes is [] and the accepted/demoted counts must NOT be trusted/accumulated.
         written = list(nodes)
         if rolled_back:
-            persisted = (Disposition.ACCEPTED.value, Disposition.DEMOTED.value)
-            summary["rolled_back"] = sum(summary.get(d, 0) for d in persisted)
-            for d in persisted:
+            summary["rolled_back"] = sum(summary.get(d, 0) for d in PERSISTED_DISPOSITIONS)
+            for d in PERSISTED_DISPOSITIONS:
                 summary[d] = 0
             written = []
         else:
@@ -797,20 +851,10 @@ class KGEngine:
         by = by if by in VALID_ACTORS else "agent"
         state = EpistemicState(verdict)
         promoted_to = None
-        # Acquire the single-writer lease FIRST, then read the owning node FRESH under the lease, mutate,
-        # audit, and write — so the whole read-modify-write is atomic w.r.t. other writers. Reading before
-        # locking (the old order) let a concurrent multi-process grounding clobber our edits with a
-        # whole-node overwrite (lost update, F17/L5). The lease also still guards the audit-append +
-        # write + compensating-truncate sequence (server-3); write_one re-acquires it re-entrantly.
-        # Use the bounded-BLOCKING acquire (as kg_write's write_nodes does), not the non-blocking
-        # try_acquire_lock: a verdict/rename/merge is a WRITER, so brief cross-process contention (the
-        # detached reconcile worker or a headless backend holding the lease for one note) must SERIALIZE
-        # cleanly instead of failing outright with a spurious locked-vault error. The 30s budget stays
-        # well under the watchdog timeout (review: writers-use-nonblocking-lock).
-        try:
-            self.canon._acquire_lock()
-        except RuntimeError:
-            return {"ok": False, "error": "canon vault is locked by another live session"}
+        # Lease-first read-modify-write; the full rationale (F17/L5, server-3,
+        # writers-use-nonblocking-lock) lives once on _try_writer_lease.
+        if not self._try_writer_lease():
+            return {"ok": False, "error": self._LOCKED_ERROR}
         try:
             if kind == "node":
                 # Canonicalize the node id like kg_rename/kg_merge (`slug`) so a non-canonical id doesn't
@@ -876,58 +920,63 @@ class KGEngine:
                 out["provenance_upgraded_to"] = promoted_to
             return out
         finally:
-            self.canon._release_lock()
+            self.canon.release_lock()
+
+    def _promote_support(self, *, verify, apply_span, apply_note, support_span, support_note):
+        """The shared §1.2-3 / PLAN-Stage-8 hypothesized→grounded promotion SKELETON (review-r5: the
+        edge and node gates were ~80% identical twins): a span-less proposal earns grounding only
+        with support, which UPGRADES its provenance. `support_span` (a verbatim source substring,
+        placeholder-restored first) must verify via `verify` and meet MIN_SPAN_CHARS → span-present;
+        else `support_note` (an external citation) → inferred; neither → `hypothesis-needs-support`.
+        The `apply_*` callbacks mutate the item in place ONLY after the checks pass, so a refusal
+        leaves it untouched (no state change, no audit, no write). Returns (promoted_to, None) on
+        success, (None, error) on refusal."""
+        restore = self._restore_fn()
+        if support_span and support_span.strip():
+            check = restore(support_span) if restore else support_span
+            if not verify(check):
+                return None, "support-span-not-in-source"
+            if len(normalize_text(check).replace(" ", "")) < MIN_SPAN_CHARS:
+                return None, "support-span-too-short"
+            apply_span(check)
+            return Provenance.SPAN_PRESENT.value, None
+        if support_note and support_note.strip():
+            apply_note(support_note.strip())
+            return Provenance.INFERRED.value, None
+        return None, "hypothesis-needs-support"
 
     def _promote_hypothesis(self, edge, support_span: str, support_note: str):
-        """The §1.2-3 / PLAN-Stage-8 hypothesized→grounded promotion gate: a span-less proposal earns
-        grounding only with support, which UPGRADES its provenance. Mutates `edge` in place on success
-        and returns (promoted_to, None); on a refusal it leaves the edge UNTOUCHED and returns
-        (None, error) so the caller can refuse before any state change / audit / write. `support_span`
-        (a verbatim source substring) → span-present; `support_note` (an external citation) → inferred;
-        neither → `hypothesis-needs-support`."""
-        restore = self._restore_fn()
-        if support_span and support_span.strip():
-            check = restore(support_span) if restore else support_span
-            # source-aware (R4): verify against the edge's named source if it has one, else
-            # any declared source. The not-in-ANY-source contract is unchanged
-            # (support-span-not-in-source) — a promotion span just has to exist SOMEWHERE.
-            if not self.source_set().verifies(check, source_file=edge.source_file):
-                return None, "support-span-not-in-source"
-            if len(normalize_text(check).replace(" ", "")) < MIN_SPAN_CHARS:
-                return None, "support-span-too-short"
+        """The EDGE promotion gate over `_promote_support`. Source-aware (R4): the span verifies
+        against the edge's named source if it has one, else any declared source — the
+        not-in-ANY-source contract is unchanged (support-span-not-in-source); a promotion span just
+        has to exist SOMEWHERE. Support lands on the edge's own fields: the span becomes `edge.span`
+        (now citable), a citation is appended to `edge.notes`."""
+        def apply_span(check):
             edge.span = check
-            edge.provenance = Provenance.SPAN_PRESENT       # upgraded: now citable
-            return Provenance.SPAN_PRESENT.value, None
-        if support_note and support_note.strip():
+            edge.provenance = Provenance.SPAN_PRESENT        # upgraded: now citable
+        def apply_note(note):
             edge.provenance = Provenance.INFERRED            # upgraded: asserted via external citation
-            edge.notes = self._append_note(edge.notes, f"citation: {support_note.strip()}")
-            return Provenance.INFERRED.value, None
-        return None, "hypothesis-needs-support"
+            edge.notes = self._append_note(edge.notes, f"citation: {note}")
+        return self._promote_support(
+            verify=lambda s: self.source_set().verifies(s, source_file=edge.source_file),
+            apply_span=apply_span, apply_note=apply_note,
+            support_span=support_span, support_note=support_note)
 
     def _promote_hypothesis_node(self, node, support_span: str, support_note: str):
-        """The node counterpart of `_promote_hypothesis`: a hypothesized NODE (a generated compression
-        node / primitive from the propose lane) earns grounding only with support, which UPGRADES its
-        provenance. A Node has no `span`/`notes` field, so the support is restated into the node BODY (the
-        only persisted free-text — body prose may restate cited spans) rather than a
-        stray span attr. Mutates `node` in place on success and returns (promoted_to, None); on a refusal
-        it leaves the node UNTOUCHED and returns (None, error). `support_span` (a verbatim source
-        substring) → span-present; `support_note` (an external citation) → inferred; neither →
-        `hypothesis-needs-support`."""
-        restore = self._restore_fn()
-        if support_span and support_span.strip():
-            check = restore(support_span) if restore else support_span
-            if not self.source_set().verifies(check):
-                return None, "support-span-not-in-source"
-            if len(normalize_text(check).replace(" ", "")) < MIN_SPAN_CHARS:
-                return None, "support-span-too-short"
+        """The NODE promotion gate over `_promote_support` (a generated compression node / primitive
+        from the propose lane). A Node has no `span`/`notes` field, so the support is restated into
+        the node BODY (the only persisted free-text — body prose may restate cited spans) rather
+        than a stray span attr; the span verifies against ANY declared source."""
+        def apply_span(check):
             node.body = self._append_body(node.body, f"grounding span: {check}")
-            node.provenance = Provenance.SPAN_PRESENT       # upgraded: now citable
-            return Provenance.SPAN_PRESENT.value, None
-        if support_note and support_note.strip():
-            node.body = self._append_body(node.body, f"citation: {support_note.strip()}")
+            node.provenance = Provenance.SPAN_PRESENT        # upgraded: now citable
+        def apply_note(note):
+            node.body = self._append_body(node.body, f"citation: {note}")
             node.provenance = Provenance.INFERRED            # upgraded: asserted via external citation
-            return Provenance.INFERRED.value, None
-        return None, "hypothesis-needs-support"
+        return self._promote_support(
+            verify=lambda s: self.source_set().verifies(s),
+            apply_span=apply_span, apply_note=apply_note,
+            support_span=support_span, support_note=support_note)
 
     @staticmethod
     def _append_body(existing: str, addition: str) -> str:
@@ -970,7 +1019,6 @@ class KGEngine:
         (new_id, state_value) iff the id actually CHANGED and the edge is in a policed (verdict-or-
         obsolete) state — the load-bearing record that preserves grounding/failure memory across a
         rename, kept in ONE place so the two rename loops can never drift apart."""
-        from .model import edge_id
         old_eid = edge.id
         if edge.source == old:
             edge.source = new
@@ -985,23 +1033,13 @@ class KGEngine:
     def kg_rename(self, old_id: str, new_id: str, *, message: str = "kg_rename") -> dict:
         """Rename a node and rewrite every edge endpoint referencing it (single-canonical-edge safe)."""
         old, new = slug(old_id), slug(new_id)
-        # Acquire the single-writer lease FIRST, then read the canon FRESH under the lease and compute
-        # the migration set + touched notes, all before write_nodes. Reading BEFORE locking (the old
-        # order) let a concurrent cross-process kg_ground stamp a verdict on a SIBLING edge of a touched
-        # node in the gap; this rename then wrote its stale in-memory copy verbatim (merge=False) and
-        # silently clobbered that just-stamped verdict — a lost update of grounding memory the reconciler
-        # can't recover (it only re-quarantines forgeries, never resurrects a lost legitimate verdict).
-        # Same fix as kg_ground (F17/L5); the lease also stays held across the whole audit + write +
-        # unlink + commit sequence so the migrating records and their compensating truncate are atomic
-        # w.r.t. other writers (server-3). write_nodes/_acquire_lock are re-entrant, so the inner write
-        # still works.
-        # bounded-BLOCKING acquire (mirrors kg_write) so brief cross-process contention serializes rather
-        # than failing this writer outright (review: writers-use-nonblocking-lock).
-        try:
-            self.canon._acquire_lock()
-        except RuntimeError:
-            return {"ok": False, "error": "canon vault is locked by another live session",
-                    "old": old, "new": new}
+        # Lease FIRST, then read the canon fresh under it and compute the migration set + touched
+        # notes before write_nodes (the rationale lives on _try_writer_lease; the rename-specific
+        # hazard: reading before locking let a concurrent verdict on a SIBLING edge of a touched node
+        # be clobbered by this rename's stale verbatim write — a lost update of grounding memory the
+        # reconciler can't recover, F17/L5).
+        if not self._try_writer_lease():
+            return {"ok": False, "error": self._LOCKED_ERROR, "old": old, "new": new}
         try:
             if not self.canon.exists(old):
                 return {"ok": False, "error": "node not found"}
@@ -1059,20 +1097,10 @@ class KGEngine:
             except OSError as e:  # the new note already landed; surface a structured error, not a raw raise
                 return {"ok": False, "old": old, "new": new, "touched": [n.id for n in touched],
                         "error": self._scrub_error(f"rename wrote '{new}' but could not remove old '{old}': {e}")}
-            from .canon import _git, _git_ok
-            if _git_ok(self.canon.root):
-                # stage only what this rename touched — the rewritten notes + the removed old note —
-                # instead of `git add -A` re-scanning the whole working tree per rename (server-9).
-                paths = [str(self.canon.node_path(n.id)) for n in touched]
-                paths.append(str(self.canon.node_path(old)))
-                _git(self.canon.root, "add", "--", *paths, check=False)
-                # Scope the commit to THIS operation's paths (not a bare `git commit`, which would sweep
-                # any externally-staged files in the user's project repo into an engine commit) — mirrors
-                # the already-scoped `git add` (review: unscoped-commit-sweeps-staged-index).
-                _git(self.canon.root, "commit", "-m", message, "--allow-empty", "--", *paths, check=False)
+            self._commit_paths(touched, old, message)
             return {"ok": True, "old": old, "new": new, "touched": [n.id for n in touched]}
         finally:
-            self.canon._release_lock()
+            self.canon.release_lock()
 
     @staticmethod
     def _merge_edge_pair(a: Edge, b: Edge) -> Edge:
@@ -1116,7 +1144,6 @@ class KGEngine:
         (edge_id is a function of source), and a node file holds only its own source's edges — so a
         collision is always within ONE file, which is why this dedup is per-node. Mutates `report`'s
         counters and returns (deduped_edges, changed)."""
-        from .model import edge_id
         survivors: dict[str, Edge] = {}
         changed = False
         for e in edges:
@@ -1161,16 +1188,10 @@ class KGEngine:
         frm, into = slug(from_id), slug(into_id)
         if frm == into:
             return {"ok": False, "error": "cannot merge a node into itself", "from": frm, "into": into}
-        # Acquire the single-writer lease FIRST, then read everything FRESH under the lease — same
-        # ordering as kg_rename/kg_ground (F17/L5): reading before locking would let a concurrent
-        # cross-process verdict on a sibling edge be clobbered by our verbatim (merge=False) write.
-        # bounded-BLOCKING acquire (mirrors kg_write) so brief cross-process contention serializes rather
-        # than failing this writer outright (review: writers-use-nonblocking-lock).
-        try:
-            self.canon._acquire_lock()
-        except RuntimeError:
-            return {"ok": False, "error": "canon vault is locked by another live session",
-                    "from": frm, "into": into}
+        # Lease FIRST, then read everything fresh under it — same ordering as kg_rename/kg_ground
+        # (the rationale lives on _try_writer_lease, F17/L5).
+        if not self._try_writer_lease():
+            return {"ok": False, "error": self._LOCKED_ERROR, "from": frm, "into": into}
         try:
             if not self.canon.exists(frm):
                 return {"ok": False, "error": "source node not found", "from": frm, "into": into}
@@ -1239,16 +1260,7 @@ class KGEngine:
             except OSError as e:
                 return {"ok": False, "from": frm, "into": into, "touched": [n.id for n in touched],
                         "error": self._scrub_error(f"merge wrote '{into}' but could not remove old '{frm}': {e}")}
-            from .canon import _git, _git_ok
-            if _git_ok(self.canon.root):
-                # stage only the rewritten notes + the removed source note (not a whole-tree `git add -A`).
-                paths = [str(self.canon.node_path(n.id)) for n in touched]
-                paths.append(str(self.canon.node_path(frm)))
-                _git(self.canon.root, "add", "--", *paths, check=False)
-                # Scope the commit to THIS operation's paths (not a bare `git commit`, which would sweep
-                # any externally-staged files in the user's project repo into an engine commit) — mirrors
-                # the already-scoped `git add` (review: unscoped-commit-sweeps-staged-index).
-                _git(self.canon.root, "commit", "-m", message, "--allow-empty", "--", *paths, check=False)
+            self._commit_paths(touched, frm, message)
             return {"ok": True, "from": frm, "into": into, "touched": [n.id for n in touched],
                     "edges_rewritten": report["edges_rewritten"],
                     "edges_deduped": report["edges_deduped"],
@@ -1256,7 +1268,7 @@ class KGEngine:
                     "nodes": len(others) + 1,
                     "edges": sum(len(n.edges) for n in others) + len(into_node.edges)}
         finally:
-            self.canon._release_lock()
+            self.canon.release_lock()
 
     def kg_metrics(self) -> dict:
         # When the derived index is already fresh, serve counts from it with O(1) SQL instead of
@@ -1277,30 +1289,8 @@ class KGEngine:
             logger.debug("metrics index read failed (%s); falling back to canon parse", e)
         nodes = self.canon.all_nodes()
         edges = [e for n in nodes for e in n.edges]
-        by_state: dict = {}
-        for e in edges:
-            by_state[e.epistemic_state.value] = by_state.get(e.epistemic_state.value, 0) + 1
+        by_state = dict(Counter(e.epistemic_state.value for e in edges))  # same idiom as kg_status
         return {"nodes": len(nodes), "edges": len(edges), "edges_by_epistemic_state": by_state}
-
-    @staticmethod
-    def _split_sections(text: str) -> "list[tuple[str, str]]":
-        """Split a source document into (heading, body) by level-2 `## ` headings — the SAME unit
-        `/kg-build` extracts per subagent. Text before the first `##` is the `(preamble)`. `### ` and
-        deeper stay inside their `##` section's body."""
-        sections: list[tuple[str, str]] = []
-        title, buf = None, []
-        for line in text.splitlines():
-            # `### `/deeper never satisfy startswith("## ") (the 3rd char is '#', not ' '), so they fall to
-            # the else and stay in the section body — no extra guard needed.
-            if line.startswith("## "):
-                if title is not None or buf:
-                    sections.append((title or "(preamble)", "\n".join(buf)))
-                title, buf = line[3:].strip(), []
-            else:
-                buf.append(line)
-        if title is not None or buf:
-            sections.append((title or "(preamble)", "\n".join(buf)))
-        return sections
 
     def _coverage(self, edges) -> dict:
         """Which configured source files / `##` sections already have at least one ANCHORED (span-present)
@@ -1319,7 +1309,9 @@ class KGEngine:
         spans = {s for s in (normalize_text(e.span) for e in edges if e.span and e.span.strip()) if s}
         files, sections = [], []
         for fname, raw in texts.items():
-            secs = self._split_sections(raw)
+            # the SAME `##` unit /kg-build extracts per subagent — the rule is single-homed in
+            # sources.split_sections (review-r5), shared with the headless backend's slicer.
+            secs = split_sections(raw, preamble_title="(preamble)")
             norm_bodies = [normalize_text(body) for _title, body in secs]
             covered_flags = [False] * len(secs)
             norm_file = normalize_text(raw)
@@ -1374,7 +1366,6 @@ class KGEngine:
         calling this), pass it in to derive the ids from the in-memory edges instead of re-parsing the
         whole canon (server-6). The index keeps failure memory (§1.7 never prunes it), so the set is
         identical; EpistemicState subclasses str, so the string compare matches."""
-        from .model import FAILURE_STATES
         if G is not None:
             fail = {s.value for s in FAILURE_STATES}
             return {d.get("id") for _, _, d in G.edges(data=True) if d.get("epistemic_state") in fail}
@@ -1538,11 +1529,14 @@ class KGEngine:
         cold-contended path (an idempotent CREATE TABLE IF NOT EXISTS + an empty graph.json)."""
         try:
             import networkx as nx
-            from .projector import _atomic_write, _node_link_data
+            # import from the owning leaves directly (review-r5: these used to be re-imported
+            # THROUGH the projector, hiding where they live)
+            from .atomicio import atomic_write_text
+            from .graphio import node_link_data
             if not self.projector.db_path.exists() or self.projector._schema_outdated():
                 self.projector._connect().close()
             if not self.projector.graph_path.exists():
-                _atomic_write(self.projector.graph_path, json.dumps(_node_link_data(nx.MultiDiGraph())))
+                atomic_write_text(self.projector.graph_path, json.dumps(node_link_data(nx.MultiDiGraph())))
         except Exception as e:  # noqa: BLE001 — purely defensive; a read that still can't project errors via _tool_result
             logger.debug("could not materialise a degraded derived layer (%s)", e)
 
@@ -1588,6 +1582,13 @@ class KGEngine:
         return _walk(obj)
 
     @property
+    def projection_degraded(self) -> "str | None":
+        """The last reprojection-failure reason (None when projection is healthy) — the public form
+        of `_projection_degraded`, so the MCP wrappers that surface the flag never reach into a
+        private attribute of the facade (review-r5)."""
+        return self._projection_degraded
+
+    @property
     def _proj(self) -> Projector:
         """The lazy-projection read seam: ensure the derived layer is fresh, then return the projector.
         The single edit point for the projection trigger every pure read delegate goes through."""
@@ -1599,7 +1600,7 @@ class KGEngine:
         # On a degraded (empty/stale) derived layer a real canon node looks like a genuine miss; surface
         # the flag on the miss too so a caller can tell "not found" from "couldn't project" (review-M2).
         if res is None and self._projection_degraded:
-            return {"error": "not found", "projection_degraded": self._projection_degraded}
+            return {**_NOT_FOUND, "projection_degraded": self._projection_degraded}
         return self._with_degraded(self._scrub_egress(res))
 
     def get_neighbors(self, node_id: str, relation: str | None = None) -> list:
@@ -1612,135 +1613,17 @@ class KGEngine:
         return self._scrub_egress(self._proj.shortest_path(source, target))
 
     def explain_path(self, nodes: list[str]) -> dict:
-        """Trace the associative chain connecting `nodes` over GROUNDED edges only (read-only egress, §2).
-        Returns the ordered node `path`, the grounded `edges` used (relation + span, for audit), and an
-        ADVISORY `leap` = the path edge-count — never a verdict, never written, never folded into a score
-        (G1/G4). For >2 nodes the visiting order comes from a deterministic nearest-neighbour walk (a TSP
-        approximation) over the grounded shortest-path closure — byte-stable across processes by a
-        (distance, id) tie-break, no external solver, no new dependency. The result is EMPTY (path=[],
-        leap=null) with a `reason` when no fully-grounded path exists — itself informative: the concepts
-        are joined only through unverified/hypothesized/refuted links, or not at all. Mirrors
-        shortest_path's `projection_degraded` surfacing so an empty result is never confused with a
-        degraded projection."""
-        import itertools
-        from collections import deque
-
-        import networkx as nx
-
-        G = self._proj.load_graph()
-        # the grounded-ONLY undirected graph: an undirected pair {u,v} exists iff at least one parallel
-        # edge between them (either direction) is epistemic_state == grounded. Carry ONE representative
-        # grounded edge's relation+span — deterministically the smallest edge id — for the audit trail.
-        # unverified / hypothesized / failed / rejected edges are excluded ENTIRELY: routing a chain
-        # through them would manufacture a false "explanation", defeating the auditability purpose (§2).
-        Gg = nx.Graph()
-        Gg.add_nodes_from(G.nodes())
-        reps: dict = {}  # frozenset({u,v}) -> (edge_id, relation, span) representative grounded edge
-        for u, v, d in G.edges(data=True):
-            if u == v or d.get("epistemic_state") != EpistemicState.GROUNDED.value:
-                continue
-            key = frozenset((u, v))
-            eid = d.get("id", "") or ""
-            prior = reps.get(key)
-            if prior is None or eid < prior[0]:
-                reps[key] = (eid, d.get("relation", "") or "", d.get("span", "") or "")
-        for key, (_eid, rel, span) in reps.items():
-            a, b = sorted(key)
-            Gg.add_edge(a, b, relation=rel, span=span)
-
-        def _grounded_path(s, t):
-            """Deterministic shortest path s->t over Gg (sorted-neighbour predecessor BFS); None when no
-            fully-grounded path exists."""
-            if s == t:
-                return [s]
-            if s not in Gg or t not in Gg:
-                return None
-            pred = {s: s}
-            q = deque([s])
-            while q:
-                cur = q.popleft()
-                for nb in sorted(Gg.neighbors(cur)):  # sorted -> byte-stable path among equal-length ties
-                    if nb in pred:
-                        continue
-                    pred[nb] = cur
-                    if nb == t:
-                        path = [t]
-                        while path[-1] != s:
-                            path.append(pred[path[-1]])
-                        path.reverse()
-                        return path
-                    q.append(nb)
-            return None
-
-        def _unreachable(reason):
-            return self._with_degraded({"path": [], "edges": [], "leap": None,
-                                        "grounded_only": True, "reason": reason})
-
-        uniq = sorted(set(str(n) for n in (nodes or [])))
-        if not uniq:
-            return _unreachable("no nodes requested")
-        missing = [n for n in uniq if n not in Gg]
-        if missing:
-            return _unreachable(f"node not in graph: {missing[0]}")
-        if len(uniq) == 1:
-            return self._with_degraded({"path": [uniq[0]], "edges": [], "leap": 0, "grounded_only": True})
-
-        # cache oriented grounded shortest paths between requested concepts (the BFS is deterministic).
-        seg_cache: dict = {}
-
-        def _seg(a, b):
-            if (a, b) not in seg_cache:
-                p = _grounded_path(a, b)
-                seg_cache[(a, b)] = p
-                if p is not None:
-                    seg_cache[(b, a)] = list(reversed(p))
-            return seg_cache[(a, b)]
-
-        if len(uniq) == 2:
-            full = _seg(uniq[0], uniq[1])
-            if full is None:
-                return _unreachable(f"no fully-grounded path between {uniq[0]} and {uniq[1]}")
-        else:
-            # every requested concept must be mutually reachable over grounded edges; report the FIRST
-            # offending pair (combinations of the sorted set -> deterministic). Build the metric closure.
-            dist: dict = {}
-            for a, b in itertools.combinations(uniq, 2):
-                seg = _seg(a, b)
-                if seg is None:
-                    return _unreachable(f"no fully-grounded path between {a} and {b}")
-                dist[(a, b)] = dist[(b, a)] = len(seg) - 1
-            # order the concepts by a DETERMINISTIC nearest-neighbour walk over the grounded shortest-path
-            # closure (a TSP-path approximation): start at the smallest id, then repeatedly take the
-            # closest unvisited concept, tie-broken by id. The (distance, id) key is a TOTAL order, so
-            # `min` is byte-stable ACROSS PROCESSES — unlike networkx greedy_tsp, whose internal
-            # `min(set(...))` tie-breaks on hash-randomized set iteration order (a real G6 hazard here,
-            # since the grounded closure's unit-weight distances tie pervasively and server restarts are
-            # routine). Then expand each consecutive pair into its grounded shortest path.
-            order = [uniq[0]]
-            remaining = set(uniq[1:])
-            while remaining:
-                cur = order[-1]
-                nxt = min(remaining, key=lambda n: (dist[(cur, n)], n))
-                order.append(nxt)
-                remaining.discard(nxt)
-            full = []
-            for a, b in zip(order, order[1:]):
-                seg = _seg(a, b)
-                full += seg if not full else seg[1:]
-
-        # collect the grounded edges along the full chain (relation+span per hop, for audit). Every
-        # consecutive pair is a Gg edge by construction; guard defensively all the same.
-        edges_used = []
-        for a, b in zip(full, full[1:]):
-            d = Gg.get_edge_data(a, b)
-            if d is None:
-                return _unreachable(f"no fully-grounded path between {a} and {b}")
-            edges_used.append({"source": a, "target": b,
-                               "relation": d.get("relation", ""), "span": d.get("span", "")})
-        # re-scrub the grounded spans before egress (a secret restored into a canon span must not
-        # round-trip to the model — review: reads-return-canon-spans-unscrubbed).
-        return self._with_degraded(self._scrub_egress(
-            {"path": full, "edges": edges_used, "leap": len(edges_used), "grounded_only": True}))
+        """Trace the associative chain connecting `nodes` over GROUNDED edges only (read-only
+        egress, §2). The algorithm — the grounded-only view, deterministic BFS, and the
+        nearest-neighbour walk — lives in the pure `pathing` module (review-r5: it was the one
+        large inline algorithm in this facade); this method wires the derived graph in and applies
+        the facade's egress policy: re-scrub the grounded spans (a secret restored into a canon
+        span must not round-trip to the model — review: reads-return-canon-spans-unscrubbed) and
+        mirror shortest_path's `projection_degraded` surfacing so an empty result is never
+        confused with a degraded projection."""
+        from .pathing import explain_grounded_path
+        result = explain_grounded_path(self._proj.load_graph(), nodes)
+        return self._with_degraded(self._scrub_egress(result))
 
     def query_graph(self, **kw) -> dict:
         return self._with_degraded(self._scrub_egress(self._proj.query_graph(**kw)))
@@ -1760,38 +1643,183 @@ class KGEngine:
         from . import export as _export
         return self._with_degraded(_export.export(self, kind=kind))
 
+    # ---- divergence surface (FUSION Stages 3-4) --------------------------
+    # These live on the facade like every other tool (the module docstring's "the FastMCP wrappers
+    # are thin" contract — review-r5: materialize + the fate sync were ~150 lines of real logic in
+    # closures inside _register, reachable only by scraping the registered tool table). kg_engine.
+    # divergence is imported LAZILY inside each body so this module's import graph stays
+    # divergence-free (I3, firewall-tested).
+
+    def _diverge_home(self) -> Path:
+        # The USER project, never the plugin data dir: divergence session state is
+        # git-friendly project state, like canon — not a cache. The resolution rule
+        # (KG_DIVERGE_HOME override first) is single-homed in state.base_dir (review-r5:
+        # a hardcoded project path here split a KG_DIVERGE_HOME user's pins/discards
+        # between the CLI and these MCP tools, I8).
+        from kg_engine.divergence.state import base_dir
+        return base_dir(self.project_dir)
+
+    def _sync_materialized_fates(self, project: str) -> list:
+        """Unified negative memory (FUSION Stage 4, I8): grounding failures flow BACK
+        into the brief's discard store. For every materialized pin, read the CURRENT
+        epistemic state of its graph items from canon (reads only — verdicts remain
+        kg_ground's monopoly); any candidate whose node/edge landed in a FAILURE state
+        is added to the discards for this brief, so no future slate or parent pool
+        ever re-proposes it. Idempotent; fates are stamped in materialized.json."""
+        from kg_engine.divergence.session import Session as _DSession
+
+        sess = _DSession(project, home=self._diverge_home())
+        state = sess.state
+        ledger = state.read_materialized()
+        if not ledger:
+            return []
+        try:
+            domain = sess.domain
+        except Exception:  # no axes snapshot yet — nothing to sync into
+            return []
+        newly_discarded: list = []
+        changed = False
+        for cid, entry in ledger.items():
+            if cid == "_edges":
+                continue  # extra edges with no candidate mapping: nothing to discard
+            if entry.get("fate") in FAILURE_STATE_VALUES:
+                continue  # already folded into discards
+            failed_state = None
+            for node_id in entry.get("nodes", ()):
+                try:
+                    node = self.canon.read_node(node_id)
+                except FileNotFoundError:
+                    continue
+                if node and node.epistemic_state in FAILURE_STATES:
+                    failed_state = node.epistemic_state.value
+            for ref in entry.get("edges", ()):
+                owner, ref_edge_id = ref.get("owner"), ref.get("id")
+                try:
+                    node = self.canon.read_node(owner) if owner else None
+                except FileNotFoundError:
+                    continue
+                for e in (node.edges if node else ()):
+                    if e.id == ref_edge_id and e.epistemic_state in FAILURE_STATES:
+                        failed_state = e.epistemic_state.value
+            if failed_state:
+                state.add_discard(domain, cid)
+                entry["fate"] = failed_state
+                newly_discarded.append({"candidate": cid, "fate": failed_state})
+                changed = True
+        if changed:
+            state.write_materialized(ledger)
+        return newly_discarded
+
+    def kg_diverge_materialize(self, project: str, candidate_ids=None,
+                               node_type: str = "claim", edges=None) -> dict:
+        """Materialize PINNED ideas into the graph — the EXPLICIT action (nothing enters the
+        graph implicitly; kickoff Q5). Each pinned candidate becomes a node in the hypothesized
+        lane via the propose door (kg_propose -> kg_write -> boundary): it lands
+        `provenance=hypothesized, epistemic_state=unverified`, carrying its full lineage in the
+        node body. `candidate_ids` defaults to every pin with a live session record; a pin from
+        an ENDED session has no record left (I10) and is reported as skipped. Optional `edges`
+        transit the SAME boundary (claimed verdicts stripped, text-claim provenance refused)."""
+        from kg_engine.divergence.session import Session as _DSession
+
+        sess = _DSession(project, home=self._diverge_home())
+        state = sess.state
+        domain = sess.domain
+        spec = sess.spec
+        open_axis = spec.primary_axis
+        session_id = state.read_session().get("session_id", "")
+        pins = state.read_pins(domain)
+        cand_store = state.read_candidates()
+
+        wanted = [str(c) for c in candidate_ids] if candidate_ids is not None else list(pins)
+        results: list[dict] = []
+        nodes_payload: list[dict] = []
+        node_for_cid: dict[str, str] = {}
+        for cid in wanted:
+            if cid not in pins:
+                results.append({"candidate": cid, "status": "refused",
+                                "reason": "not-pinned: materialization is an explicit "
+                                          "action on PINNED ideas only"})
+                continue
+            rec = cand_store.get(cid)
+            if not rec or not rec.get("text"):
+                results.append({"candidate": cid, "status": "skipped",
+                                "reason": "no-session-record: geometry state is session-"
+                                          "ephemeral (I10) — re-ingest this idea in the "
+                                          "current session, then materialize"})
+                continue
+            text = str(rec["text"]).strip()
+            descriptor = rec.get("descriptor") or {}
+            mechanism = str(descriptor.get(open_axis.name, "")) if open_axis else ""
+            operator = str((rec.get("genealogy") or {}).get("operator_id", ""))
+            node_id = f"idea-{slug(project)}-{slug(cid)}"
+            label = text if len(text) <= 80 else text[:77] + "..."
+            lineage = (f"[diverge] pinned candidate={cid} brief={project} "
+                       f"session={session_id} mechanism={mechanism!r} operator={operator}")
+            nodes_payload.append({"id": node_id, "label": label, "node_type": node_type,
+                                  "body": f"{text}\n\n{lineage}\n"})
+            node_for_cid[cid] = node_id
+
+        edges_payload: list[dict] = []
+        for e in (edges or []):
+            e = dict(e or {})
+            # candidate_id is OUR routing key (ledger mapping), not a boundary field —
+            # the boundary's extra="forbid" would rightly reject it as schema-invalid.
+            e.pop("candidate_id", None)
+            marker = (f"[diverge] pinned brief={project} session={session_id}")
+            e["notes"] = f"{e.get('notes', '')} {marker}".strip()
+            edges_payload.append(e)
+
+        if not nodes_payload and not edges_payload:
+            return {"ok": True, "materialized": 0, "results": results}
+
+        out = self.kg_propose({"nodes": nodes_payload, "edges": edges_payload},
+                              message="kg_diverge_materialize")
+
+        by_id = {d.get("id"): d for d in out.get("details", [])}
+        ledger = state.read_materialized()
+        for cid, node_id in node_for_cid.items():
+            detail = by_id.get(node_id, {})
+            status = detail.get("disposition", "UNKNOWN")
+            results.append({"candidate": cid, "status": status, "node": node_id,
+                            "reason": detail.get("reason", "")})
+            if status in PERSISTED_DISPOSITIONS:
+                entry = ledger.setdefault(cid, {"nodes": [], "edges": []})
+                if node_id not in entry["nodes"]:
+                    entry["nodes"].append(node_id)
+                entry["session"] = session_id
+        for e, raw in zip(edges_payload, edges or []):
+            eid = edge_id(e.get("source", ""), e.get("relation", ""), e.get("target", ""))
+            detail = by_id.get(eid, {})
+            if detail.get("disposition") in PERSISTED_DISPOSITIONS:
+                cid = str((raw or {}).get("candidate_id", "")) or "_edges"
+                entry = ledger.setdefault(cid, {"nodes": [], "edges": []})
+                ref = {"id": eid, "owner": e.get("source", "")}
+                if ref not in entry["edges"]:
+                    entry["edges"].append(ref)
+                entry["session"] = session_id
+        state.write_materialized(ledger)
+
+        return {"ok": bool(any(out.get("dispositions", {}).get(d, 0) for d in PERSISTED_DISPOSITIONS)),
+                "materialized": sum(1 for r in results if r.get("status") in PERSISTED_DISPOSITIONS),
+                "results": results, "propose": out}
+
 
 # --------------------------------------------------------------------------- MCP wiring
 
 
 def build_engine_from_env(*, project=None, data=None, source=None, pack=None) -> KGEngine:
     """Construct a KGEngine from environment config, with optional explicit overrides (CLI flags win
-    over env). All resolution — project dir, source, pack auto-discovery, and the flood rate limit —
-    lives here so every caller (MCP server, headless backend) gets identical behavior."""
-    # Treat an empty OR unsubstituted `${...}` env value the same as unset. When a `${user_config.*}`
-    # placeholder is never substituted — e.g. `source_path`, which has no default in plugin.json — Claude
-    # Code passes the literal `${user_config.source_path}` through `.mcp.json`. Taking that as a real path
-    # silently breaks the engine: `source_text()` reads a non-existent file and returns "", so every agent
-    # edge fails span verification (`span-not-in-source`). Mirrors `bootstrap._clean` / `launch_server.clean`,
-    # which strip the same values; without it the documented `examples/source.md` fallback never fires.
-    # `_clean_env` is the module-level form of the old local `_env`, shared with the logging path
-    # (resolve_data_dir) so the server log lands in the SAME dir the engine resolves for the derived layer.
-    _env = _clean_env
-    project = project or _env("KG_PROJECT_DIR") or _env("CLAUDE_PROJECT_DIR") or os.getcwd()
-    data = data or _env("KG_DATA")
-    # Route the CLAUDE_PLUGIN_OPTION_* reads through the same ${...}-placeholder filter as every other
-    # env read (_clean_env): an unsubstituted `${user_config.*}` literal must read as unset here too,
-    # not as a real sensitivity/metrics/source value (review-r4: opt-skips-placeholder-filter).
-    opt = lambda k, d=None: _clean_env(f"CLAUDE_PLUGIN_OPTION_{k}") or d  # noqa: E731
-    src = source or opt("SOURCE_PATH") or _env("KG_SOURCE_PATH")
-    if not src:
-        # documented default: build/ground against the bundled example when nothing is configured
-        guess = Path(project) / "examples" / "source.md"
-        src = str(guess) if guess.exists() else None
-    pack_path = pack or _env("KG_PACK_PATH")
-    if not pack_path:
-        guess = Path(project) / "pack" / "pack.yaml"
-        pack_path = str(guess) if guess.exists() else None
+    over env). The resolution RULES — the `${user_config.*}` placeholder filter (an unsubstituted
+    literal reads as unset, so the documented `examples/source.md` fallback still fires; review-r4:
+    opt-skips-placeholder-filter), the source/pack precedence and project-relative defaults — are
+    single-homed in ``envconfig`` (review-r5), shared with the PreToolUse hook and the lightrag arm,
+    so the hook can never again resolve a DIFFERENT source/pack/metrics than the server. This
+    function keeps only what is server-specific: the explicit-override layering and the flood rate
+    limit; every caller (MCP server, headless backend) gets identical behavior."""
+    project = project or envconfig.resolve_project(os.getcwd())
+    data = data or _clean_env("KG_DATA")  # None → KGEngine defaults to <project>/DATA_DIRNAME
+    src = envconfig.resolve_source(project, explicit=source)
+    pack_path = envconfig.resolve_pack_path(project, explicit=pack)
     try:
         rate = float(os.environ["KG_MAX_EDGES_PER_KB"])
         if not math.isfinite(rate) or rate < 0:  # 'nan'/'inf'/negative would crash or disable the limiter
@@ -1799,7 +1827,8 @@ def build_engine_from_env(*, project=None, data=None, source=None, pack=None) ->
     except (KeyError, ValueError):
         rate = DEFAULT_MAX_EDGES_PER_KB
     return KGEngine(project, data, source_path=src, pack_path=pack_path,
-                    sensitivity=opt("SENSITIVITY", "medium"), metrics_mode=opt("METRICS_MODE", "structure_only"),
+                    sensitivity=envconfig.plugin_option("SENSITIVITY", "medium"),
+                    metrics_mode=envconfig.plugin_option("METRICS_MODE", "structure_only"),
                     max_edges_per_kb=rate)
 
 
@@ -1972,7 +2001,7 @@ def _register(mcp, engine: KGEngine) -> None:
     @_tool_result
     def get_node(node_id: str) -> dict:
         """Fetch a node with its incident edges."""
-        return engine.get_node(node_id) or {"error": "not found"}
+        return engine.get_node(node_id) or dict(_NOT_FOUND)
 
     @mcp.tool()
     @_tool_result
@@ -1986,8 +2015,8 @@ def _register(mcp, engine: KGEngine) -> None:
         """Shortest path between two nodes over the derived graph."""
         out = {"path": engine.shortest_path(source, target)}
         # surface the degraded signal so an empty path isn't mistaken for "no path" (review-M2)
-        if engine._projection_degraded:
-            out["projection_degraded"] = engine._projection_degraded
+        if engine.projection_degraded:
+            out["projection_degraded"] = engine.projection_degraded
         return out
 
     @mcp.tool()
@@ -2041,11 +2070,6 @@ def _register(mcp, engine: KGEngine) -> None:
     # divergence-free (I3, firewall-tested) and a missing divergence dep degrades
     # only these six tools with a clear error (I9) — never a kg_* tool.
     # ------------------------------------------------------------------------- #
-    def _diverge_home() -> Path:
-        # The USER project (KG_PROJECT_DIR), never the plugin data dir: divergence
-        # session state is git-friendly project state, like canon — not a cache.
-        return Path(engine.project_dir) / ".kg" / "diverge"
-
     @mcp.tool()
     @_tool_result
     def kg_diverge_init(project: str, axes: dict | str | None = None, seed: int = 0,
@@ -2059,11 +2083,13 @@ def _register(mcp, engine: KGEngine) -> None:
         survive. Returns the resolved domain, session id, and state paths."""
         from kg_engine.divergence import config as dconfig
         from kg_engine.divergence import pipeline as dpipe
-        out = dpipe.init_project(project, dconfig.resolve_axes_source(axes),
-                                 seed=seed, home=_diverge_home(), session=session)
+        # pack_path threads the ENGINE's resolved pack into axes resolution, so the divergence
+        # domain config can never diverge from the pack the engine loaded (review-r5).
+        out = dpipe.init_project(project, dconfig.resolve_axes_source(axes, pack_path=engine.pack_path),
+                                 seed=seed, home=engine._diverge_home(), session=session)
         # Unified negative memory (I8): fold grounding failures of previously
         # materialized pins into this brief's discards before the round starts.
-        fates = _sync_materialized_fates(project)
+        fates = engine._sync_materialized_fates(project)
         if fates:
             out["materialized_failures_discarded"] = fates
         return out
@@ -2082,8 +2108,9 @@ def _register(mcp, engine: KGEngine) -> None:
         re-slated. Purely advisory: nothing here can create graph state or verdicts."""
         from kg_engine.divergence import config as dconfig
         from kg_engine.divergence import pipeline as dpipe
-        return dpipe.ingest(project, candidates, dconfig.resolve_axes_source(axes),
-                            seed=seed, home=_diverge_home())
+        return dpipe.ingest(project, candidates,
+                            dconfig.resolve_axes_source(axes, pack_path=engine.pack_path),
+                            seed=seed, home=engine._diverge_home())
 
     @mcp.tool()
     @_tool_result
@@ -2095,7 +2122,7 @@ def _register(mcp, engine: KGEngine) -> None:
         ({"type":"comparison","winner":...,"loser":...}) are low-weight A-vs-B evidence.
         Pin and discard are mutually exclusive per id (latest wins)."""
         from kg_engine.divergence import pipeline as dpipe
-        return dpipe.remember(project, event, home=_diverge_home())
+        return dpipe.remember(project, event, home=engine._diverge_home())
 
     @mcp.tool()
     @_tool_result
@@ -2104,7 +2131,7 @@ def _register(mcp, engine: KGEngine) -> None:
         preference memory — pins always included, discards never (I8). Use these as the
         stepping stones the next round of variation operators mutates/combines."""
         from kg_engine.divergence import pipeline as dpipe
-        return dpipe.parents(project, k=k, seed=seed, home=_diverge_home())
+        return dpipe.parents(project, k=k, seed=seed, home=engine._diverge_home())
 
     @mcp.tool()
     @_tool_result
@@ -2113,7 +2140,7 @@ def _register(mcp, engine: KGEngine) -> None:
         calibration, open-axis (mechanism) partition status, and advisory series (variety
         erosion, surface-vs-mechanism gap when enabled)."""
         from kg_engine.divergence import pipeline as dpipe
-        return dpipe.metrics(project, home=_diverge_home())
+        return dpipe.metrics(project, home=engine._diverge_home())
 
     @mcp.tool()
     @_tool_result
@@ -2124,62 +2151,11 @@ def _register(mcp, engine: KGEngine) -> None:
         previously materialized pins: one whose graph item was FAILED/REJECTED by grounding
         joins this brief's discards (unified negative memory, I8)."""
         from kg_engine.divergence import pipeline as dpipe
-        out = dpipe.recall(project, k=k, home=_diverge_home())
-        fates = _sync_materialized_fates(project)
+        out = dpipe.recall(project, k=k, home=engine._diverge_home())
+        fates = engine._sync_materialized_fates(project)
         if fates:
             out["materialized_failures_discarded"] = fates
         return out
-
-    def _sync_materialized_fates(project: str) -> list:
-        """Unified negative memory (FUSION Stage 4, I8): grounding failures flow BACK
-        into the brief's discard store. For every materialized pin, read the CURRENT
-        epistemic state of its graph items from canon (reads only — verdicts remain
-        kg_ground's monopoly); any candidate whose node/edge landed in a FAILURE state
-        is added to the discards for this brief, so no future slate or parent pool
-        ever re-proposes it. Idempotent; fates are stamped in materialized.json."""
-        from kg_engine.divergence.session import Session as _DSession
-
-        sess = _DSession(project, home=_diverge_home())
-        state = sess.state
-        ledger = state.read_materialized()
-        if not ledger:
-            return []
-        try:
-            domain = sess.domain
-        except Exception:  # no axes snapshot yet — nothing to sync into
-            return []
-        newly_discarded: list = []
-        changed = False
-        for cid, entry in ledger.items():
-            if cid == "_edges":
-                continue  # extra edges with no candidate mapping: nothing to discard
-            if entry.get("fate") in ("failed", "rejected"):
-                continue  # already folded into discards
-            failed_state = None
-            for node_id in entry.get("nodes", ()):
-                try:
-                    node = engine.canon.read_node(node_id)
-                except FileNotFoundError:
-                    continue
-                if node and node.epistemic_state in FAILURE_STATES:
-                    failed_state = node.epistemic_state.value
-            for ref in entry.get("edges", ()):
-                owner, edge_id_ = ref.get("owner"), ref.get("id")
-                try:
-                    node = engine.canon.read_node(owner) if owner else None
-                except FileNotFoundError:
-                    continue
-                for e in (node.edges if node else ()):
-                    if e.id == edge_id_ and e.epistemic_state in FAILURE_STATES:
-                        failed_state = e.epistemic_state.value
-            if failed_state:
-                state.add_discard(domain, cid)
-                entry["fate"] = failed_state
-                newly_discarded.append({"candidate": cid, "fate": failed_state})
-                changed = True
-        if changed:
-            state.write_materialized(ledger)
-        return newly_discarded
 
     @mcp.tool()
     @_tool_result
@@ -2200,90 +2176,8 @@ def _register(mcp, engine: KGEngine) -> None:
         verdicts are stripped, text-claim provenance is refused, unknown fields are rejected.
         Pinned items may be ORDERED FIRST in the grounding queue; being pinned never changes
         a grounding VERDICT (verdict neutrality, I5)."""
-        from kg_engine.divergence.session import Session as _DSession
-
-        sess = _DSession(project, home=_diverge_home())
-        state = sess.state
-        domain = sess.domain
-        spec = sess.spec
-        open_axis = spec.primary_axis
-        session_id = state.read_session().get("session_id", "")
-        pins = state.read_pins(domain)
-        cand_store = state.read_candidates()
-
-        wanted = [str(c) for c in candidate_ids] if candidate_ids is not None else list(pins)
-        results: list[dict] = []
-        nodes_payload: list[dict] = []
-        node_for_cid: dict[str, str] = {}
-        for cid in wanted:
-            if cid not in pins:
-                results.append({"candidate": cid, "status": "refused",
-                                "reason": "not-pinned: materialization is an explicit "
-                                          "action on PINNED ideas only"})
-                continue
-            rec = cand_store.get(cid)
-            if not rec or not rec.get("text"):
-                results.append({"candidate": cid, "status": "skipped",
-                                "reason": "no-session-record: geometry state is session-"
-                                          "ephemeral (I10) — re-ingest this idea in the "
-                                          "current session, then materialize"})
-                continue
-            text = str(rec["text"]).strip()
-            descriptor = rec.get("descriptor") or {}
-            mechanism = str(descriptor.get(open_axis.name, "")) if open_axis else ""
-            operator = str((rec.get("genealogy") or {}).get("operator_id", ""))
-            node_id = f"idea-{slug(project)}-{slug(cid)}"
-            label = text if len(text) <= 80 else text[:77] + "..."
-            lineage = (f"[diverge] pinned candidate={cid} brief={project} "
-                       f"session={session_id} mechanism={mechanism!r} operator={operator}")
-            nodes_payload.append({"id": node_id, "label": label, "node_type": node_type,
-                                  "body": f"{text}\n\n{lineage}\n"})
-            node_for_cid[cid] = node_id
-
-        edges_payload: list[dict] = []
-        for e in (edges or []):
-            e = dict(e or {})
-            # candidate_id is OUR routing key (ledger mapping), not a boundary field —
-            # the boundary's extra="forbid" would rightly reject it as schema-invalid.
-            e.pop("candidate_id", None)
-            marker = (f"[diverge] pinned brief={project} session={session_id}")
-            e["notes"] = f"{e.get('notes', '')} {marker}".strip()
-            edges_payload.append(e)
-
-        if not nodes_payload and not edges_payload:
-            return {"ok": True, "materialized": 0, "results": results}
-
-        out = engine.kg_propose({"nodes": nodes_payload, "edges": edges_payload},
-                                message="kg_diverge_materialize")
-
-        by_id = {d.get("id"): d for d in out.get("details", [])}
-        ledger = state.read_materialized()
-        for cid, node_id in node_for_cid.items():
-            detail = by_id.get(node_id, {})
-            status = detail.get("disposition", "UNKNOWN")
-            results.append({"candidate": cid, "status": status, "node": node_id,
-                            "reason": detail.get("reason", "")})
-            if status in ("ACCEPTED", "DEMOTED"):
-                entry = ledger.setdefault(cid, {"nodes": [], "edges": []})
-                if node_id not in entry["nodes"]:
-                    entry["nodes"].append(node_id)
-                entry["session"] = session_id
-        for e, raw in zip(edges_payload, edges or []):
-            eid = edge_id(e.get("source", ""), e.get("relation", ""), e.get("target", ""))
-            detail = by_id.get(eid, {})
-            if detail.get("disposition") in ("ACCEPTED", "DEMOTED"):
-                cid = str((raw or {}).get("candidate_id", "")) or "_edges"
-                entry = ledger.setdefault(cid, {"nodes": [], "edges": []})
-                ref = {"id": eid, "owner": e.get("source", "")}
-                if ref not in entry["edges"]:
-                    entry["edges"].append(ref)
-                entry["session"] = session_id
-        state.write_materialized(ledger)
-
-        return {"ok": bool(out.get("dispositions", {}).get("ACCEPTED", 0)
-                           or out.get("dispositions", {}).get("DEMOTED", 0)),
-                "materialized": sum(1 for r in results if r.get("status") in ("ACCEPTED", "DEMOTED")),
-                "results": results, "propose": out}
+        return engine.kg_diverge_materialize(project, candidate_ids=candidate_ids,
+                                             node_type=node_type, edges=edges)
 
 
 def _start_watchdog() -> "_Watchdog | None":

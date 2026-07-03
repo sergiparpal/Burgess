@@ -81,12 +81,12 @@ def test_failed_edge_does_not_seed_spurious_shared_neighbour_candidate():
     edges = [("p", "s1"), ("q", "s1"), ("p", "s2"), ("q", "s2"), ("s1", "r"), ("r", "x"), ("x", "y")]
     node_attrs = {n: {} for e in edges for n in e}
 
-    live = gen.seed(_mdg(edges, node_attrs), pack=None, corpus=[_UNIFORM], failures=set(), k=40)
+    live = gen.seed(_mdg(edges, node_attrs), failures=set(), k=40)
     live_pairs = {frozenset((c.source, c.target)) for c in live}
     assert frozenset(("p", "q")) in live_pairs                    # the (buggy-code) spurious candidate
 
     withfail = gen.seed(_mdg(edges, node_attrs, failed=[("q", "s1")]),
-                        pack=None, corpus=[_UNIFORM], failures=set(), k=40)
+                        failures=set(), k=40)
     fail_pairs = {frozenset((c.source, c.target)) for c in withfail}
     assert frozenset(("p", "q")) not in fail_pairs               # excluded once the edge is refuted
 
@@ -113,7 +113,7 @@ def test_transplant_higher_degree_target_outranks_lower():
     for i, (u, v) in enumerate(edges):
         G.add_edge(u, v, key="e%d" % i, relation="drives", epistemic_state="unverified")
 
-    cands = gen.transplant(G, pack=None, corpus=[_UNIFORM], failures=set(), k=40)
+    cands = gen.transplant(G, failures=set(), k=40)
     order = [c.target for c in cands]
     assert "t_hi" in order and "t_lo" in order
     assert order.index("t_hi") < order.index("t_lo")             # degree-desc intent preserved
@@ -137,10 +137,10 @@ def test_convergence_counts_pair_dropped_from_one_mechanisms_topk(canon: Canon):
     pair = frozenset(("a3", "b2"))
 
     # sanity: bridge proposes the pair but NOT in its top-1 (it would be dropped by k=1 truncation)
-    bridge_cands = gen.bridge(G, pack=None, corpus=[_UNIFORM], failures=set(), k=40)
+    bridge_cands = gen.bridge(G, failures=set(), k=40)
     assert any(frozenset((c.source, c.target)) == pair for c in bridge_cands)
     assert frozenset((bridge_cands[0].source, bridge_cands[0].target)) != pair
 
-    out = gen.run_generators(G, mechanism="all", pack=None, corpus=[_UNIFORM], failures=set(), k=1)
+    out = gen.run_generators(G, mechanism="all", failures=set(), k=1)
     surv = next(c for c in out if c.kind == "edge" and frozenset((c.source, c.target)) == pair)
     assert surv.convergence >= 2                                 # counted across both, despite k=1 truncation

@@ -40,14 +40,38 @@ import logging
 import os
 import re
 import shutil
-import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
+from ..atomicio import atomic_write_text
 from .config import ConfigError
 
 _log = logging.getLogger(__name__)
+
+
+class StateError(ConfigError):
+    """A persisted state file is corrupt/unreadable. Subclasses ConfigError so existing handlers
+    keep catching it (review-r5: ConfigError's own docstring promises "the axes spec is malformed",
+    which read untrue when raised for a corrupt archive/candidates file)."""
+
+
+def read_jsonl(path: Path) -> Tuple[List[Dict[str, Any]], int]:
+    """Tolerant JSONL read: skip blank lines, skip corrupt lines (an interrupted append) and COUNT
+    them — the ONE recovery policy shared by ``State.read_comparisons`` and the Cambrian importer
+    (review-r5: two hand-synced copies agreed only by coincidence). Raises OSError like
+    ``read_text`` (the importer catches it; State callers pre-check existence)."""
+    records: List[Dict[str, Any]] = []
+    corrupt = 0
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            corrupt += 1
+    return records, corrupt
 
 DEFAULT_HOME_ENV = "KG_DIVERGE_HOME"
 PROJECT_DIR_ENV = "KG_PROJECT_DIR"
@@ -83,62 +107,29 @@ def _path_slug(name: str, fallback: str = "default") -> str:
     return f"{s or fallback}-{suffix}"
 
 
-def base_dir() -> Path:
-    """Project-local state home: ``<project>/.kg/diverge`` unless overridden.
+def base_dir(project_dir: "str | Path | None" = None) -> Path:
+    """Project-local state home: ``<project>/.kg/diverge`` unless overridden — THE single rule for
+    where a brief's state lives (review-r5: the MCP tools' ``_diverge_home`` used to hardcode the
+    project path, so a ``KG_DIVERGE_HOME`` user got pins/discards split between CLI and server).
 
-    ``KG_DIVERGE_HOME`` (tests, power users) wins; else the project root comes
-    from ``KG_PROJECT_DIR`` (set for the MCP server by .mcp.json) or the cwd.
+    ``KG_DIVERGE_HOME`` (tests, power users) always wins; else the explicit ``project_dir`` (the
+    server passes its resolved ``engine.project_dir``); else ``KG_PROJECT_DIR`` (set for the MCP
+    server by .mcp.json) or the cwd.
     """
     env = os.environ.get(DEFAULT_HOME_ENV)
     if env:
         return Path(env).expanduser()
-    project = os.environ.get(PROJECT_DIR_ENV) or os.getcwd()
+    project = project_dir or os.environ.get(PROJECT_DIR_ENV) or os.getcwd()
     return Path(project).expanduser() / ".kg" / "diverge"
 
 
-def _fsync_dir(directory: Path) -> None:
-    """Best-effort fsync of a directory so a rename is durable across a crash.
-
-    ``os.fsync`` on the file only flushes its *contents*; the directory entry that
-    ``os.replace`` creates is separate metadata and can be lost on power loss even
-    though the data was synced. Fsyncing the parent closes that gap on POSIX. A
-    no-op where a directory handle can't be fsynced (e.g. Windows has no
-    ``O_DIRECTORY`` and raises on fsync of a dir fd).
-    """
-    if not hasattr(os, "O_DIRECTORY"):
-        return
-    try:
-        dfd = os.open(str(directory), os.O_DIRECTORY)
-    except OSError:
-        return
-    try:
-        os.fsync(dfd)
-    except OSError:
-        pass
-    finally:
-        os.close(dfd)
-
-
 def _atomic_write(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-", suffix=path.suffix)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(text)
-            # Flush + fsync before the rename so a crash can't persist the rename
-            # ahead of the data (which would leave a zero-length/stale file).
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-        # Fsync the directory so the rename itself is durable, not just the data.
-        _fsync_dir(path.parent)
-    finally:
-        # Best-effort cleanup: an unlink failing on the ERROR path (tmp vanished, a transient Windows
-        # sharing violation) must not MASK the true exception propagating from the try — mirror
-        # kg_engine.atomicio's guarded cleanup.
-        if os.path.exists(tmp):
-            with contextlib.suppress(OSError):
-                os.unlink(tmp)
+    """Crash-safe write via the shared ``kg_engine.atomicio`` protocol (review-r5). This module used
+    to carry its own temp+fsync+replace copy that "mirrored" atomicio's guarded cleanup — but lacked
+    its bounded ``os.replace`` retry for the transient Windows sharing-violation class, so divergence
+    state writes could fail where a canon write would have succeeded. One implementation now; the I3
+    firewall is directional (verdict path must not import divergence), so this import is legal."""
+    atomic_write_text(path, text)
 
 
 def _steal_stale_lock(lock: Path) -> None:
@@ -400,7 +391,7 @@ class State:
         except json.JSONDecodeError as exc:
             # A non-empty but corrupt state file is surfaced as a clean,
             # operator-facing error instead of a raw traceback.
-            raise ConfigError(
+            raise StateError(
                 f"state file {path} is corrupt ({exc}); remove it (or restore a "
                 f"backup) and retry"
             ) from exc
@@ -471,18 +462,9 @@ class State:
         path = self.comparisons_path(domain)
         if not path.exists():
             return []
-        out: List[Dict[str, Any]] = []
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                out.append(json.loads(line))
-            except json.JSONDecodeError:
-                # Skip a truncated/corrupt line (e.g. an interrupted append) so a
-                # single bad record can't poison every future read of this domain.
-                continue
-        return out
+        # Shared tolerant reader: a truncated/corrupt line (an interrupted append) is skipped so a
+        # single bad record can't poison every future read of this domain.
+        return read_jsonl(path)[0]
 
     def read_pins(self, domain: str) -> List[str]:
         return self.read_json(self.pins_path(domain), []) or []

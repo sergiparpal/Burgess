@@ -13,7 +13,7 @@ import pytest
 
 from kg_engine.divergence import archive as archive_mod
 from kg_engine.divergence import novelty
-from kg_engine.divergence.archive import Archive, CVTNicher, compute_niche, continuous_bin
+from kg_engine.divergence.archive import Archive, FrozenVoronoiNicher, compute_niche, continuous_bin
 from kg_engine.divergence.config import axes_spec_from_dict
 
 
@@ -97,8 +97,8 @@ def test_distinct_descriptors_distinct_niches():
 
 
 def test_cvt_nicher_deterministic_and_stable():
-    n1 = CVTNicher(dim=16, k=8, seed=3)
-    n2 = CVTNicher(dim=16, k=8, seed=3)
+    n1 = FrozenVoronoiNicher(dim=16, k=8, seed=3)
+    n2 = FrozenVoronoiNicher(dim=16, k=8, seed=3)
     assert np.array_equal(n1.centroids, n2.centroids)
     rng = np.random.default_rng(1)
     vecs = np.array([_unit(rng.standard_normal(16)) for _ in range(20)])

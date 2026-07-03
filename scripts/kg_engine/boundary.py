@@ -30,9 +30,9 @@ from .model import (
     Node,
     Provenance,
     UNDECLARED_TYPE,
-    VERDICT_STATES,
     edge_id,
     normalize_text,
+    slug,
 )
 
 # A span must be a verbatim anchor, not a degenerate one: a 1-char span ('a') is a substring of
@@ -97,15 +97,23 @@ class ValidationResult:
     item: Any                 # Node or Edge (the canonicalized object, when written/quarantined)
     reason: str
     retryable: bool
-    identity: tuple | str = ""
+    identity: str = ""        # the canonical id (node id / edge id) the dedup + flood sets key on
 
     @property
     def written(self) -> bool:
         return self.disposition in (Disposition.ACCEPTED, Disposition.DEMOTED)
 
 
-def _ok(kind, item, disp, reason="", retryable=False, identity=""):
+def _result(kind, item, disp, reason="", retryable=False, identity=""):
+    """ValidationResult factory (review-r5: previously named `_ok`, which read as a contradiction on
+    every `_ok(... REJECTED ...)` call in the trust boundary's hottest file)."""
     return ValidationResult(disp, kind, item, reason, retryable, identity)
+
+
+def _add_reason(reason: str, tag: str) -> str:
+    """Append `tag` to a semicolon-joined reason string — the ONE home of the separator and
+    empty-case rule (review-r5: the idiom was copy-pasted six times)."""
+    return (reason + ";" if reason else "") + tag
 
 
 def _apply_forge_guards(item, claimed_state, claimed_author, is_hypothesized) -> tuple[Disposition, str]:
@@ -132,7 +140,7 @@ def _apply_forge_guards(item, claimed_state, claimed_author, is_hypothesized) ->
         item.authored_by = AuthoredBy.AGENT
         tag = "human-claim-stripped" if claimed == AuthoredBy.HUMAN else "deterministic-claim-stripped"
         disp = Disposition.DEMOTED
-        reason = (reason + ";" if reason else "") + tag
+        reason = _add_reason(reason, tag)
     return disp, reason
 
 
@@ -197,11 +205,11 @@ def validate_payload(
     try:
         wp = payload if isinstance(payload, WritePayload) else WritePayload.model_validate(payload)
     except ValidationError as e:
-        return [_ok("payload", None, Disposition.REJECTED, f"schema-invalid: {e.error_count()} errors", True)]
+        return [_result("payload", None, Disposition.REJECTED, f"schema-invalid: {e.error_count()} errors", True)]
 
     if not wp.complete:
         # truncated/partial payload — reject whole thing, no partial write (Stage 3)
-        return [_ok("payload", None, Disposition.REJECTED, "truncated-payload", True)]
+        return [_result("payload", None, Disposition.REJECTED, "truncated-payload", True)]
 
     node_types = set(getattr(pack, "node_types", None) or []) if pack is not None else None
     edge_types = set(getattr(pack, "edge_types", None) or []) if pack is not None else None
@@ -226,40 +234,7 @@ def validate_payload(
     # flag any later node whose label carries a DIFFERENT signature but the same id.
     sig_by_id: dict[str, str] = {}
     for node_in in wp.nodes:
-        node = _canon_node(node_in)
-        # restore the egress-scrubbed placeholders in the HUMAN-FACING fields so the canon stores the
-        # ORIGINAL text (§1.9), exactly as the edge span is restored below. Scoped to label/body (free
-        # text); the node id and edge endpoints stay on the form the subagent emitted so identity
-        # linkage (id == slug it was attached by) is preserved (review-low: restore-only-span).
-        if restore is not None:
-            node.label = restore(node.label)
-            node.body = restore(node.body)
-        # never-forge-a-state + never-forge-authorship (§1.4/§1.8), single-sourced with the edge lane.
-        is_hypothesized = node.provenance == Provenance.HYPOTHESIZED
-        disp, reason = _apply_forge_guards(node, node_in.epistemic_state, node_in.authored_by, is_hypothesized)
-        # slug-collision detection (non-fatal, §1.4): two labels differing beyond separator/case that
-        # collapse onto the same node id are aliased silently. Surface a warning in the result; never
-        # change the id (identity must stay deterministic/stable) and never reject on it.
-        sig = _slug_signature(node.label)
-        prior = sig_by_id.setdefault(node.id, sig)
-        if prior != sig:
-            reason = (reason + ";" if reason else "") + "slug-collision-warning"
-        # undeclared type -> quarantine bucket (never silently accepted)
-        if node_types is not None and node.node_type not in node_types:
-            disp = Disposition.QUARANTINED
-            reason = (reason + ";" if reason else "") + "undeclared-node-type"
-        # flood guard: cap NET-NEW writable nodes. A node id already in the canon (or repeated in this
-        # payload) grows the canon by zero, so it costs no budget and is never flooded — mirroring the
-        # edge "deduped costs zero" rule so an idempotent re-build never trips the limiter.
-        if node_budget is not None and disp in (Disposition.ACCEPTED, Disposition.DEMOTED):
-            is_deduped = node.id in seen_nodes
-            if is_deduped:
-                reason = (reason + ";" if reason else "") + "deduped"
-            elif not node_budget.fits(is_deduped):
-                disp, reason = Disposition.REJECTED, "rate-limited-flood"
-            else:
-                seen_nodes.add(node.id)
-        results.append(_ok("node", node, disp, reason, retryable=False, identity=node.id))
+        results.append(_validate_node(node_in, node_types, restore, seen_nodes, sig_by_id, node_budget))
 
     # 3. edges ---------------------------------------------------------------
     existing_list = list(existing or [])
@@ -289,24 +264,54 @@ def validate_payload(
     # single-blob fallback: normalize the source ONCE (skipped when a SourceSet drives verification,
     # which keeps its own per-file normalized cache).
     norm_source = "" if sources is not None else normalize_text(source_text)
+    ctx = _EdgeLaneContext(edge_types=edge_types, norm_source=norm_source, restore=restore,
+                           sources=sources, failure_ids=failure_ids, verdict_ids=verdict_ids)
     for edge_in in wp.edges:
-        r = _validate_edge(edge_in, edge_types, norm_source, restore, seen, failure_ids,
-                           verdict_ids=verdict_ids, sources=sources)
-        # rate limit: once the canon-wide writable-edge budget is exhausted, reject the overflow as a
-        # flood rather than letting it grow the graph unbounded (§Stage 9). Only NET-NEW edges are
-        # charged: a deduped edge (already in the canon or repeated in this payload) grows the canon by
-        # zero, so it must neither consume budget nor be flooded — otherwise an idempotent re-build that
-        # re-emits existing edges would spuriously trip the limiter.
-        if edge_budget is not None and r.written and not edge_budget.fits("deduped" in r.reason):
-            # mirror the node lane: an id only counts as `seen` (a free dedup) once a copy was actually
-            # written. A flood-rejected NET-NEW edge was provisionally added to `seen` by _validate_edge;
-            # discard it here so a SECOND identical copy can't take the zero-cost dedup branch and slip
-            # past the full budget (cap-bypass via in-payload duplication).
-            seen.discard(r.identity)
-            r = _ok("edge", r.item, Disposition.REJECTED, "rate-limited-flood", False, r.identity)
-        results.append(r)
+        results.append(_validate_edge(edge_in, ctx, seen, edge_budget))
 
     return results
+
+
+def _validate_node(node_in: NodeIn, node_types, restore, seen_nodes: set, sig_by_id: dict,
+                   node_budget: "_FloodBudget | None") -> ValidationResult:
+    """Validate ONE node through the node lane — the mirror of `_validate_edge` (review-r5: this
+    lived as a 35-line inline loop body while the edge lane was extracted, so the two lanes'
+    mirrored rules sat at different abstraction levels). Mutates `seen_nodes` (canon-wide dedup),
+    `sig_by_id` (payload-scoped slug-collision detection), and charges `node_budget`."""
+    node = _canon_node(node_in)
+    # restore the egress-scrubbed placeholders in the HUMAN-FACING fields so the canon stores the
+    # ORIGINAL text (§1.9), exactly as the edge span is restored in the edge lane. Scoped to
+    # label/body (free text); the node id and edge endpoints stay on the form the subagent emitted so
+    # identity linkage (id == slug it was attached by) is preserved (review-low: restore-only-span).
+    if restore is not None:
+        node.label = restore(node.label)
+        node.body = restore(node.body)
+    # never-forge-a-state + never-forge-authorship (§1.4/§1.8), single-sourced with the edge lane.
+    is_hypothesized = node.provenance == Provenance.HYPOTHESIZED
+    disp, reason = _apply_forge_guards(node, node_in.epistemic_state, node_in.authored_by, is_hypothesized)
+    # slug-collision detection (non-fatal, §1.4): two labels differing beyond separator/case that
+    # collapse onto the same node id are aliased silently. Surface a warning in the result; never
+    # change the id (identity must stay deterministic/stable) and never reject on it.
+    sig = _slug_signature(node.label)
+    prior = sig_by_id.setdefault(node.id, sig)
+    if prior != sig:
+        reason = _add_reason(reason, "slug-collision-warning")
+    # undeclared type -> quarantine bucket (never silently accepted)
+    if node_types is not None and node.node_type not in node_types:
+        disp = Disposition.QUARANTINED
+        reason = _add_reason(reason, "undeclared-node-type")
+    # flood guard: cap NET-NEW writable nodes. A node id already in the canon (or repeated in this
+    # payload) grows the canon by zero, so it costs no budget and is never flooded — mirroring the
+    # edge "deduped costs zero" rule so an idempotent re-build never trips the limiter.
+    if node_budget is not None and disp in (Disposition.ACCEPTED, Disposition.DEMOTED):
+        is_deduped = node.id in seen_nodes
+        if is_deduped:
+            reason = _add_reason(reason, "deduped")
+        elif not node_budget.fits(is_deduped):
+            disp, reason = Disposition.REJECTED, "rate-limited-flood"
+        else:
+            seen_nodes.add(node.id)
+    return _result("node", node, disp, reason, retryable=False, identity=node.id)
 
 
 def _canon_node(node_in: NodeIn) -> Node:
@@ -315,17 +320,12 @@ def _canon_node(node_in: NodeIn) -> Node:
     # RAW while the edge lane keyed its source on slug() — the two then diverge ("FEP" vs "fep") onto
     # the same fep.md and trip _check_slug_collision, rolling back the whole kg_write batch. node_path
     # already slugs the id for the filename, so the raw id was never honored on disk anyway.
-    nid = _slug_label(node_in.id or node_in.label)
+    nid = slug(node_in.id or node_in.label)
     return Node(
         id=nid, label=node_in.label, node_type=node_in.node_type, file_type=node_in.file_type,
         provenance=node_in.provenance, authored_by=node_in.authored_by,
         epistemic_state=node_in.epistemic_state, body=node_in.body,
     )
-
-
-def _slug_label(label: str) -> str:
-    from .model import slug
-    return slug(label)
 
 
 def _slug_signature(label: str) -> str:
@@ -388,14 +388,30 @@ def _durability_quarantine(edge, canonical_id, rev, failure_ids, verdict_ids,
     resets the verdict to this fresh `unverified` edge on a routine idempotent /kg-build re-run.
     """
     if canonical_id in failure_ids or (check_reverse and rev in failure_ids):
-        return _ok("edge", edge, Disposition.QUARANTINED, "collapses-into-known-failure", False, canonical_id)
+        return _result("edge", edge, Disposition.QUARANTINED, "collapses-into-known-failure", False, canonical_id)
     if not check_reverse and canonical_id in verdict_ids:
-        return _ok("edge", edge, Disposition.QUARANTINED, "collapses-into-known-verdict", False, canonical_id)
+        return _result("edge", edge, Disposition.QUARANTINED, "collapses-into-known-verdict", False, canonical_id)
     return None
 
 
-def _validate_edge(edge_in, edge_types, norm_source, restore, seen, failure_ids, *, verdict_ids,
-                   sources=None) -> ValidationResult:
+@dataclass(frozen=True)
+class _EdgeLaneContext:
+    """The per-payload, per-lane IMMUTABLE validation context threaded to every edge (review-r5:
+    `_validate_edge` took eight loose parameters that widened with every new invariant —
+    `verdict_ids` was the latest — forcing a signature + call-site edit each time). The mutable
+    state (the `seen` dedup set, the flood budget) stays an explicit argument."""
+    edge_types: "set[str] | None"
+    norm_source: str
+    restore: Any
+    sources: "SourceSet | None"
+    failure_ids: "set[str]"
+    verdict_ids: "set[str]"
+
+
+def _validate_edge(edge_in: EdgeIn, ctx: _EdgeLaneContext, seen: set,
+                   budget: "_FloodBudget | None") -> ValidationResult:
+    edge_types, norm_source, restore, sources = ctx.edge_types, ctx.norm_source, ctx.restore, ctx.sources
+    failure_ids, verdict_ids = ctx.failure_ids, ctx.verdict_ids
     edge = Edge(
         source=edge_in.source, target=edge_in.target, relation=edge_in.relation,
         provenance=edge_in.provenance, authored_by=edge_in.authored_by,
@@ -414,7 +430,7 @@ def _validate_edge(edge_in, edge_types, norm_source, restore, seen, failure_ids,
     # don't sneak past. Reject before that aliasing can dedup-merge unrelated claims (§1.4).
     for role, value in (("source", edge.source), ("relation", edge.relation), ("target", edge.target)):
         if not re.search(r"[^\W_]", value or "", re.UNICODE):
-            return _ok("edge", edge, Disposition.REJECTED, f"empty-{role}", False, canonical_id)
+            return _result("edge", edge, Disposition.REJECTED, f"empty-{role}", False, canonical_id)
 
     # clamp the confidence hint into [0,1]; drop NaN/inf so it can't poison downstream calibration
     if edge.confidence_score is not None:
@@ -446,7 +462,7 @@ def _validate_edge(edge_in, edge_types, norm_source, restore, seen, failure_ids,
         check_span = restore(edge.span) if restore else edge.span
         rej = _verify_span(edge, check_span, sources, norm_source)
         if rej is not None:
-            return _ok("edge", edge, Disposition.REJECTED, rej, False, canonical_id)
+            return _result("edge", edge, Disposition.REJECTED, rej, False, canonical_id)
         # restore protects the egress, not the local canon (§1.9): the canon stores the ORIGINAL
         # (unscrubbed) span, recovered from the placeholder form the subagent emitted.
         if restore and check_span != edge.span:
@@ -466,21 +482,30 @@ def _validate_edge(edge_in, edge_types, norm_source, restore, seen, failure_ids,
     # undeclared edge type -> quarantine (never silently accepted) — applies to every lane
     if edge_types is not None and edge.relation not in edge_types:
         disp = Disposition.QUARANTINED
-        reason = (reason + ";" if reason else "") + "undeclared-edge-type"
+        reason = _add_reason(reason, "undeclared-edge-type")
 
-    # single-canonical-edge rule: dedup. Only a WRITABLE disposition seeds `seen` (mirroring the node
-    # lane's `seen_nodes`, which adds only on a net-new written+fitting node). A QUARANTINED/REJECTED
-    # edge is never merged into trusted canon, so it must NOT seed the dedup set: otherwise a later
-    # same-canonical-id WRITABLE edge takes the zero-cost "deduped" branch and slips past the §Stage-9
-    # flood cap — e.g. a QUARANTINED case-variant twin (relation "Grounds" vs declared "grounds", both
-    # slugging to "grounds") would buy a free real edge.
+    # single-canonical-edge rule (dedup) + the §Stage-9 flood charge, in ONE place (review-r5: the
+    # charge lived in the caller, keyed on a "deduped"-substring sniff of the free-text reason, and
+    # UNDID this function's provisional `seen.add` from outside — fragile hidden coupling).
+    # Only a WRITABLE disposition touches `seen` (mirroring the node lane): a QUARANTINED/REJECTED
+    # edge is never merged into trusted canon, so it must not seed the dedup set — otherwise a later
+    # same-canonical-id WRITABLE edge takes the zero-cost "deduped" branch and slips past the flood
+    # cap (e.g. a QUARANTINED case-variant twin buying a free real edge).
     writable = disp in (Disposition.ACCEPTED, Disposition.DEMOTED)
-    if canonical_id in seen and writable:
-        reason = (reason + ";" if reason else "") + "deduped"
     if writable:
+        is_deduped = canonical_id in seen
+        if is_deduped:
+            # a dedup grows the canon by zero: never charged, never flooded — an idempotent
+            # re-build that re-emits existing edges must not trip the limiter.
+            reason = _add_reason(reason, "deduped")
+        if budget is not None and not budget.fits(is_deduped):
+            # NET-NEW past the canon-wide budget: reject as flood, and never seed `seen` — a second
+            # identical copy must not take the zero-cost dedup branch and slip past the cap
+            # (cap-bypass via in-payload duplication).
+            return _result("edge", edge, Disposition.REJECTED, "rate-limited-flood", False, canonical_id)
         seen.add(canonical_id)
 
-    return _ok("edge", edge, disp, reason, retryable=False, identity=canonical_id)
+    return _result("edge", edge, disp, reason, retryable=False, identity=canonical_id)
 
 
 def merge_results_into_nodes(results: list[ValidationResult]) -> dict[str, Node]:
@@ -500,7 +525,7 @@ def merge_results_into_nodes(results: list[ValidationResult]) -> dict[str, Node]
     labels: dict[str, str] = {}
     for r in results:
         if r.kind == "edge" and r.written:
-            src = _slug_label(r.item.source)
+            src = slug(r.item.source)
             edges_by_node.setdefault(src, {})[r.item.id] = r.item
             labels.setdefault(src, r.item.source)  # a readable label for an auto-created placeholder
     for src, ebyid in edges_by_node.items():

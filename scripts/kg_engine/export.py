@@ -19,13 +19,17 @@ from collections import Counter
 from pathlib import Path
 
 from .atomicio import atomic_write_text as _atomic_write
+from .model import FAILURE_STATE_VALUES
+from .projector import BRIDGE_LIMIT
 from .templates.graph_html import HTML_TEMPLATE
 
-_FAILURE = ("failed", "rejected")
+_FAILURE = FAILURE_STATE_VALUES  # the single-homed negative-memory vocabulary (review-r5)
 
-# Reader-facing limits. _BRIDGE_TOP_N is coordinated with the projector's bridge LIMIT (kg_context),
-# which inlines the same magnitude in SQL with no shared constant — keep in sync with projector bridge LIMIT.
-_BRIDGE_TOP_N = 10
+# Reader-facing limits. The bridge top-N IS the projector's kg_context bridge LIMIT (review-r5: the
+# two used to be independent literals coordinated by a keep-in-sync comment).
+_BRIDGE_TOP_N = BRIDGE_LIMIT
+# The export kinds, named once for the engine entry point and the CLI (review-r5).
+_KINDS = ("html", "report", "all")
 _COMMUNITY_PREVIEW = 8        # community-member preview count (the slice AND the "…"-more threshold must match)
 _LIST_CAP = 50               # falsification / stale-verdict list caps
 _SPAN_TRUNCATE = 80          # span truncation width
@@ -127,7 +131,11 @@ def build_html(engine) -> Path:
     # HTML tokenizer, defeating both </script> and <!--<script>.
     payload = (json.dumps(data, sort_keys=True)
                .replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026"))
-    html = HTML_TEMPLATE.replace("__KG_DATA_JSON__", payload)
+    # The failure-state vocabulary is injected from its single model home (review-r5) — sorted so
+    # the rendered HTML bytes stay deterministic for a given derived state.
+    html = (HTML_TEMPLATE
+            .replace("__KG_DATA_JSON__", payload)
+            .replace("__KG_FAILURE_STATES_JSON__", json.dumps(sorted(FAILURE_STATE_VALUES))))
     out = engine.projector.derived / "graph.html"
     _atomic_write(out, html)
     return out
@@ -307,7 +315,7 @@ def export(engine, kind: str = "all") -> dict:
     """Build the requested artifact(s) (``html`` | ``report`` | ``all``). Read-only — consumes the derived
     layer, writes only its two disposable artifacts. Returns ``{ok, kind, html_path, report_path}``."""
     kind = (kind or "all").lower()
-    if kind not in ("html", "report", "all"):
+    if kind not in _KINDS:
         return {"ok": False, "kind": kind, "error": f"unknown kind {kind!r}; expected html|report|all",
                 "html_path": None, "report_path": None}
     html_path = build_html(engine) if kind in ("html", "all") else None
@@ -319,7 +327,7 @@ def export(engine, kind: str = "all") -> dict:
 
 def _main(argv: list) -> int:
     kind = (argv[0] if argv else "all").lower()
-    if kind not in ("html", "report", "all"):
+    if kind not in _KINDS:
         print("usage: python -m kg_engine.export [html|report|all]", file=sys.stderr)
         return 2
     from .server import build_engine_from_env

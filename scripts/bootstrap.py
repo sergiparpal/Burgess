@@ -4,9 +4,10 @@
 This is the single source of truth for building the engine's virtualenv. It is
 invoked three ways, all idempotent and safe to re-run:
 
-* by the plugin's ``SessionStart`` hook (``hooks/provision.sh`` / ``provision.ps1``,
-  dispatched cross-platform by ``hooks/provision.mjs``) right after the plugin is
-  installed/loaded — see ``--background`` below;
+* by the plugin's ``SessionStart`` hook (``hooks/provision.mjs`` — the single
+  cross-platform launcher since review-r5; ``provision.sh``/``provision.ps1`` remain
+  as dev shims that exec it) right after the plugin is installed/loaded — see
+  ``--background`` below;
 * by the MCP launcher (``scripts/launch_server.mjs``) as a foreground last-resort if
   the server is spawned before the background provision has finished (graceful catch-up);
 * by a developer from a shell (``python scripts/bootstrap.py``).
@@ -54,23 +55,25 @@ Launch with any system Python >= 3.10:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import os
 import platform
 import shutil
-import socket
 import subprocess
 import sys
 import threading
 import time
-import uuid
 import venv
 from pathlib import Path
 
-# Stdlib-only leaf module: importable with a bare system Python BEFORE the venv deps exist
+# Stdlib-only leaf modules: importable with a bare system Python BEFORE the venv deps exist
 # (kg_engine/__init__ is import-light), and bootstrap runs as ``python scripts/bootstrap.py``
-# so scripts/ is sys.path[0] and ``import kg_engine.atomicio`` resolves.
+# so scripts/ is sys.path[0] and ``import kg_engine.atomicio`` resolves. envconfig.clean is the
+# single home of the env-value cleaner (review-r5: five hand-synced copies, two sentinel sets).
+from kg_engine import dirlock
 from kg_engine.atomicio import atomic_write_text
+from kg_engine.envconfig import clean as _clean
 
 SCRIPT_DIR = Path(__file__).resolve().parent      # <repo>/scripts
 REPO_ROOT = SCRIPT_DIR.parent                     # <repo>
@@ -87,6 +90,13 @@ HEARTBEAT_SECS = STALE_LOCK_SECS / 4
 POLL_SECS = 2.0                     # how often a foreground waiter re-checks the lock
 LOG_NAME = "provision.log"          # where the detached worker logs
 SCHEMA = "1"                        # bump to force every venv to rebuild
+# Provisioning process exit codes, named once (review-r5: the meanings lived only in prose here
+# and again in launch_server.mjs's comments). launch_server treats any non-zero as "not ready";
+# the distinct values make the logs say WHY.
+EXIT_OK = 0
+EXIT_BUILD_FAILED = 1        # an install step failed (see provision.log)
+EXIT_STILL_PROVISIONING = 2  # a foreign in-flight build outlasted the wait deadline
+EXIT_PY_TOO_OLD = 3          # no interpreter >= MIN_PY to build with
 
 # Modules the engine must be able to import for the MCP server to come up. The igraph dep
 # imports as ``igraph``; pyyaml as ``yaml``. ``kg_engine`` resolves off PYTHONPATH. (Git is
@@ -108,14 +118,7 @@ _VERIFY_IMPORTS = (
 # --------------------------------------------------------------------------- #
 # Path resolution
 # --------------------------------------------------------------------------- #
-def _clean(value: str | None) -> str:
-    """Drop empty / unsubstituted ``${...}`` values from env or args."""
-    if not value:
-        return ""
-    value = value.strip()
-    if not value or value.startswith("${") or value in ("/.venv", "/venv"):
-        return ""
-    return value
+# (the env-value cleaner ``_clean`` is imported at the top, from its kg_engine.envconfig home)
 
 
 def resolve_venv_dir(explicit: str | None = None) -> Path:
@@ -239,254 +242,33 @@ def venv_current(venv_dir: Path) -> bool:
 # --------------------------------------------------------------------------- #
 # Lock (atomic mkdir; steals abandoned locks)
 # --------------------------------------------------------------------------- #
+# The implementation lives in the kg_engine.dirlock LEAF (review-r5): it was a second ~250-line
+# lock inside the installer, parallel-by-design to canon.LeaseLock and kept correct only by
+# keep-in-sync comments; it now has one home with its own unit-test surface. These thin wrappers
+# keep bootstrap's venv-dir-keyed call shape (and the tests' seams) unchanged.
+
+
 def _lock_dir(venv_dir: Path) -> Path:
     # Beside the venv, not inside it, so a half-built venv can't shadow the lock.
     return venv_dir.parent / LOCK_NAME
 
 
 def _heartbeat_file(venv_dir: Path) -> Path:
-    return _lock_dir(venv_dir) / "heartbeat"
-
-
-# The owner token this process wrote into each lock it currently holds, keyed by the lock
-# dir path. release() only rmtrees a lock whose ``info`` still carries OUR token — so a
-# holder that was falsely stolen (suspend/resume past STALE_LOCK_SECS) never deletes the
-# thief's fresh lock (mirrors canon.LeaseLock.release's ownership re-check, F15). Cleared on
-# release; a token surviving here for a lock we no longer own simply never matches the info.
-_OWNED_TOKENS: dict[str, str] = {}
-_HOST = socket.gethostname()
-
-
-def _new_token() -> str:
-    return uuid.uuid4().hex
-
-
-def _info_record(token: str) -> str:
-    # host+pid drive the liveness probe; the nonce token proves ownership across a stolen lock.
-    return f"pid={os.getpid()} host={_HOST} token={token} t={time.time():.0f}\n"
-
-
-def _parse_info_dir(lock: Path) -> dict[str, str]:
-    """Parse the ``info`` record inside lock dir `lock` into a {key: value} map.
-
-    Works on the live lock OR a sidelined copy, so the steal/release re-checks re-read the
-    exact dir they moved aside. Missing/unreadable -> {}.
-    """
-    try:
-        text = (lock / "info").read_text("utf-8")
-    except OSError:
-        return {}
-    rec: dict[str, str] = {}
-    for tok in text.split():
-        key, sep, val = tok.partition("=")
-        if sep:
-            rec[key] = val
-    return rec
-
-
-def _read_info(venv_dir: Path) -> dict[str, str]:
-    """Parse the live lock's ``info`` record into a {key: value} map. Missing/unreadable -> {}."""
-    return _parse_info_dir(_lock_dir(venv_dir))
-
-
-def _pid_probe(rec: dict[str, str]) -> bool:
-    """True if the lock's recorded holder is (possibly) alive. Mirrors canon._pid_probe: a
-    pid on another host (or no host recorded) is treated as alive, and the probe is skipped
-    on Windows (os.kill(pid, 0) there is CTRL_C_EVENT, not a no-op existence check)."""
-    try:
-        pid = int(rec.get("pid", "0"))
-    except ValueError:
-        pid = 0
-    if not pid:
-        return False
-    host = rec.get("host", "")
-    if host and host != _HOST:
-        return True
-    if not host:
-        return True  # an old info record without a host can't be probed — assume alive
-    if os.name == "nt":
-        return True
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # exists but owned by another user
-    except OSError:
-        return False
-
-
-def _lock_age(venv_dir: Path) -> float:
-    """Seconds since the holder last proved it is alive.
-
-    Liveness is judged by the heartbeat file (refreshed by the install loop, see
-    ``heartbeat``), NOT by the lock-dir mtime: a long cold source-build (igraph/leidenalg
-    from sdist) can outlast STALE_LOCK_SECS without ever touching the dir, and stealing a
-    *live* holder's lock lets two installs clobber the same venv. Fall back to the dir
-    mtime when no heartbeat has landed yet (the brief window right after mkdir).
-    """
-    hb = _heartbeat_file(venv_dir)
-    lock = _lock_dir(venv_dir)
-    try:
-        return time.time() - hb.stat().st_mtime
-    except OSError:
-        try:
-            return time.time() - lock.stat().st_mtime
-        except OSError:
-            return 0.0
-
-
-def _is_stealable(venv_dir: Path) -> bool:
-    """Whether the existing lock may be reclaimed: either its liveness signal has aged past
-    STALE_LOCK_SECS, OR a cheap PID-liveness probe shows the recorded holder is dead on this
-    host (mirrors canon.LeaseLock._rec_stale: TTL OR a failed os.kill probe). The probe makes
-    a crashed background worker reclaimable in milliseconds instead of the full 30-min window.
-    """
-    if _lock_age(venv_dir) > STALE_LOCK_SECS:
-        return True
-    return not _pid_probe(_read_info(venv_dir))
+    return dirlock.heartbeat_file(_lock_dir(venv_dir))
 
 
 def heartbeat(venv_dir: Path) -> None:
-    """Stamp the lock as alive. Called periodically by the install loop so a slow but
-    healthy build is never mistaken for an abandoned lock and stolen.
-
-    If the heartbeat write fails (read-only fs, ENOSPC, AV/permission hiccup), touch the
-    lock dir as a backstop so ``_lock_age``'s fallback path still advances for a live holder
-    instead of freezing at the mkdir-time mtime and getting the live build stolen (review-low).
-    """
-    hb = _heartbeat_file(venv_dir)
-    try:
-        if hb.exists():
-            os.utime(hb, None)
-        else:
-            hb.write_text(f"pid={os.getpid()} t={time.time():.0f}\n", "utf-8")
-    except OSError:
-        try:
-            os.utime(_lock_dir(venv_dir), None)
-        except OSError:
-            pass
+    """Stamp the provision lock as alive (the install loop pulses this so a slow but healthy
+    build is never mistaken for an abandoned lock and stolen)."""
+    dirlock.heartbeat(_lock_dir(venv_dir))
 
 
 def try_acquire(venv_dir: Path) -> bool:
-    lock = _lock_dir(venv_dir)
-    lock.parent.mkdir(parents=True, exist_ok=True)
-    token = _new_token()
-    try:
-        lock.mkdir()
-    except FileExistsError:
-        if _is_stealable(venv_dir):
-            # Steal discipline mirrors canon.LeaseLock.acquire's reclaim path (the lease-file
-            # twin of this mkdir-dir lock); the two are parallel by design — keep in sync.
-            # Steal atomically: renaming a directory is atomic, so exactly one racer
-            # can move the stale lock aside (the loser finds it already gone and backs
-            # off). rmtree+mkdir alone is not atomic together — two simultaneous
-            # stealers could both proceed.
-            #
-            # The sideline name must be collision-proof: a crash between os.replace() and
-            # rmtree() orphans a non-empty ``.stale-<...>`` dir, and a stealer that reused a
-            # bare PID-only name would then hit ENOTEMPTY on os.replace (masked as a lost
-            # race) and never reclaim. ``time_ns()`` makes every steal target unique, and we
-            # sweep any pre-existing ``*.stale-*`` orphans first so they can't accumulate.
-            # Reap only STALE orphans (mtime older than STALE_LOCK_SECS). A FRESH `.stale-*`/`.release-*`
-            # dir may be the IN-FLIGHT sideline of a CONCURRENT stealer/releaser (names are unique by
-            # pid+time_ns, so a fresh one isn't ours and isn't a crash orphan yet). rmtree-ing it out from
-            # under that racer would make its own re-validation see the dir "vanished" and STEAL a lock it
-            # meant to RESTORE — destroying a live holder. Gating on age spares the live racer while still
-            # reaping genuine crash orphans (the unique names already prevent the ENOTEMPTY collision).
-            now = time.time()
-            for pattern in (f"{LOCK_NAME}.stale-*", f"{LOCK_NAME}.release-*"):
-                for orphan in lock.parent.glob(pattern):
-                    try:
-                        if (now - orphan.stat().st_mtime) <= STALE_LOCK_SECS:
-                            continue  # too fresh — may be a concurrent racer's in-flight sideline
-                    except OSError:
-                        continue  # vanished/unreadable under us — nothing to reap
-                    shutil.rmtree(orphan, ignore_errors=True)
-            sidelined = lock.parent / f"{LOCK_NAME}.stale-{os.getpid()}-{time.time_ns()}"
-            try:
-                os.replace(lock, sidelined)
-            except OSError:
-                return False  # lost the steal race; caller re-loops and waits
-            # Re-validate the lock we actually moved: if the holder refreshed its heartbeat in
-            # the window between our staleness read and this move, we just sidelined a LIVE
-            # lock. Put it back and lose the race rather than destroy a live build's heartbeat
-            # (closes the residual reclaim TOCTOU, mirroring LeaseLock._reclaim_stale).
-            if not _is_stealable_dir(sidelined):
-                try:
-                    os.replace(sidelined, lock)
-                except OSError:
-                    shutil.rmtree(sidelined, ignore_errors=True)
-                return False
-            shutil.rmtree(sidelined, ignore_errors=True)
-            try:
-                lock.mkdir()
-            except OSError:
-                return False
-        else:
-            return False
-    try:
-        (lock / "info").write_text(_info_record(token), "utf-8")
-        _OWNED_TOKENS[str(lock)] = token
-    except OSError:
-        # The info write failed (ENOSPC, a transient AV/permission hold). Do NOT return success holding
-        # an UNOWNED lock: without the token, release() can't remove it (it leaks until the TTL), and
-        # with no `info` record _pid_probe reads pid=0, so a concurrent provisioner judges this
-        # just-acquired lock dead and STEALS it mid-build — two builds clobbering one venv, the exact
-        # race this lock prevents. Abandon cleanly (remove the dir we hold) so the caller re-loops.
-        shutil.rmtree(lock, ignore_errors=True)
-        return False
-    heartbeat(venv_dir)  # seed liveness immediately so a just-acquired lock is never stale
-    return True
-
-
-def _is_stealable_dir(lock: Path) -> bool:
-    """Staleness re-check against a SPECIFIC (already sidelined) lock dir, by its own
-    heartbeat/dir mtime and PID probe — so the reclaim path re-validates the exact dir it
-    moved aside rather than whatever now sits at the live path."""
-    hb = lock / "heartbeat"
-    try:
-        age = time.time() - hb.stat().st_mtime
-    except OSError:
-        try:
-            age = time.time() - lock.stat().st_mtime
-        except OSError:
-            return True  # vanished under us — nothing live to protect
-    if age > STALE_LOCK_SECS:
-        return True
-    return not _pid_probe(_parse_info_dir(lock))
+    return dirlock.try_acquire(_lock_dir(venv_dir), stale_secs=STALE_LOCK_SECS)
 
 
 def release(venv_dir: Path) -> None:
-    """Release the lock — but ONLY if it is still the one THIS process acquired.
-
-    Mirror canon.LeaseLock.release's ownership re-check (F15): a holder that was falsely
-    stolen (laptop suspend/resume spanning STALE_LOCK_SECS froze its heartbeat) must not
-    rmtree the thief's brand-new lock on its way out. We rename the lock aside (only one
-    mover wins), confirm the MOVED ``info`` still carries our token, and only then remove
-    it; otherwise we put it back untouched.
-    """
-    lock = _lock_dir(venv_dir)
-    token = _OWNED_TOKENS.get(str(lock))
-    if token is None:
-        return  # we never recorded ownership of this lock — leave it alone
-    sidelined = lock.parent / f"{LOCK_NAME}.release-{os.getpid()}-{time.time_ns()}"
-    try:
-        os.replace(lock, sidelined)
-    except OSError:
-        _OWNED_TOKENS.pop(str(lock), None)
-        return  # already gone/reclaimed — nothing of ours to release
-    if _parse_info_dir(sidelined).get("token") == token:
-        shutil.rmtree(sidelined, ignore_errors=True)
-        _OWNED_TOKENS.pop(str(lock), None)
-        return
-    # We moved a foreign/changed lock aside (a successor reclaimed the path) — restore it.
-    try:
-        os.replace(sidelined, lock)
-    except OSError:
-        shutil.rmtree(sidelined, ignore_errors=True)
-    _OWNED_TOKENS.pop(str(lock), None)
+    dirlock.release(_lock_dir(venv_dir))
 
 
 # --------------------------------------------------------------------------- #
@@ -548,33 +330,35 @@ def verify_imports(py: Path) -> None:
     run([str(py), "-c", _VERIFY_IMPORTS], env=_engine_env())
 
 
+def _soft_probe(py: Path, snippet: str, parent_fail_msg: str) -> None:
+    """Run an ADVISORY in-venv import probe that must never abort provisioning (review-r5: the
+    two probes were structural copy-paste). A NON-checking subprocess (never ``run()``, which is
+    ``check=True``); the in-venv import/DLL-load error is reported by the snippet itself, and a
+    parent-side launch failure (OSError) by the except — either way provisioning proceeds."""
+    try:
+        subprocess.run([str(py), "-c", snippet], check=False, env=_engine_env())
+    except Exception as exc:  # noqa: BLE001 — an optional/blocked dep must never abort provisioning
+        print(parent_fail_msg.format(exc=f"{type(exc).__name__}: {exc}"), flush=True)
+
+
 def probe_leidenalg(py: Path) -> None:
     """Soft-probe the OPTIONAL ``leidenalg`` import in the freshly-built venv — advisory only.
 
     leidenalg installs fine but its unsigned native ``_c_leiden`` DLL can be blocked from
     LOADING by Windows Smart App Control / Application Control. At runtime that is already
     tolerated (``projector._leiden`` degrades to label propagation), so a blocked import must
-    NOT abort the provision the way ``verify_imports`` would. This reports which path the engine
-    will take and ALWAYS returns cleanly: it runs a NON-checking subprocess (never ``run()``,
-    which is ``check=True``) and swallows every failure — the in-venv import error / DLL-load
-    error is caught by the snippet, a parent-side launch failure (OSError) by the ``except``.
+    NOT abort the provision the way ``verify_imports`` would — this just reports which path the
+    engine will take.
     """
-    snippet = (
+    _soft_probe(py, (
         "try:\n"
         "    import leidenalg\n"
         "    print('[bootstrap] leidenalg OK (Leiden community detection enabled)')\n"
         "except Exception as e:\n"
         "    print('[bootstrap] leidenalg unavailable (' + type(e).__name__ + ': ' + str(e)\n"
         "          + '); using label-propagation fallback (projector._leiden)')\n"
-    )
-    try:
-        subprocess.run([str(py), "-c", snippet], check=False, env=_engine_env())
-    except Exception as exc:  # noqa: BLE001 — a blocked/optional dep must never abort provisioning
-        print(
-            f"[bootstrap] leidenalg unavailable ({type(exc).__name__}: {exc}); "
-            "using label-propagation fallback (projector._leiden)",
-            flush=True,
-        )
+    ), "[bootstrap] leidenalg unavailable ({exc}); "
+       "using label-propagation fallback (projector._leiden)")
 
 
 def probe_divergence(py: Path) -> None:
@@ -586,7 +370,7 @@ def probe_divergence(py: Path) -> None:
     keeps working. So, exactly like leidenalg, a missing/blocked divergence dep must never
     abort provisioning — this just reports which path the diverge flow will take.
     """
-    snippet = (
+    _soft_probe(py, (
         "try:\n"
         "    import numpy, sklearn, model2vec\n"
         "    print('[bootstrap] divergence deps OK (numpy/sklearn/model2vec)')\n"
@@ -594,15 +378,8 @@ def probe_divergence(py: Path) -> None:
         "    print('[bootstrap] divergence deps unavailable (' + type(e).__name__ + ': '\n"
         "          + str(e) + '); /kg-diverge will raise a clear error until provisioned;'\n"
         "          + ' convergence (kg_*) tools are unaffected (I9)')\n"
-    )
-    try:
-        subprocess.run([str(py), "-c", snippet], check=False, env=_engine_env())
-    except Exception as exc:  # noqa: BLE001 — an optional layer must never abort provisioning
-        print(
-            f"[bootstrap] divergence deps unavailable ({type(exc).__name__}: {exc}); "
-            "/kg-diverge degraded until provisioned; kg_* tools unaffected (I9)",
-            flush=True,
-        )
+    ), "[bootstrap] divergence deps unavailable ({exc}); "
+       "/kg-diverge degraded until provisioned; kg_* tools unaffected (I9)")
 
 
 def _has_engine_marker(venv_dir: Path) -> bool:
@@ -617,6 +394,48 @@ def _has_engine_marker(venv_dir: Path) -> bool:
     foreign user data and is never scaffolded into nor deleted.
     """
     return (venv_dir / PTR_NAME).exists() or (venv_dir / STAMP_NAME).exists()
+
+
+@contextlib.contextmanager
+def _heartbeat_pulse(venv_dir: Path):
+    """Keep the provision lock alive across a slow source-build (a daemon thread pulsing
+    ``heartbeat`` every HEARTBEAT_SECS) so a concurrent provisioner does not mistake a healthy
+    long install for an abandoned lock and steal it (bootstrap-1). Extracted from do_install
+    (review-r5) so the install body reads as guards -> install -> verify -> markers."""
+    stop = threading.Event()
+
+    def _pulse() -> None:
+        while not stop.wait(HEARTBEAT_SECS):
+            heartbeat(venv_dir)
+
+    thread = threading.Thread(target=_pulse, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join(timeout=1.0)
+
+
+def _write_markers(venv_dir: Path, py: Path) -> None:
+    """Finalize a VERIFIED venv: the interpreter pointer, then the stamp STRICTLY LAST.
+
+    Single source of truth for the launchers, on every OS — forward slashes work in Git Bash,
+    PowerShell, and cmd alike, so the recorded path is shell-agnostic. Both writes are atomic;
+    the stamp lands only after verify_imports succeeded, so a matching stamp implies a verified
+    venv (bootstrap-2) and a crash between pointer and stamp never fakes "ready". The stamp
+    carries the BUILT venv's own interpreter identity (uv may have built with a different
+    interpreter than the one running bootstrap), so a later --check under yet another
+    interpreter compares equal and doesn't force a spurious rebuild (review-M7)."""
+    atomic_write_text(venv_dir / PTR_NAME, py.as_posix(), mkparents=False, fsync_dir=False)
+    atomic_write_text(
+        venv_dir / STAMP_NAME,
+        compute_stamp(_interp_identity(py)),
+        mkparents=False,
+        fsync_dir=False,
+    )
+    print(f"[bootstrap] Engine interpreter: {py.as_posix()}", flush=True)
+    print(f"[bootstrap] Wrote {venv_dir / PTR_NAME}", flush=True)
 
 
 def do_install(venv_dir: Path) -> Path:
@@ -650,63 +469,35 @@ def do_install(venv_dir: Path) -> Path:
             f"engine venv (no {PTR_NAME} / {STAMP_NAME}). Point --venv / KG_ENGINE_VENV "
             f"at a dedicated path.")
 
-    # Keep the lock alive across a slow source-build so a concurrent provisioner does not
-    # mistake a healthy long install for an abandoned lock and steal it (bootstrap-1).
-    stop_hb = threading.Event()
+    with _heartbeat_pulse(venv_dir):
+        try:
+            if uv:
+                install_with_uv(venv_dir, uv)
+            else:
+                install_with_pip(venv_dir)
+            py = venv_python(venv_dir)
+            if not py.exists():
+                raise SystemExit(f"[bootstrap] venv interpreter not found at {py}")
+            verify_imports(py)
+            # Optional, never fatal: the soft probes report whether Leiden / the divergence deps
+            # are loadable, or which fallback the engine will take. They swallow all failures.
+            probe_leidenalg(py)
+            probe_divergence(py)
+        except BaseException:
+            # A failed/interrupted install leaves a venv with an interpreter but a partial
+            # dependency graph that the next run would silently "reuse". Remove it so the next
+            # provision rebuilds clean — but ONLY when it is genuinely ours: either WE created
+            # the dir THIS run (ours_to_clean) or it carries an engine marker from a prior build
+            # (engine-python.txt / install.stamp). A pre-existing populated dir WITHOUT an engine
+            # marker is foreign and was already refused above, so we never reach here for one — but
+            # the marker re-check keeps the rmtree from ever touching such a dir even if that guard
+            # changed. A bare pyvenv.cfg never qualifies (bootstrap-1). The lock lives BESIDE the
+            # venv (_lock_dir), so this never deletes the lock this process still holds.
+            if ours_to_clean or _has_engine_marker(venv_dir):
+                shutil.rmtree(venv_dir, ignore_errors=True)
+            raise
 
-    def _pulse() -> None:
-        while not stop_hb.wait(HEARTBEAT_SECS):
-            heartbeat(venv_dir)
-
-    hb_thread = threading.Thread(target=_pulse, daemon=True)
-    hb_thread.start()
-    try:
-        if uv:
-            install_with_uv(venv_dir, uv)
-        else:
-            install_with_pip(venv_dir)
-        py = venv_python(venv_dir)
-        if not py.exists():
-            raise SystemExit(f"[bootstrap] venv interpreter not found at {py}")
-        verify_imports(py)
-        # Optional, never fatal: report whether Leiden is loadable or the engine will fall back
-        # to label propagation (SAC-blocked DLL). probe_leidenalg swallows all failures.
-        probe_leidenalg(py)
-        probe_divergence(py)
-    except BaseException:
-        # A failed/interrupted install leaves a venv with an interpreter but a partial
-        # dependency graph that the next run would silently "reuse". Remove it so the next
-        # provision rebuilds clean — but ONLY when it is genuinely ours: either WE created
-        # the dir THIS run (ours_to_clean) or it carries an engine marker from a prior build
-        # (engine-python.txt / install.stamp). A pre-existing populated dir WITHOUT an engine
-        # marker is foreign and was already refused above, so we never reach here for one — but
-        # the marker re-check keeps the rmtree from ever touching such a dir even if that guard
-        # changed. A bare pyvenv.cfg never qualifies (bootstrap-1). The lock lives BESIDE the
-        # venv (_lock_dir), so this never deletes the lock this process still holds.
-        if ours_to_clean or _has_engine_marker(venv_dir):
-            shutil.rmtree(venv_dir, ignore_errors=True)
-        raise
-    finally:
-        stop_hb.set()
-        hb_thread.join(timeout=1.0)
-
-    # Single source of truth for the launchers, on every OS. Forward slashes work in
-    # Git Bash, PowerShell, and cmd alike, so the recorded path is shell-agnostic.
-    # Pointer first, then stamp (both atomic): the stamp is written STRICTLY LAST, after
-    # verify_imports has succeeded, so the presence of a matching stamp implies a verified
-    # venv (bootstrap-2) and a crash between pointer and stamp never fakes "ready".
-    atomic_write_text(venv_dir / PTR_NAME, py.as_posix(), mkparents=False, fsync_dir=False)
-    # Re-stamp with the BUILT venv's own interpreter identity (uv may have built the venv with a
-    # different interpreter than the one running bootstrap), so a later --check under yet another
-    # interpreter compares equal and doesn't force a spurious rebuild (review-M7).
-    atomic_write_text(
-        venv_dir / STAMP_NAME,
-        compute_stamp(_interp_identity(py)),
-        mkparents=False,
-        fsync_dir=False,
-    )
-    print(f"[bootstrap] Engine interpreter: {py.as_posix()}", flush=True)
-    print(f"[bootstrap] Wrote {venv_dir / PTR_NAME}", flush=True)
+    _write_markers(venv_dir, py)
     return py
 
 
@@ -749,16 +540,16 @@ def _ok_with_reconcile(venv_dir: Path, reconcile: bool) -> int:
     """The single success post-condition: on any successful provision, reconcile if asked (§1.8)."""
     if reconcile:
         maybe_reconcile(venv_dir)
-    return 0
+    return EXIT_OK
 
 
 def _wait_for_lock(venv_dir: Path, deadline: float) -> int | None:
     """Wait until we hold the provision lock or the venv is otherwise current.
 
-    Returns 0 when another builder finished while we waited (caller must still reconcile),
-    2 when the wait deadline passed without the venv becoming ready, or None once the lock
-    is acquired (caller proceeds to build). Keep release in the caller's finally — this
-    helper never releases.
+    Returns EXIT_OK when another builder finished while we waited (caller must still
+    reconcile), EXIT_STILL_PROVISIONING when the wait deadline passed without the venv becoming
+    ready, or None once the lock is acquired (caller proceeds to build). Keep release in the
+    caller's finally — this helper never releases.
     """
     while not try_acquire(venv_dir):
         # re-evaluate readiness against the VENV interpreter's identity each iteration (M7): once
@@ -766,18 +557,18 @@ def _wait_for_lock(venv_dir: Path, deadline: float) -> int | None:
         # Check readiness BEFORE the deadline so a just-finished build returns ready, not 2.
         if venv_current(venv_dir):
             print("[bootstrap] Another setup just finished — engine ready.", flush=True)
-            return 0
+            return EXIT_OK
         if time.time() >= deadline:
             # We gave up waiting and the venv is NOT ready. Return NON-zero (review-low: wait-deadline):
             # a legitimately long cold source-build (igraph/leidenalg from sdist) can outlast the
-            # deadline, and returning 0 here would tell the launcher "ready" and launch the server
-            # against an unprovisioned venv. 2 = "still provisioning", distinct from a build failure (1).
+            # deadline, and EXIT_OK here would tell the launcher "ready" and launch the server
+            # against an unprovisioned venv. Distinct from EXIT_BUILD_FAILED.
             print(
                 "[bootstrap] Another setup is still in progress past the wait deadline; "
                 "it will finish in the background. Try again shortly.",
                 flush=True,
             )
-            return 2
+            return EXIT_STILL_PROVISIONING
         time.sleep(POLL_SECS)
     return None
 
@@ -795,16 +586,16 @@ def provision(venv_dir: Path, *, wait_secs: float, reconcile: bool = False) -> i
             "[bootstrap] Install Python 3.10+ (python.org / your package manager / "
             "`winget install Python.Python.3.12`) and start a new session.\n"
         )
-        return 3
+        return EXIT_PY_TOO_OLD
 
     # Serialize against any other provisioner (the SessionStart worker, more terminals,
     # the launcher racing the background hook).
     deadline = time.time() + max(0.0, wait_secs)
     waited = _wait_for_lock(venv_dir, deadline)
-    if waited == 0:
+    if waited == EXIT_OK:
         return _ok_with_reconcile(venv_dir, reconcile)
-    if waited == 2:
-        return 2
+    if waited == EXIT_STILL_PROVISIONING:
+        return EXIT_STILL_PROVISIONING
 
     try:
         if venv_current(venv_dir):  # re-check now that we hold the lock
@@ -822,7 +613,7 @@ def provision(venv_dir: Path, *, wait_secs: float, reconcile: bool = False) -> i
             f"{' '.join(str(c) for c in exc.cmd)}\n"
             f"[bootstrap] See {log_path} for details, then start a new session.\n"
         )
-        return 1
+        return EXIT_BUILD_FAILED
     finally:
         release(venv_dir)
 

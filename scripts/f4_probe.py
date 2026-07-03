@@ -21,6 +21,7 @@ VERDICT vocabulary (the only judgment that matters):
 span_found (y/n): is there an actual textual span in the source supporting it (the span-present check)?
 """
 
+import argparse
 import csv
 import json
 import math
@@ -61,25 +62,6 @@ def _span_found(row):
     return row.get("span_found", "").strip().lower() in TRUE_VALUES
 
 
-def _flag_str(args, name, default):
-    if name not in args:
-        return default
-    i = args.index(name)
-    if i + 1 >= len(args):
-        sys.exit(f"{name} requires a value")
-    return args[i + 1]
-
-
-def _flag_int(args, name, default):
-    raw = _flag_str(args, name, None)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        sys.exit(f"{name} must be an integer, got {raw!r}")
-
-
 def _median(sorted_vals):
     """True median of an already-sorted, non-empty list: average the two central elements on even
     length rather than reporting the upper-middle one (finding harness-f4-2)."""
@@ -96,8 +78,7 @@ def load(path):
     nodes = data.get("nodes", [])
     edges = data.get("links", data.get("edges", []))
     id2label = {n.get("id"): n.get("label", n.get("id")) for n in nodes}
-    id2type = {n.get("id"): n.get("file_type", "?") for n in nodes}
-    return nodes, edges, id2label, id2type
+    return nodes, edges, id2label
 
 
 def _print_counter(title, counter, top=None, row=lambda k, v: f"  {k:12} {v}"):
@@ -108,7 +89,7 @@ def _print_counter(title, counter, top=None, row=lambda k, v: f"  {k:12} {v}"):
 
 
 def summary(path):
-    nodes, edges, _, id2type = load(path)
+    nodes, edges, _ = load(path)
     print(f"nodes: {len(nodes)}   edges: {len(edges)}\n")
 
     by_type = Counter(n.get("file_type", "?") for n in nodes)
@@ -138,7 +119,7 @@ def sheet(path, n, out, include_extracted):
     # (finding harness-f4-3). Reject it loudly so the labeling run can't silently produce nothing.
     if n <= 0:
         sys.exit(f"--n must be a positive integer, got {n}")
-    _, edges, id2label, _ = load(path)
+    _, edges, id2label = load(path)
     pool = list(enumerate(edges))
     if not include_extracted:
         pool = [(i, e) for i, e in pool if e.get("confidence") != EXTRACTED]
@@ -257,26 +238,37 @@ def score(path):
     _report_calibration(rows)
 
 
-def main():
-    if len(sys.argv) < 3:
-        sys.exit(__doc__)
-    cmd, path = sys.argv[1], sys.argv[2]
-    args = sys.argv[3:]
+def main(argv=None):
+    # argparse subcommands (review-r5: this probe hand-rolled _flag_str/_flag_int while the sibling
+    # CLIs used argparse — three idioms across the repo for the same job).
+    ap = argparse.ArgumentParser(
+        prog="f4_probe.py",
+        description="Measure the extractor's precision on a non-self-grounding conceptual document "
+                    "(see the module docstring for the verdict vocabulary).")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sp = sub.add_parser("summary", help="graph shape + confidence/relation distributions")
+    sp.add_argument("path", help="graph.json (node-link)")
+    sp = sub.add_parser("sheet", help="sample edges into a labeling CSV")
+    sp.add_argument("path", help="graph.json (node-link)")
+    sp.add_argument("--n", type=int, default=80, help="edges to sample (default 80)")
+    sp.add_argument("--out", default="labels.csv", help="output CSV path (default labels.csv)")
+    sp.add_argument("--include-extracted", action="store_true",
+                    help="include EXTRACTED (deterministic) edges in the pool")
+    sp = sub.add_parser("score", help="score a filled labels CSV")
+    sp.add_argument("path", help="labels.csv with verdict/span_found filled")
+    args = ap.parse_args(argv)
     try:
-        if cmd == "summary":
-            summary(path)
-        elif cmd == "sheet":
-            sheet(path, _flag_int(args, "--n", 80), _flag_str(args, "--out", "labels.csv"),
-                  include_extracted="--include-extracted" in args)
-        elif cmd == "score":
-            score(path)
+        if args.cmd == "summary":
+            summary(args.path)
+        elif args.cmd == "sheet":
+            sheet(args.path, args.n, args.out, include_extracted=args.include_extracted)
         else:
-            sys.exit(__doc__)
+            score(args.path)
     except FileNotFoundError as e:
         sys.exit(f"file not found: {e.filename}")
     except (json.JSONDecodeError, csv.Error, UnicodeDecodeError) as e:
         # a present-but-corrupt graph.json/labels.csv must fail cleanly, not surface a raw traceback
-        sys.exit(f"could not read '{path}': {e}")
+        sys.exit(f"could not read '{args.path}': {e}")
 
 
 if __name__ == "__main__":

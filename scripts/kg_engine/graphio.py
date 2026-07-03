@@ -1,6 +1,6 @@
 """Leaf NetworkX helpers — version-robust node-link (de)serialization + a safe node-attr accessor.
 
-`node_link_graph` / `_node_link_data` are the on-disk shape of the derived `graph.json` (§1.2). They
+`node_link_graph` / `node_link_data` are the on-disk shape of the derived `graph.json` (§1.2). They
 are shared by three modules: the projector *writes* the derived graph, while the harness (`specificity`,
 `absorption`) and the generators (`load_second_graph`/ensemble) *reconstruct* a graph from a second
 construction's JSON. They previously lived in `projector.py`, which forced `harness` and `generate` to
@@ -18,7 +18,7 @@ from __future__ import annotations
 import networkx as nx
 
 
-def _node_link_data(G) -> dict:
+def node_link_data(G) -> dict:
     try:
         return nx.node_link_data(G, edges="links")
     except TypeError:
@@ -28,13 +28,17 @@ def _node_link_data(G) -> dict:
         return d
 
 
+# Back-compat alias for the pre-review-r5 underscore name (its reader half was always public).
+_node_link_data = node_link_data
+
+
 def node_link_graph(data: dict):
     try:
         return nx.node_link_graph(data, edges="links", directed=data.get("directed", True))
     except TypeError:
         # Only the OLD networkx (3.0–3.3) that lacks the `edges=` keyword reaches this branch, and its
         # bare `node_link_graph` reader expects the edges under the "links" key — exactly the key
-        # `_node_link_data` writes on disk. So do NOT rename "links" -> "edges" (that would hide the
+        # `node_link_data` writes on disk. So do NOT rename "links" -> "edges" (that would hide the
         # edges from the old reader and reconstruct an EDGELESS graph); pass the data through as-is.
         # Copy so the caller's dict is never mutated.
         return nx.node_link_graph(dict(data), directed=data.get("directed", True))

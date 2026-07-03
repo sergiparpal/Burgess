@@ -13,7 +13,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .canon import Canon, GROUND_AUDIT
+from .canon import Canon, GROUND_AUDIT, RECONCILE_STATE_NAME, _atomic_write
 from .groundaudit import GroundAuditLog
 from .model import EpistemicState, GROUNDABLE_STATES, VERDICT_STATES, node_from_markdown, slug
 
@@ -40,13 +40,27 @@ class OrphanReport:
     orphaned_verdicts: list[str] = field(default_factory=list)  # verdicts whose edge vanished
 
 
+@dataclass
+class _Sweep:
+    """One scan's working state, threaded through the phase helpers (every field is the LIVE
+    object scan() persists at the end — the helpers mutate them in place; review-r5)."""
+    files_state: dict
+    epistemic: dict
+    consumed: dict
+    audit: dict
+    report: ReconcileReport
+    live_files: set
+    live_keys: set
+    full_sweep: bool
+
+
 class Reconciler:
     # Size of the bounded prefix-tail window hashed as an anchor for the incremental audit fold below.
     _AUDIT_ANCHOR_WINDOW = 4096
 
     def __init__(self, canon: Canon, state_path: str | Path | None = None):
         self.canon = canon
-        self.state_path = Path(state_path) if state_path else (canon.root / ".kg-reconcile-state.json")
+        self.state_path = Path(state_path) if state_path else (canon.root / RECONCILE_STATE_NAME)
         self.audit_path = canon.root / GROUND_AUDIT
         # The audit log is the durable trust root; this seam reads it for forge detection and owns the
         # §1.8 spend-ledger checkpoint SIDECAR that lets a sweep RECOVER `consumed`/`epistemic` after the
@@ -83,7 +97,6 @@ class Reconciler:
             return {"files": {}, "epistemic": {}, "consumed": {}}
 
     def _save_state(self, state: dict) -> None:
-        from .canon import _atomic_write
         _atomic_write(self.state_path, json.dumps(state, indent=0))
 
     @staticmethod
@@ -121,7 +134,7 @@ class Reconciler:
                 continue  # one corrupt audit line must not blind the reconciler to the rest
             if not isinstance(rec, dict) or "_ckpt" in rec:
                 continue  # checkpoint snapshot, not a verdict transition
-            pair = f"{rec.get('key', '')}||{rec.get('to', '')}"
+            pair = Reconciler._pair(rec.get("key", ""), rec.get("to", ""))
             counts[pair] = counts.get(pair, 0) + 1
 
     def _audit_counts(self) -> dict[str, int]:
@@ -208,6 +221,20 @@ class Reconciler:
             return None
         return Reconciler._node_keys(node)
 
+    @staticmethod
+    def _pair(key: str, state: str) -> str:
+        """Encode a (key, to-state) audit tally pair — ``key||state`` (review-r5: the format lived
+        at four sites as inline f-strings/rsplits)."""
+        return f"{key}||{state}"
+
+    @staticmethod
+    def _pair_owner(pair: str) -> str:
+        """Decode the key half of a pair. Split on the LAST ``||``: the state value never contains
+        ``||``, but a hand-edited node id might (raw frontmatter ids are not re-slugged on read,
+        model.node_from_markdown) — a prefix match would let ``node:a`` over-drain ``node:a||b``'s
+        ledger and wrongly re-quarantine a sibling's legit verdict (reconciler-||collision)."""
+        return pair.rsplit("||", 1)[0]
+
     def _requarantine_forged(self, node, epistemic: dict, consumed: dict, audit: dict[str, int],
                              report: ReconcileReport) -> bool:
         """Reset any out-of-band forged verdict on `node` and its edges to UNVERIFIED, recording the
@@ -218,7 +245,7 @@ class Reconciler:
 
         # node-level forged verdict
         nkey = f"node:{node.id}"
-        if self._forged(nkey, node.epistemic_state, epistemic, consumed, audit):
+        if self._check_and_spend(nkey, node.epistemic_state, epistemic, consumed, audit):
             node.epistemic_state = EpistemicState.UNVERIFIED
             report.requarantined.append(node.id)
             mutated = True
@@ -227,7 +254,7 @@ class Reconciler:
         # edge-level forged verdicts
         for e in node.edges:
             ekey = e.id
-            if self._forged(ekey, e.epistemic_state, epistemic, consumed, audit):
+            if self._check_and_spend(ekey, e.epistemic_state, epistemic, consumed, audit):
                 e.epistemic_state = EpistemicState.UNVERIFIED
                 e.verdict_by = None
                 e.verdict_at = None
@@ -278,33 +305,183 @@ class Reconciler:
             p = self.canon.notes_dir / canonical_name
         return p, rel
 
+    def _scan_note(self, p: Path, sw: "_Sweep") -> None:
+        """Examine ONE canon note: pre-filter, hash, re-quarantine forged verdicts under the lease,
+        and maintain the sweep's cache/liveness sets (review-r5: this was a ~95-line inline loop
+        body with five differently-scoped `continue`s — each is now a guard-clause `return`).
+
+        Liveness contract on every early return: a VANISHED or cheap-path-skipped note is NOT added
+        to `live_files` (the cheap prune path recomputes authoritatively); a note that still exists
+        on disk but could not be (re)processed IS kept live so the prune spares its baseline, and it
+        is retried next sweep."""
+        rel = p.name
+        # scan() holds no lease, so a lease-holding writer (kg_rename's unlink, an atomic
+        # temp+replace) can delete/rename a note BETWEEN note_paths()'s snapshot and these
+        # stat/hash syscalls. An unguarded raise here aborts the WHOLE §1.8 sweep before
+        # _save_state, silently disabling forge-detection for the session (reconciler-7). Skip a
+        # vanished/transiently-unreadable note instead: it is correctly absent from live_files (and
+        # pruned if truly gone), and re-examined next sweep if it still exists.
+        try:
+            st = p.stat()
+        except OSError:
+            return  # deleted/renamed concurrently; not live this sweep
+        prev = sw.files_state.get(rel, {})
+        # pre-filter: unchanged mtime+size and not a full sweep -> skip the expensive re-read
+        prefilter_same = (prev.get("mtime") == st.st_mtime and prev.get("size") == st.st_size)
+        if prefilter_same and not sw.full_sweep:
+            return  # cheap pre-gate: trust (mtime,size); the full-sweep prune re-reads
+        try:
+            digest = _sha256(p)
+        except OSError:
+            return  # vanished/unreadable between stat and hash; retry next sweep
+        if sw.full_sweep and prefilter_same and prev.get("sha256") == digest:
+            # mtime/size AND hash matched -> genuinely unchanged even under sweep. Carry the cached
+            # keys forward (backfill once if absent) so live_keys stays complete without a re-parse.
+            keys = prev.get("keys")
+            if keys is None:
+                keys = self._file_keys(p)
+            sw.files_state[rel] = self._file_record(st, digest, keys if keys is not None else [])
+            sw.live_files.add(rel)
+            if keys:
+                sw.live_keys.update(keys)
+            return
+
+        sw.report.changed.append(rel)
+        try:
+            # parse the file ON DISK directly, not via read_node(p.stem) which re-slugs the stem
+            # and could resolve to a different/missing file for a non-slug-canonical filename
+            # (reconciler-4) — leaving that note un-reconciled on every scan.
+            node = node_from_markdown(p.read_text(encoding="utf-8"), fallback_id=p.stem)
+        except Exception:  # noqa: BLE001 — a single malformed note must not crash the sweep
+            # the note still exists on disk (so its files_state entry must survive the prune), but a
+            # malformed note contributes NO parseable keys — exactly what all_nodes() would yield.
+            sw.live_files.add(rel)
+            return  # leave its file_state untouched so it's retried next scan
+
+        # A re-quarantine is a read->mutate->write; the reconciler holds no lease across the sweep, so
+        # a concurrent kg_ground (separate process) could ground a SIBLING edge on this same note
+        # between our read and our write, and a stale in-memory copy written back would silently
+        # clobber that verdict (lost update, reconciler-M3/M2). Take the lease and decide on a FRESH
+        # read under it (_correct_under_lease) — mirroring kg_ground's read-under-lease discipline —
+        # so we reset only what is STILL forged and never drop a concurrently-applied sibling
+        # verdict. If the lease CANNOT be taken (another live writer), do NOT mutate+write the stale
+        # snapshot at all: keep the note live (so the prune doesn't reap it) and carry its snapshot
+        # keys so the epistemic baseline survives; retry under the lease next sweep.
+        if not self.canon.try_acquire_lock():
+            sw.live_files.add(rel)
+            sw.live_keys.update(self._node_keys(node))  # snapshot keys keep the baseline
+            return
+        try:
+            done = self._correct_under_lease(p, rel, st, digest, sw)
+        finally:
+            self.canon.release_lock()
+        if done is None:
+            return  # liveness already handled by the callee; retry next sweep
+        st, digest, node, p, rel = done
+        keys = self._node_keys(node)
+        sw.files_state[rel] = self._file_record(st, digest, keys)
+        sw.live_files.add(rel)
+        sw.live_keys.update(keys)
+
+    def _correct_under_lease(self, p: Path, rel: str, st, digest, sw: "_Sweep"):
+        """The lease-held read -> re-quarantine -> write critical section of one note's scan.
+
+        Re-reads FRESH under the lease (see the caller's rationale), resets any still-forged
+        verdicts, and — when something was actually reset — relocates a non-canonical filename and
+        persists the corrected note. Returns ``(st, digest, node, p, rel)`` for the caller to cache
+        (the unmutated path keeps the pre-lease stat/hash: the bytes are unchanged), or None for
+        "keep live, retry next sweep" (this helper or `_relocate_to_canonical` has already added the
+        note's liveness where it applies)."""
+        try:
+            node = node_from_markdown(p.read_text(encoding="utf-8"), fallback_id=p.stem)
+        except OSError:
+            sw.live_files.add(rel)  # vanished/unreadable under the lease; retry next sweep
+            return None
+        except Exception:  # noqa: BLE001 — became malformed; no parseable keys, retry next
+            sw.live_files.add(rel)
+            return None
+        mutated = self._requarantine_forged(node, sw.epistemic, sw.consumed, sw.audit, sw.report)
+        if mutated:
+            relocated = self._relocate_to_canonical(node, p, rel, sw.files_state, sw.live_files)
+            if relocated is None:
+                return None  # collision pre-check failed: keep the original, retry next sweep
+            p, rel = relocated
+            try:
+                self.canon.write_one(node)
+            except Exception:  # noqa: BLE001 — one unwritable/colliding note must not abort sweep
+                sw.live_files.add(rel)
+                return None
+            try:
+                st = p.stat()
+                digest = _sha256(p)
+            except OSError:
+                sw.live_files.add(rel)  # vanished right after our write; cache it next sweep
+                return None
+        return st, digest, node, p, rel
+
+    def _prune_dead_baseline(self, sw: "_Sweep") -> None:
+        """Prune the `epistemic` BASELINE (and the files cache) for anything no longer live. Edge ids
+        are deterministic, so a deleted-then-recreated edge would otherwise inherit the old "already
+        grounded" baseline and let a forged verdict slip past the `last == current` short-circuit in
+        _check_and_spend (reconciler-1). Dropping dead keys also bounds growth across renames/churn
+        (reconciler-2).
+
+        `consumed` is deliberately NOT pruned: it is the running tally of audit records already
+        spent, and the audit log is append-only (never pruned). Pruning consumed would let an old,
+        still-present audit record be re-spent by a recreated edge — re-opening the very replay the
+        count check defeats. Its growth tracks the audit log, which is the permanent record anyway."""
+        if sw.full_sweep:
+            # every note was visited+hashed in the loop, so the incremental sets equal an
+            # all_nodes()/note_paths() recompute exactly — without the redundant second full read.
+            prune_files, prune_keys = sw.live_files, sw.live_keys
+        else:
+            # cheap pre-gate skipped unchanged notes (their cached keys may be stale under an
+            # (mtime,size) collision), so recompute authoritatively — byte-identical to the
+            # pre-reconciler-6 prune. (Trusting cached keys here could leave a stale baseline key and
+            # reopen a delete→recreate→forge bypass — see
+            # test_f29_cheap_path_uses_authoritative_all_nodes — so it stays deliberately authoritative.)
+            live_nodes = self.canon.all_nodes()
+            prune_files = {p.name for p in self.canon.note_paths()}
+            prune_keys = ({f"node:{n.id}" for n in live_nodes}
+                          | {e.id for n in live_nodes for e in n.edges})
+        for rel in [r for r in sw.files_state if r not in prune_files]:
+            del sw.files_state[rel]
+        for k in [k for k in sw.epistemic if k not in prune_keys]:
+            del sw.epistemic[k]
+
+    def _recover_spend_ledger(self, consumed: dict, epistemic: dict) -> None:
+        """Durability recovery (§1.8): `consumed` (the spend ledger) and `epistemic` (the
+        re-quarantine baseline) live in the git-ignored, fail-open reconcile-state cache. If that
+        cache is lost/deleted while the append-only audit log survives, `consumed` resets to {} and
+        every historical record looks unspent again — letting a previously-grounded-then-demoted
+        edge be re-forged and accepted (the count check in _check_and_spend finds an "unconsumed"
+        stale record). So when the cache carries no spend ledger, recover both from the last
+        checkpoint persisted beside the audit log (the durable trust root). Merge safe-HIGH for
+        consumed (max per pair — over-strict, never a missed forgery) and adopt the checkpoint's
+        epistemic baseline only where the cache lacks one. A genuine first-ever run has no
+        checkpoint -> stays empty, behaviour unchanged. Mutates both dicts in place."""
+        if consumed:
+            return
+        recovered = self._ground_audit.last_checkpoint()
+        if not recovered:
+            return
+        for pair, c in recovered["consumed"].items():
+            if isinstance(c, int) and c > consumed.get(pair, 0):
+                consumed[pair] = c
+        for k, v in recovered["epistemic"].items():
+            epistemic.setdefault(k, v)
+
     # ---- scan
     def scan(self, full_sweep: bool = False) -> ReconcileReport:
         state = self._load_state()
         # Coerce each sub-key defensively: a hand-edited / truncated state with `{"files": null}` (or a
         # non-dict sub-value) would otherwise crash scan() before _save_state can heal it. These stay the
-        # LIVE sub-dicts mutated in place below (consumed spends records in _forged, epistemic is the
+        # LIVE sub-dicts mutated in place below (consumed spends records in _check_and_spend, epistemic is the
         # re-quarantine baseline) and written back at the end — _coerce_subdict must never copy them out.
         files_state = self._coerce_subdict(state, "files")
         epistemic = self._coerce_subdict(state, "epistemic")
         consumed = self._coerce_subdict(state, "consumed")
-        # Durability recovery (§1.8): `consumed` (the spend ledger) and `epistemic` (the re-quarantine
-        # baseline) live in the git-ignored, fail-open `.kg-reconcile-state.json` cache. If that cache is
-        # lost/deleted while the append-only audit log survives, `consumed` resets to {} and every
-        # historical record looks unspent again — letting a previously-grounded-then-demoted edge be
-        # re-forged and accepted (the count check at _forged finds an "unconsumed" stale record). So when
-        # the cache carries no spend ledger, recover both from the last checkpoint persisted in the audit
-        # log (the durable trust root). Merge safe-HIGH for consumed (max per pair — over-strict, never a
-        # missed forgery) and adopt the checkpoint's epistemic baseline only where the cache lacks one. A
-        # genuine first-ever run has no checkpoint -> stays empty, behaviour unchanged.
-        if not consumed:
-            recovered = self._ground_audit.last_checkpoint()
-            if recovered:
-                for pair, c in recovered["consumed"].items():
-                    if isinstance(c, int) and c > consumed.get(pair, 0):
-                        consumed[pair] = c
-                for k, v in recovered["epistemic"].items():
-                    epistemic.setdefault(k, v)
+        self._recover_spend_ledger(consumed, epistemic)
         audit = self._audit_counts()
         report = ReconcileReport(full_sweep=full_sweep)
         # On a FULL SWEEP we visit and hash every note in the loop below, so we can build the live
@@ -316,129 +493,14 @@ class Reconciler:
         live_files: set[str] = set()
         live_keys: set[str] = set()
 
+        sweep = _Sweep(files_state=files_state, epistemic=epistemic, consumed=consumed,
+                       audit=audit, report=report, live_files=live_files, live_keys=live_keys,
+                       full_sweep=full_sweep)
         for p in self.canon.note_paths():  # excludes .tmp-* atomic-write temporaries (canon-5)
             report.scanned += 1
-            rel = p.name
-            # scan() holds no lease, so a lease-holding writer (kg_rename's unlink, an atomic
-            # temp+replace) can delete/rename a note BETWEEN note_paths()'s snapshot and these
-            # stat/hash syscalls. An unguarded raise here aborts the WHOLE §1.8 sweep before
-            # _save_state, silently disabling forge-detection for the session (reconciler-7). Skip a
-            # vanished/transiently-unreadable note instead: it is correctly absent from live_files (and
-            # pruned if truly gone), and re-examined next sweep if it still exists.
-            try:
-                st = p.stat()
-            except OSError:
-                continue  # deleted/renamed concurrently; not live this sweep
-            prev = files_state.get(rel, {})
-            # pre-filter: unchanged mtime+size and not a full sweep -> skip the expensive re-read
-            prefilter_same = (prev.get("mtime") == st.st_mtime and prev.get("size") == st.st_size)
-            if prefilter_same and not full_sweep:
-                continue  # cheap pre-gate: trust (mtime,size); the full-sweep prune below re-reads
-            try:
-                digest = _sha256(p)
-            except OSError:
-                continue  # vanished/unreadable between stat and hash; retry next sweep
-            if full_sweep and prefilter_same and prev.get("sha256") == digest:
-                # mtime/size AND hash matched -> genuinely unchanged even under sweep. Carry the cached
-                # keys forward (backfill once if absent) so live_keys stays complete without a re-parse.
-                keys = prev.get("keys")
-                if keys is None:
-                    keys = self._file_keys(p)
-                files_state[rel] = self._file_record(st, digest, keys if keys is not None else [])
-                live_files.add(rel)
-                if keys:
-                    live_keys.update(keys)
-                continue
+            self._scan_note(p, sweep)
 
-            report.changed.append(rel)
-            try:
-                # parse the file ON DISK directly, not via read_node(p.stem) which re-slugs the stem
-                # and could resolve to a different/missing file for a non-slug-canonical filename
-                # (reconciler-4) — leaving that note un-reconciled on every scan.
-                node = node_from_markdown(p.read_text(encoding="utf-8"), fallback_id=p.stem)
-            except Exception:  # noqa: BLE001 — a single malformed note must not crash the sweep
-                # the note still exists on disk (so its files_state entry must survive the prune), but a
-                # malformed note contributes NO parseable keys — exactly what all_nodes() would yield.
-                live_files.add(rel)
-                continue  # leave its file_state untouched so it's retried next scan
-
-            # A re-quarantine is a read->mutate->write; the reconciler holds no lease across the sweep, so
-            # a concurrent kg_ground (separate process) could ground a SIBLING edge on this same note
-            # between our read and our write, and a stale in-memory copy written back would silently
-            # clobber that verdict (lost update, reconciler-M3/M2). Take the lease for the critical
-            # section and decide on a FRESH read under it — mirroring kg_ground's read-under-lease
-            # discipline — so we reset only what is STILL forged and never drop a concurrently-applied
-            # sibling verdict. If the lease CANNOT be taken (another live writer), do NOT mutate+write the
-            # stale snapshot at all: skip this note (keep it live so the prune doesn't reap it, and carry
-            # its snapshot keys so the epistemic baseline survives) and retry under the lease on the next
-            # sweep. Only the lease-held FRESH read is ever mutated and written; single-process callers
-            # (the lease is free) always take the fast lease path.
-            locked = self.canon.try_acquire_lock()
-            if not locked:
-                live_files.add(rel)
-                live_keys.update(self._node_keys(node))  # snapshot keys keep the baseline; retry next sweep
-                continue
-            try:
-                try:
-                    node = node_from_markdown(p.read_text(encoding="utf-8"), fallback_id=p.stem)
-                except OSError:
-                    live_files.add(rel)  # vanished/unreadable under the lease; retry next sweep
-                    continue
-                except Exception:  # noqa: BLE001 — became malformed; no parseable keys, retry next
-                    live_files.add(rel)
-                    continue
-                mutated = self._requarantine_forged(node, epistemic, consumed, audit, report)
-
-                if mutated:
-                    relocated = self._relocate_to_canonical(node, p, rel, files_state, live_files)
-                    if relocated is None:
-                        continue  # collision pre-check failed: keep the original, retry next sweep
-                    p, rel = relocated
-                    try:
-                        self.canon.write_one(node)
-                    except Exception:  # noqa: BLE001 — one unwritable/colliding note must not abort sweep
-                        live_files.add(rel)
-                        continue
-                    try:
-                        st = p.stat()
-                        digest = _sha256(p)
-                    except OSError:
-                        live_files.add(rel)  # vanished right after our write; cache it next sweep
-                        continue
-            finally:
-                self.canon._release_lock()
-            keys = self._node_keys(node)
-            files_state[rel] = self._file_record(st, digest, keys)
-            live_files.add(rel)
-            live_keys.update(keys)
-
-        # Prune the `epistemic` BASELINE for anything no longer live. Edge ids are deterministic, so a
-        # deleted-then-recreated edge would otherwise inherit the old "already grounded" baseline and
-        # let a forged verdict slip past the `last == current` short-circuit in _forged (reconciler-1).
-        # Dropping dead keys also bounds growth across renames/churn (reconciler-2, whose comment
-        # previously claimed a pruning that did not happen).
-        #
-        # `consumed` is deliberately NOT pruned: it is the running tally of audit records already
-        # spent, and the audit log is append-only (never pruned). Pruning consumed would let an old,
-        # still-present audit record be re-spent by a recreated edge — re-opening the very replay the
-        # count check defeats. Its growth tracks the audit log, which is the permanent record anyway.
-        if full_sweep:
-            # every note was visited+hashed in the loop, so the incremental sets equal an
-            # all_nodes()/note_paths() recompute exactly — without the redundant second full read.
-            prune_files, prune_keys = live_files, live_keys
-        else:
-            # cheap pre-gate skipped unchanged notes (their cached keys may be stale under an (mtime,size)
-            # collision), so recompute authoritatively — byte-identical to the pre-reconciler-6 prune.
-            # (Trusting cached keys here could leave a stale baseline key and reopen a delete→recreate→
-            # forge bypass — see test_f29_cheap_path_uses_authoritative_all_nodes — so it stays
-            # deliberately authoritative.)
-            live_nodes = self.canon.all_nodes()
-            prune_files = {p.name for p in self.canon.note_paths()}
-            prune_keys = {f"node:{n.id}" for n in live_nodes} | {e.id for n in live_nodes for e in n.edges}
-        for rel in [r for r in files_state if r not in prune_files]:
-            del files_state[rel]
-        for k in [k for k in epistemic if k not in prune_keys]:
-            del epistemic[k]
+        self._prune_dead_baseline(sweep)
 
         self._save_state({"files": files_state, "epistemic": epistemic, "consumed": consumed})
 
@@ -456,7 +518,7 @@ class Reconciler:
             except Exception:  # noqa: BLE001 — checkpointing must never break the sweep
                 pass
             finally:
-                self.canon._release_lock()
+                self.canon.release_lock()
 
         # Housekeeping (full sweep only): reap bounded-retention transient dotfiles (old `.bak` self-heal
         # backups beyond the retention cap, crash-leftover `.tmp-*`, sidelined lock records) that would
@@ -475,18 +537,21 @@ class Reconciler:
         """Mark EVERY audit record for `key` as consumed (consumed[pair] = audit[pair] for each of the
         key's pairs). Called once `key`'s current canon state is validated as legitimate: that state is
         authoritative, so all historical records that led here are spent and none may justify a FUTURE
-        out-of-band transition. Pair keys are `f"{key}||{state}"`; isolate this key's pairs by splitting
-        the trailing `||{state}` off the LAST `||` (the state value never contains `||`) rather than a
-        prefix match — a hand-edited node id that itself contains `||` (raw frontmatter ids are not
-        re-slugged on read, model.node_from_markdown) would otherwise let `node:a` over-drain `node:a||b`'s
-        ledger and wrongly re-quarantine a sibling's legit verdict (reconciler-||collision)."""
+        out-of-band transition. Pair encode/decode (and the last-`||` split rationale) live on
+        `_pair`/`_pair_owner`."""
         for pair, count in audit.items():
-            if pair.rsplit("||", 1)[0] == key and count > consumed.get(pair, 0):
+            if Reconciler._pair_owner(pair) == key and count > consumed.get(pair, 0):
                 consumed[pair] = count
 
-    def _forged(self, key: str, current: EpistemicState, epistemic: dict, consumed: dict,
-                audit: dict[str, int]) -> bool:
-        """True if `current` is a policed state reached out-of-band: it differs from the last validated
+    def _check_and_spend(self, key: str, current: EpistemicState, epistemic: dict, consumed: dict,
+                         audit: dict[str, int]) -> bool:
+        """True iff `current` is FORGED; otherwise validates the state and SPENDS the ledger.
+
+        (Renamed from `_forged` in review-r5: it read as a pure predicate but advances the spend
+        ledger — the module's central invariant — via `_drain_key_ledger`, and can adopt mid-sweep
+        audit records into the working snapshot; calling it twice or reordering it is NOT safe.)
+
+        Forged means: `current` is a policed state reached out-of-band — it differs from the last validated
         state for this key and there is no UNCONSUMED kg_ground audit record justifying a transition
         into `current`. Each legitimate transition consumes one audit record, so replaying a stale
         verdict (whose record was already spent) is caught. The policed set is GROUNDABLE_STATES — the
@@ -496,7 +561,7 @@ class Reconciler:
         if current not in GROUNDABLE_STATES:
             return False
         last = epistemic.get(key)
-        pair = f"{key}||{current.value}"
+        pair = self._pair(key, current.value)
         if last == current.value:
             # Unchanged since last validated — nothing new to justify, and the current state is
             # authoritative, so drain the WHOLE ledger for this key into `consumed`. An idempotent
@@ -526,7 +591,7 @@ class Reconciler:
         fresh = self._audit_counts()
         if fresh.get(pair, 0) > audit.get(pair, 0):
             for p, c in fresh.items():
-                if p.rsplit("||", 1)[0] == key and c > audit.get(p, 0):
+                if self._pair_owner(p) == key and c > audit.get(p, 0):
                     audit[p] = c  # adopt mid-sweep records for this key into the working snapshot
             if audit.get(pair, 0) > consumed.get(pair, 0):
                 self._drain_key_ledger(key, consumed, audit)

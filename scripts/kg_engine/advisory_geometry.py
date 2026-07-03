@@ -27,7 +27,7 @@ ordering and reports why).
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 # The brief-level cliché map enumerates ~6 obvious answers; the graph-level map
 # mirrors that size with the top grounded hubs (the graph's "center").

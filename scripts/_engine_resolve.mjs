@@ -47,20 +47,28 @@ export function venvDir(root, env = process.env) {
   return join(root, ".venv");
 }
 
+// Interpreter-probe / bootstrap-check spawnSync bound, shared by every launcher (review-r5: the
+// value used to be spelled in three files, named in one). On Windows the `py`/`python` App
+// Execution Alias stub can stall indefinitely; a timed-out probe is treated as "not found".
+export const PROBE_TIMEOUT_MS = 15000;
+
 // A system Python >= 3.10 that can ALSO import every module in `requireImports`. launch_server
 // needs only 'sys'; the canon merge driver additionally needs 'yaml' (PyYAML) — kg_engine.canonmerge
 // imports it transitively (model.py `import yaml`), so a dep-less interpreter is rejected and the
 // driver falls through to the clean "no engine python" conflict path instead of crashing (M8).
 export function systemPython(requireImports = ["sys"]) {
+  // The versioned POSIX tail (python3.13…3.10) covers minimal distros that ship a versioned
+  // binary with no bare `python3` — folded in from the retired provision.sh probe (review-r5).
   const cands =
-    process.platform === "win32" ? ["py", "python", "python3"] : ["python3", "python", "py"];
+    process.platform === "win32"
+      ? ["py", "python", "python3"]
+      : ["python3", "python", "py", "python3.13", "python3.12", "python3.11", "python3.10"];
   const probe =
     `import ${requireImports.join(", ")}; raise SystemExit(0 if sys.version_info[:2] >= (3, 10) else 1)`;
   for (const c of cands) {
-    // Cap the probe (review-low): on Windows the `py`/`python` App Execution Alias stub can stall
-    // indefinitely. A timed-out probe sets r.error with r.status=null, so it is skipped like a missing
-    // interpreter and we fall through to the next candidate / null.
-    const r = spawnSync(c, ["-c", probe], { stdio: "ignore", timeout: 15000 });
+    // Cap the probe (review-low): a stalled alias/interpreter sets r.error with r.status=null, so it
+    // is skipped like a missing interpreter and we fall through to the next candidate / null.
+    const r = spawnSync(c, ["-c", probe], { stdio: "ignore", timeout: PROBE_TIMEOUT_MS });
     if (!r.error && r.status === 0) return c;
   }
   return null;

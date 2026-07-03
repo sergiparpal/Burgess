@@ -25,14 +25,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .model import AuthoredBy, Disposition, EpistemicState, Provenance, UNDECLARED_TYPE
 from .server import KGEngine, build_engine_from_env
+from .sources import split_sections as _shared_split_sections
 
 DEFAULT_MODEL = "claude-opus-4-8"
 # Dense sections + adaptive thinking (which counts toward the budget) can blow past a small cap and
@@ -165,24 +166,13 @@ class BackendExtractor:
     # ---- source slicing ---------------------------------------------------
     @staticmethod
     def split_sections(text: str) -> list[tuple[str, str]]:
-        """Split a Markdown source into (title, body) sections at top-level ``##`` headers.
-
-        Any preamble before the first ``##`` becomes a leading ("", preamble) section so it is not
-        dropped. Mirrors the extractor agent's "one ## section per payload" rule.
-        """
-        parts: list[tuple[str, str]] = []
-        cur_title, cur_lines = "", []
-        for line in text.splitlines():
-            m = re.match(r"^##\s+(.*)$", line)
-            if m:
-                if cur_lines:
-                    parts.append((cur_title, "\n".join(cur_lines)))
-                cur_title, cur_lines = m.group(1).strip(), [line]
-            else:
-                cur_lines.append(line)
-        if cur_lines:
-            parts.append((cur_title, "\n".join(cur_lines)))
-        return parts
+        """Split a Markdown source into (title, body) sections at top-level ``##`` headers — the
+        extractor agent's "one ## section per payload" unit. The rule itself is single-homed in
+        ``sources.split_sections`` (review-r5: this used to be a second, regex-based copy that had
+        drifted from the server's coverage splitter). ``include_heading`` keeps the heading line in
+        the body: the extraction payload needs it for model context. Any preamble before the first
+        ``##`` becomes a leading ("", preamble) section so it is not dropped."""
+        return _shared_split_sections(text, include_heading=True)
 
     def source_file_name(self) -> str:
         # Only a real single FILE has a meaningful basename. Under R4 source_path may be a directory
@@ -305,11 +295,11 @@ class BackendExtractor:
             {
                 "id": n.get("id"),
                 "label": n.get("label", n.get("id", "")),
-                "node_type": n.get("node_type", "undeclared-type"),
+                "node_type": n.get("node_type", UNDECLARED_TYPE),
                 "file_type": "prose",
-                "provenance": "span-present",
-                "authored_by": "agent",
-                "epistemic_state": "unverified",
+                "provenance": Provenance.SPAN_PRESENT.value,
+                "authored_by": AuthoredBy.AGENT.value,
+                "epistemic_state": EpistemicState.UNVERIFIED.value,
                 "body": n.get("body", ""),
             }
             for n in raw.get("nodes", [])
@@ -323,9 +313,9 @@ class BackendExtractor:
                 "relation": e.get("relation", ""),
                 "span": e.get("span", ""),
                 "source_file": source_basename,
-                "provenance": "span-present",
-                "authored_by": "agent",
-                "epistemic_state": "unverified",
+                "provenance": Provenance.SPAN_PRESENT.value,
+                "authored_by": AuthoredBy.AGENT.value,
+                "epistemic_state": EpistemicState.UNVERIFIED.value,
                 "confidence": "INFERRED",
                 "confidence_score": e.get("confidence_score"),
             }
@@ -448,8 +438,8 @@ def _exit_code(out: dict) -> int:
     if not (out.get("metrics") or {}).get("edges"):
         return 1  # edgeless/degenerate graph: no relations landed
     disp = out.get("dispositions") or {}
-    written = disp.get("ACCEPTED", 0) + disp.get("DEMOTED", 0)
-    blocked = disp.get("REJECTED", 0) + disp.get("QUARANTINED", 0)
+    written = disp.get(Disposition.ACCEPTED.value, 0) + disp.get(Disposition.DEMOTED.value, 0)
+    blocked = disp.get(Disposition.REJECTED.value, 0) + disp.get(Disposition.QUARANTINED.value, 0)
     if written == 0 and blocked > 0:
         return 1  # nothing accepted while items were rejected/quarantined
     return 0

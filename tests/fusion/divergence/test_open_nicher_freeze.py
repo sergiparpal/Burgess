@@ -12,7 +12,7 @@ from __future__ import annotations
 import numpy as np
 
 from kg_engine.divergence import pipeline
-from kg_engine.divergence.archive import Archive, CVTNicher
+from kg_engine.divergence.archive import Archive, FrozenVoronoiNicher
 from kg_engine.divergence.config import axes_spec_from_dict
 from kg_engine.divergence.embed import get_embedder
 from kg_engine.divergence.state import State
@@ -56,7 +56,7 @@ def _cell_of(nid):
 # --------------------------------------------------------------------------- #
 def test_cold_start_separates_distinct_more_than_near_identical():
     emb = get_embedder("hash")
-    nicher = CVTNicher(dim=emb.dim, k=24, seed=0)  # cold start, fixed centroids
+    nicher = FrozenVoronoiNicher(dim=emb.dim, k=24, seed=0)  # cold start, fixed centroids
 
     distinct = [
         ("referral incentives for loyal customers", "underwater midnight sculpture exhibit"),
@@ -84,8 +84,8 @@ def test_cold_start_separates_distinct_more_than_near_identical():
 
 def test_cold_start_assignment_is_deterministic():
     emb = get_embedder("hash")
-    n1 = CVTNicher(dim=emb.dim, k=24, seed=7)
-    n2 = CVTNicher(dim=emb.dim, k=24, seed=7)
+    n1 = FrozenVoronoiNicher(dim=emb.dim, k=24, seed=7)
+    n2 = FrozenVoronoiNicher(dim=emb.dim, k=24, seed=7)
     vecs = emb.embed([f"mechanism number {i}" for i in range(15)])
     assert n1.cells(vecs) == n2.cells(vecs)
 
@@ -109,7 +109,7 @@ def test_freeze_persists_centroids_and_rekeys_archive(home):
 
     # The archive must be re-keyed onto the frozen cells, not scrambled: every
     # surviving niche's cell equals the frozen-cell of its own elite's mechanism.
-    nicher = CVTNicher.from_dict(on)
+    nicher = FrozenVoronoiNicher.from_dict(on)
     arc = Archive.from_dict(spec, state.read_archive())
     cand = state.read_candidates()
     assert len(arc.niches) >= 2  # the mechanisms really did spread
@@ -143,7 +143,7 @@ def test_niche_ids_stable_after_freeze(home):
     # every pre-existing niche id still exists (stable, not renamed)
     assert ids1 <= set(arc2.niches)
     # the new candidates landed in frozen cells consistent with the nicher
-    nicher = CVTNicher.from_dict(on2)
+    nicher = FrozenVoronoiNicher.from_dict(on2)
     cand = state.read_candidates()
     for niche in arc2.niches.values():
         mech = cand[niche.elite_id]["descriptor"]["mechanism"]

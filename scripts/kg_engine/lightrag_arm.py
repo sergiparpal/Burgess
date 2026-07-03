@@ -41,6 +41,13 @@ import os
 import sys
 from pathlib import Path
 
+# The env cleaner, data-dir rule, and derived-layer names are single-homed in envconfig
+# (review-r5) — a stdlib leaf, so this isolated module still never imports the MCP server stack.
+from .envconfig import DERIVED_DIRNAME
+from .envconfig import clean_env as _clean_env
+from .envconfig import resolve_data_dir as _resolve_data_dir
+from .envconfig import resolve_project as _resolve_project
+
 # A marker LightRAG writes once a document has been indexed into a working_dir, so a second run loads
 # the cached index instead of re-extracting (which would re-spend LLM tokens on entity extraction).
 _INDEX_MARKER = "kv_store_full_docs.json"
@@ -74,21 +81,12 @@ def _needs_rebuild(working_dir: Path, source_path: Path) -> bool:
     return cached != _source_signature(source_path)
 
 
-def _clean_env(key: str) -> str | None:
-    """Read an env var, treating empty OR an unsubstituted ``${...}`` placeholder as unset (mirrors
-    ``server._clean_env`` without importing the MCP server stack into this isolated module)."""
-    v = (os.environ.get(key) or "").strip()
-    return None if not v or v.startswith("${") else v
-
-
 def default_store_dir() -> Path:
-    """The LightRAG working store, under the engine's (gitignored) derived dir — resolved the same way
-    a KGEngine resolves its data dir, but without importing the server: ``KG_DATA`` if set, else
-    ``<project>/.kg-data``, then ``/derived/lightrag``."""
-    proj = _clean_env("KG_PROJECT_DIR") or _clean_env("CLAUDE_PROJECT_DIR") or os.getcwd()
-    data = _clean_env("KG_DATA")
-    base = Path(data) if data else (Path(proj) / ".kg-data")
-    return base / "derived" / "lightrag"
+    """The LightRAG working store, under the engine's (gitignored) derived dir — the SAME data-dir
+    rule a KGEngine resolves (``KG_DATA`` if set, else ``<project>/.kg-data``; the rule's one home
+    is ``envconfig``), then ``/derived/lightrag``."""
+    base = _resolve_data_dir(_resolve_project(os.getcwd()))
+    return base / DERIVED_DIRNAME / "lightrag"
 
 
 def query_mode() -> str:

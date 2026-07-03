@@ -18,13 +18,10 @@ from kg_engine.divergence.state import State
 
 def test_defaults_match_module_constants():
     # Drift guard: EngineConfig defaults mirror the module-level fallback constants.
+    # (pipeline's six knobs no longer appear here: since review-r5 they are DERIVED from a default
+    # EngineConfig at import — asserting equality would be tautological. The monitor/memory pairs
+    # below are still independent literals, so their guards remain load-bearing.)
     c = EngineConfig()
-    assert c.open_niches == pipeline.OPEN_NICHES
-    assert c.open_niche_freeze_factor == pipeline.OPEN_NICHE_FREEZE_FACTOR
-    assert c.knn_k == pipeline.KNN_K
-    assert c.novelty_ref_cap == pipeline.NOVELTY_REF_CAP
-    assert c.max_dpp_pool == pipeline.MAX_DPP_POOL
-    assert c.quality_weight == pipeline.QUALITY_WEIGHT
     assert c.monitor_cos_threshold == monitor.DEFAULT_COS_THRESHOLD
     assert c.monitor_entropy_threshold == monitor.DEFAULT_ENTROPY_THRESHOLD
     assert c.monitor_margin == monitor.DEFAULT_MARGIN

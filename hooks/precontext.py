@@ -8,9 +8,10 @@ import sys
 
 
 def _clean(value: "str | None") -> str:
-    """Mirror bootstrap._clean / the launchers' clean(): drop empty, whitespace, unsubstituted
-    ${...}, and the bare-sentinel results of substituting an empty ${...} into a ${VAR}/.venv
-    template so an unset/unsubstituted env var never sends us to a bogus path (review-low)."""
+    """The ONE permitted local copy of the env-value cleaner: it runs BEFORE sys.path can reach
+    kg_engine.envconfig (the rule's single home, review-r5), solely to read CLAUDE_PLUGIN_ROOT.
+    Everything after the sys.path insert resolves through envconfig — keep this body in lockstep
+    with envconfig.clean."""
     if not value:
         return ""
     v = value.strip()
@@ -28,6 +29,19 @@ def emit(ctx: str) -> None:
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": ctx}}))
 
 
+# Render/latency knobs, named (review-r5). This hook fires on every Grep/Glob/Read, so the injected
+# context is kept small and the work bounded:
+_CONTEXT_BUDGET = 800          # token budget passed to kg_context (a fraction of a normal read)
+_MAX_ITEMS = 6                 # grounded items rendered
+_MAX_BRIDGES = 3               # advisory bridge labels rendered
+_MAX_HOOK_REPROJECT_NOTES = 400  # ~the scale where pure-Python betweenness nears the 5s kill cap
+# The hook's short canon-lease TTL: precontext.mjs kills us at 5s, a killed hook leaves its lease
+# behind, and on Windows a dead pid can't be probed — so the lease must expire well inside the
+# writers' 30s acquire budget (review-r4: hook-kill-wedges-windows-writers). While the hook is ALIVE
+# the projection's heartbeats keep the lease fresh, so a legitimate slow projection is never stolen.
+_HOOK_LEASE_TTL = 15.0
+
+
 def main() -> int:
     try:
         # Decode stdin as UTF-8 explicitly — json.load(sys.stdin) would use the locale text
@@ -37,61 +51,43 @@ def main() -> int:
         payload = json.loads(sys.stdin.buffer.read().decode("utf-8"))
     except Exception:
         return 0
-    # Resolve project/data with the SAME precedence the server uses (build_engine_from_env): KG_PROJECT_DIR
-    # / KG_DATA (the .mcp.json override knobs) win over the CLAUDE_* defaults — else precontext reads a
-    # DIFFERENT vault/derived dir than the server whenever those overrides are set (review-low).
-    project = _clean(os.environ.get("KG_PROJECT_DIR")) or _clean(os.environ.get("CLAUDE_PROJECT_DIR")) \
-        or payload.get("cwd")
+    # Every resolution below goes through kg_engine.envconfig — the SAME single-homed rules the
+    # server's build_engine_from_env uses (review-r5: this hook used to carry a hand-synced copy of
+    # the whole chain, and the review-r4 ${...} placeholder-filter fix had landed only in the server
+    # copy, so an unsubstituted ${user_config.metrics_mode} passed through here as a real value).
+    # The hook's two documented differences are explicit knobs, not forks: `plugin_data_fallback`
+    # (its env lacks the .mcp.json KG_DATA=${CLAUDE_PLUGIN_DATA} wiring, so it reads the source var)
+    # and `plugin_root` (on an installed plugin the project dir has no pack/pack.yaml; a project-only
+    # lookup would wire EMPTY specificity seeds into a projection the server then serves as fresh —
+    # finding: precontext-bypasses-facade).
+    try:
+        from kg_engine import envconfig
+    except Exception:
+        return 0  # no plugin root / scripts on path — the fail-silent contract
+    project = envconfig.resolve_project(payload.get("cwd"))
     if not project:
         return 0
-    data = _clean(os.environ.get("KG_DATA")) or _clean(os.environ.get("CLAUDE_PLUGIN_DATA")) \
-        or str(pathlib.Path(project) / ".kg-data")
+    data = envconfig.resolve_data_dir(project, plugin_data_fallback=True)
     # Check the index exists BEFORE constructing the engine — this hook runs on every Grep/Glob/Read;
-    # don't build context (or touch the derived tree) when nothing has been projected yet.
-    if not (pathlib.Path(data) / "derived" / "index.sqlite").exists():
+    # don't build context (or touch the derived tree) when nothing has been projected yet. The names
+    # come from the same envconfig leaf the projector consumes, so they can't drift (review-r5).
+    if not (data / envconfig.DERIVED_DIRNAME / envconfig.INDEX_DB_NAME).exists():
         return 0
-    # Resolve source / pack / metrics_mode with the SAME precedence + project-relative defaults the
-    # server uses (build_engine_from_env), so the hook's projection wires the IDENTICAL IDF corpus,
-    # specificity seeds, and metrics_mode — never a degraded empty-corpus derived layer the server would
-    # then serve as fresh (finding: precontext-bypasses-facade). KG_* live only in the MCP server's
-    # .mcp.json env; in the hook env these resolve via CLAUDE_PLUGIN_OPTION_* + the documented defaults.
-    source = _clean(os.environ.get("CLAUDE_PLUGIN_OPTION_SOURCE_PATH")) or _clean(os.environ.get("KG_SOURCE_PATH"))
-    if not source:
-        guess = pathlib.Path(project) / "examples" / "source.md"
-        source = str(guess) if guess.exists() else None
-    # Resolve the pack the SAME way the server's KG_PACK_PATH does — prefer the PLUGIN-ROOT bundled
-    # pack before the project-relative fallback. On an installed plugin the project dir is not the
-    # plugin root and has no pack/pack.yaml, so a project-only lookup would resolve to None and wire
-    # EMPTY specificity_seeds; the hook would then persist a seed-less projection the server serves as
-    # fresh, defeating the read_only_projector parity this whole block exists to guarantee. `root` is
-    # CLAUDE_PLUGIN_ROOT, already parsed at module load (the same value .mcp.json feeds KG_PACK_PATH).
-    pack_path = _clean(os.environ.get("KG_PACK_PATH"))
-    if not pack_path:
-        for base in (root, project):
-            if base:
-                guess = pathlib.Path(base) / "pack" / "pack.yaml"
-                if guess.exists():
-                    pack_path = str(guess)
-                    break
-    metrics_mode = (os.environ.get("CLAUDE_PLUGIN_OPTION_METRICS_MODE") or "").strip() or "structure_only"
+    source = envconfig.resolve_source(project)
+    pack_path = envconfig.resolve_pack_path(project, plugin_root=root or None)
+    metrics_mode = envconfig.plugin_option("METRICS_MODE", "structure_only")
     try:
         from kg_engine.server import KGEngine
         # read_only_projector wires source/pack/metrics through the SAME seam as the server AND keeps a
         # no-side-effect Canon(ensure_layout=False): a pure read path that never mkdir's the canon dir or
         # rewrites .git/info/exclude on a plain Grep/Glob/Read (the writer-side server maintains those).
         # The derived dir exists (index.sqlite checked above), so the projector's own mkdir is a no-op.
+        # lease_ttl=_HOOK_LEASE_TTL is the SIGKILL bound (see the constant's rationale above) — set
+        # through the constructor seam rather than a reach-through mutation of proj.canon.lock.ttl.
         proj = KGEngine.read_only_projector(project, data, source_path=source, pack_path=pack_path,
-                                            metrics_mode=metrics_mode)
+                                            metrics_mode=metrics_mode, lease_ttl=_HOOK_LEASE_TTL)
         if not proj.db_path.exists():
             return 0  # nothing projected yet
-        # Bound the damage of the hook being SIGKILLed mid-projection (precontext.mjs caps us at 5s):
-        # a killed hook leaves its canon lease behind, and on Windows a dead pid can't be probed, so
-        # the lease is only stale after its TTL — the default 120s exceeds the writers' 30s acquire
-        # budget and every write in that window errors "locked by another live session". A short TTL
-        # keeps a killed hook's lease reclaimable well inside the writer budget; while the hook is
-        # ALIVE the projection's own heartbeats keep the lease fresh, so a legitimate slow projection
-        # is never stolen mid-write (review-r4: hook-kill-wedges-windows-writers).
-        proj.canon.lock.ttl = 15.0
         # Mirror the server's lazy-reproject gate (server._ensure_projected): a raw kg_context read off a
         # stale projection would inject obsolete provenance / epistemic labels. The index already exists
         # (guarded above), so this is a cheap incremental reproject, never a side-effecting cold build.
@@ -101,24 +97,23 @@ def main() -> int:
         # the gate, serve the existing (stale) index instead — the same one-projection-lag the server
         # already tolerates elsewhere (R3/Q3); the server's own next read reprojects for real
         # (review-r4: hook-reprojects-doomed-on-large-canons).
-        _MAX_HOOK_REPROJECT_NOTES = 400  # ~the scale where pure-Python betweenness nears the 5s cap
         if len(proj.canon.note_paths()) <= _MAX_HOOK_REPROJECT_NOTES and proj.is_stale():
             proj.project()
         ti = payload.get("tool_input", {})
         query = ti.get("pattern") or ti.get("query") \
             or (pathlib.Path(ti.get("file_path", "")).stem or None)
-        ctx = proj.kg_context(query, budget=800)
+        ctx = proj.kg_context(query, budget=_CONTEXT_BUDGET)
         if not ctx["items"] and not ctx["advisory"]["nodes"]:
             return 0
         lines = ["Burgess (query the graph first; provenance + falsification attached):"]
-        for it in ctx["items"][:6]:
+        for it in ctx["items"][:_MAX_ITEMS]:
             lines.append(f"- {it['source']} --{it['relation']}--> {it['target']} "
                          f"[{it['provenance']}/{it['epistemic_state']}]")
         fc = ctx["falsification_counters"]["failed_or_rejected_edges"]
         if fc:
             lines.append(f"- {fc} falsified/rejected edge(s) on record (memory of failures)")
         if ctx["advisory"]["nodes"]:
-            br = ", ".join(n["label"] for n in ctx["advisory"]["nodes"][:3])
+            br = ", ".join(n["label"] for n in ctx["advisory"]["nodes"][:_MAX_BRIDGES])
             lines.append(f"- structural-bridge advisory (heuristic, NOT a guarantee): {br}")
         emit("\n".join(lines))
     except Exception:

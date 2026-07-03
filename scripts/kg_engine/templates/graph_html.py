@@ -83,8 +83,12 @@ window.__KG_DATA__ = __KG_DATA_JSON__;
     edge: { grounded: "#2e7d32", unverified: "#9e9e9e", failed: "#c62828", hypothesized: "#1565c0" },
     border: { "deterministic": "#111", "agent": "#777", "human": "#7b1fa2" },
     fill: { "span-present": 1.0, "inferred": 0.55, "hypothesized": 0.25 },
-    fillColor: "#00897b"
+    fillColor: "#00897b",
+    bridge: "#f9a825"  // the gate-aware bridge ring — the one channel that used to bypass PALETTE
   };
+  // injected by export.build_html from model.FAILURE_STATE_VALUES — the negative-memory vocabulary
+  // has ONE home (review-r5); this template never re-types the state names by hand.
+  var FAILURE_STATES = __KG_FAILURE_STATES_JSON__;
 
   document.getElementById("counts").textContent =
     DATA.nodes.length + " nodes · " + (DATA.links || []).length + " edges";
@@ -152,7 +156,7 @@ window.__KG_DATA__ = __KG_DATA_JSON__;
   var UNVERIFIED = { color: PALETTE.edge.unverified, width: 1.2, dash: [6, 4] };
   function edgeStyle(l) {
     var state = l.epistemic_state, prov = l.provenance;
-    if (state === "failed" || state === "rejected") return { color: PALETTE.edge.failed, width: 2.2, dash: [] };
+    if (FAILURE_STATES.indexOf(state) !== -1) return { color: PALETTE.edge.failed, width: 2.2, dash: [] };
     if (state === "grounded") return { color: PALETTE.edge.grounded, width: 1.6, dash: [] };
     if (prov === "hypothesized") return { color: PALETTE.edge.hypothesized, width: 1.2, dash: [2, 4] };
     return UNVERIFIED;
@@ -191,7 +195,7 @@ window.__KG_DATA__ = __KG_DATA_JSON__;
       var r = radius(n);
       if (n.bridge) {  // gate-aware bridge highlight (gold ring) — size stays degree-only
         ctx.beginPath(); ctx.arc(n.x, n.y, r + BRIDGE_RING_GAP, 0, TAU);
-        ctx.strokeStyle = "#f9a825"; ctx.lineWidth = BRIDGE_RING_WIDTH; ctx.stroke();
+        ctx.strokeStyle = PALETTE.bridge; ctx.lineWidth = BRIDGE_RING_WIDTH; ctx.stroke();
       }
       ctx.beginPath(); ctx.arc(n.x, n.y, r, 0, TAU);
       ctx.globalAlpha = PALETTE.fill[n.provenance] !== undefined ? PALETTE.fill[n.provenance] : 0.55;

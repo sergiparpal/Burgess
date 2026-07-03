@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from kg_engine.divergence import embed
+from kg_engine.divergence.config import ConfigError
 from kg_engine.divergence.embed import (
     DEFAULT_DEDUP_TAU,
     HashingEmbedder,
@@ -97,12 +98,15 @@ def test_l2_normalize_handles_zero_row():
 
 def test_provider_switch_loads_without_import_errors():
     reset_cache()
-    # All providers construct cheaply; static/local defer the model download to
+    # All wired providers construct cheaply; static/local defer the model download to
     # first use, so constructing them here must not import model2vec/torch.
     assert get_embedder("static").name == "static"
     assert get_embedder("hash").name == "hash"
-    assert get_embedder("api").name == "api"
     assert get_embedder("local").name == "local"
+    # 'api' is named-but-unwired (the hollow APIEmbedder stub was removed in review-r5):
+    # selecting it fails loudly at selection time with actionable guidance.
+    with pytest.raises(ConfigError, match="no wired backend"):
+        get_embedder("api")
     reset_cache()
 
 

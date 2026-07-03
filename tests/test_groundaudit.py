@@ -102,8 +102,8 @@ def test_append_fsyncs_the_parent_directory(tmp_path, monkeypatch):
     """[6]: append() must fsync the parent directory (not only the file fd) so the FIRST append's
     directory entry — the log-file creation — is durable across a crash, mirroring atomicio."""
     seen = []
-    real_fsync_dir = groundaudit._fsync_dir
-    monkeypatch.setattr(groundaudit, "_fsync_dir",
+    real_fsync_dir = groundaudit.fsync_dir  # the public name since review-r5 (was _fsync_dir)
+    monkeypatch.setattr(groundaudit, "fsync_dir",
                         lambda d: (seen.append(d), real_fsync_dir(d)))
     log = GroundAuditLog(tmp_path / GROUND_AUDIT)
     log.append("e_x__grounds__y", "unverified", "grounded", "agent")

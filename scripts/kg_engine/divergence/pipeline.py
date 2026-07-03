@@ -11,7 +11,7 @@ DPP diverse slate → anti-collapse monitor. The judge is never called here.
 from __future__ import annotations
 
 import uuid
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
@@ -36,31 +36,37 @@ from .session import Session
 
 # Default tuning knobs. These are the **fallback defaults** for direct/library
 # callers and the self-test's placement helper; the real ``ingest`` path resolves
-# every knob from :class:`config.EngineConfig` (per-domain overridable). The values
-# here MUST mirror ``EngineConfig``'s defaults — ``test_engine_config`` guards that.
+# every knob from :class:`config.EngineConfig` (per-domain overridable). DERIVED
+# from a default ``EngineConfig`` — the config dataclass is the single home for
+# every value (review-r5: these used to be hand-mirrored literals whose only sync
+# mechanism was a guard test).
 #
 # The near-duplicate cosine threshold is per-embedder (see ``embed.default_dedup_tau``).
-KNN_K = 5
+_DEFAULTS = config.EngineConfig()
+KNN_K = _DEFAULTS.knn_k
 # Open-axis (mechanism) niching. The partition is data-adaptive: cold-start fixed
 # centroids until ``OPEN_NICHE_FREEZE_FACTOR * OPEN_NICHES`` mechanism embeddings
 # have accumulated, then a one-time k-means fit freezes the cells (see
 # ``_accumulate_and_maybe_freeze``).
-OPEN_NICHES = 24
-# freeze after freeze_factor * open_niches survivor mechanisms accumulate. At 2 this
+OPEN_NICHES = _DEFAULTS.open_niches
+# freeze after freeze_factor * open_niches survivor mechanisms accumulate. At the default 2 this
 # is 48 (~4-5 generations of 12) so the data-adaptive partition actually activates in
 # a realistic session, while keeping >=2 samples/centroid for a meaningful k-means
 # fit. Most short sessions still never reach it and run on the (validated) cold-start
 # partition; `ingest`/`metrics` expose accumulation progress so this is observable.
-OPEN_NICHE_FREEZE_FACTOR = 2
-MAX_DPP_POOL = 200
+OPEN_NICHE_FREEZE_FACTOR = _DEFAULTS.open_niche_freeze_factor
+MAX_DPP_POOL = _DEFAULTS.max_dpp_pool
 # Cap on the dedup/novelty reference set (the most-novel elites). Dedup and k-NN
 # novelty run against the archive elites every cycle (O(n·m)); without a cap this
 # grows unbounded. Below the cap behavior is identical to using every elite.
-NOVELTY_REF_CAP = 500
+NOVELTY_REF_CAP = _DEFAULTS.novelty_ref_cap
 # How much the judge's (bounded) fitness is allowed to weight the DPP slate.
 # 0 -> pure diversity; 1 -> full quality-diversity. Kept low so geometry owns
 # the slate and the judge can only nudge ordering within an already-diverse pool.
-QUALITY_WEIGHT = 0.3
+QUALITY_WEIGHT = _DEFAULTS.quality_weight
+# Bound on the persisted advisory gap series (entries in meta["gap_log"]); not an EngineConfig knob —
+# it caps storage, not behavior.
+GAP_LOG_CAP = 50
 
 
 # --------------------------------------------------------------------------- #
@@ -116,8 +122,9 @@ def init_project(
         if reset:
             # The monitor/erosion/gap series and the cycle counter are tied to the
             # old geometry; drop them so calibration restarts under the new axes.
-            for key in ("cycles", "cos_window", "novelty_window",
-                        "erosion_streak", "gap_log"):
+            # The key set is state.GEOMETRY_META_KEYS — the SAME list begin_session
+            # wipes, so axes re-init and session change can never drift (review-r5).
+            for key in state.GEOMETRY_META_KEYS:
                 meta.pop(key, None)
         meta.update(
             {
@@ -259,7 +266,7 @@ def assign_open_cells(
     texts: List[str],
     embedder,
     seed: int,
-    nicher: Optional["archive_mod.CVTNicher"] = None,
+    nicher: Optional["archive_mod.FrozenVoronoiNicher"] = None,
     open_niches: int = OPEN_NICHES,
 ) -> Tuple[Optional[Any], List[Optional[int]], np.ndarray]:
     """Voronoi cell per item for the primary "open" axis.
@@ -278,18 +285,18 @@ def assign_open_cells(
     open_texts = _open_axis_texts(open_axis, descriptors, texts)
     open_vecs = embedder.embed(open_texts)
     if nicher is None:
-        nicher = archive_mod.CVTNicher(dim=open_vecs.shape[1], k=open_niches, seed=seed)
+        nicher = archive_mod.FrozenVoronoiNicher(dim=open_vecs.shape[1], k=open_niches, seed=seed)
     return open_axis, nicher.cells(open_vecs), open_vecs
 
 
 def _frozen_open_nicher(
     on_state: Optional[Dict[str, Any]], open_axis: Optional[Any]
-) -> Optional["archive_mod.CVTNicher"]:
+) -> Optional["archive_mod.FrozenVoronoiNicher"]:
     """The persisted frozen nicher, or ``None`` (cold start / no open axis)."""
     if open_axis is None or not on_state:
         return None
     if on_state.get("frozen") and on_state.get("centroids"):
-        return archive_mod.CVTNicher.from_dict(on_state)
+        return archive_mod.FrozenVoronoiNicher.from_dict(on_state)
     return None
 
 
@@ -298,7 +305,7 @@ def _elite_open_cells(
     cand_store: Dict[str, Any],
     open_axis: Any,
     embedder,
-    nicher: "archive_mod.CVTNicher",
+    nicher: "archive_mod.FrozenVoronoiNicher",
 ) -> Dict[str, int]:
     """Frozen-cell index for each niche, from its elite's open-axis embedding."""
     nids: List[str] = []
@@ -317,18 +324,27 @@ def _elite_open_cells(
     return {nid: cell for nid, cell in zip(nids, cells)}
 
 
+@dataclass
+class _Cycle:
+    """One ingest cycle's shared context (review-r5: the cycle helpers threaded these same values
+    as 11-12 positional parameters each — the S4 mechanism store alone had to be spliced into
+    three signatures). Every field is the LIVE object the cycle mutates and finally persists."""
+    state: "State"
+    spec: AxesSpec
+    econfig: "config.EngineConfig"
+    embedder: Any
+    seed: int
+    arc: "archive_mod.Archive"
+    cand_store: Dict[str, Any]
+    stored_emb: Dict[str, List[float]]
+    stored_mech_emb: Dict[str, List[float]]
+
+
 def _accumulate_and_maybe_freeze(
-    state: State,
+    cyc: "_Cycle",
     on_state: Optional[Dict[str, Any]],
     open_axis: Optional[Any],
     open_vecs: np.ndarray,
-    arc: "archive_mod.Archive",
-    cand_store: Dict[str, Any],
-    spec: AxesSpec,
-    embedder,
-    seed: int,
-    open_niches: int = OPEN_NICHES,
-    freeze_factor: int = OPEN_NICHE_FREEZE_FACTOR,
 ) -> None:
     """Grow the mechanism-embedding buffer; freeze the partition once it's full.
 
@@ -348,30 +364,30 @@ def _accumulate_and_maybe_freeze(
     if open_vecs.shape[0]:
         accum.extend([[float(x) for x in v] for v in open_vecs])
 
-    threshold = freeze_factor * open_niches
+    threshold = cyc.econfig.open_niche_freeze_factor * cyc.econfig.open_niches
     if len(accum) < threshold:
-        state.write_open_nicher({"frozen": False, "accum": accum})
+        cyc.state.write_open_nicher({"frozen": False, "accum": accum})
         return
 
     # Threshold reached: fit once, freeze, and re-bucket the archive.
-    nicher = archive_mod.CVTNicher.fit(
-        np.asarray(accum, dtype=np.float32), k=open_niches, seed=seed
+    nicher = archive_mod.FrozenVoronoiNicher.fit(
+        np.asarray(accum, dtype=np.float32), k=cyc.econfig.open_niches, seed=cyc.seed
     )
-    cell_by_nid = _elite_open_cells(arc, cand_store, open_axis, embedder, nicher)
-    arc.rekey_open_axis(spec, open_axis.name, cell_by_nid)
+    cell_by_nid = _elite_open_cells(cyc.arc, cyc.cand_store, open_axis, cyc.embedder, nicher)
+    cyc.arc.rekey_open_axis(cyc.spec, open_axis.name, cell_by_nid)
     # keep cand_store display fields consistent with the re-keyed archive: slate
     # items are built from these elite records (`_slate_item`), so an elite placed
     # before the freeze would otherwise display a stale niche_id/coords. Elites are
     # the only candidates ever shown, so non-elite history is left untouched.
-    for niche in arc.niches.values():
-        rec = cand_store.get(niche.elite_id)
+    for niche in cyc.arc.niches.values():
+        rec = cyc.cand_store.get(niche.elite_id)
         if rec is not None:
             rec["niche_id"] = niche.id
             rec["coords"] = dict(niche.coords)
 
     frozen = nicher.to_dict()
     frozen["frozen"] = True
-    state.write_open_nicher(frozen)
+    cyc.state.write_open_nicher(frozen)
 
 
 def _open_axis_status(
@@ -445,6 +461,121 @@ def _maybe_prune_state(
     return len(drop)
 
 
+def _apply_advisory_sensors(mon: Dict[str, Any], meta_now: Dict[str, Any],
+                            econfig: "config.EngineConfig", *, submitted: int,
+                            surv_mean_novelty) -> Dict[str, Any]:
+    """Attach the two ADVISORY sensors to a cycle's monitor result (review-r5: each sensor had
+    landed as another inline block in _ingest_locked, which grew monotonically). Both only report —
+    they never set `collapsing` and never touch the calibration window.
+
+    Prefilter guard (soft): the monitor runs on the SUBMITTED generation, so samey ideas are caught
+    by `too_similar`; the blind spot is the agent's own prefilter dropping candidates as
+    "off-brief" and cutting variety under cover of validity. We can't see what was dropped, but we
+    can see how many reached ingest — well below the per-generation target flags possible
+    over-prefiltering. Sensed at the submitted-vs-target boundary, NOT post-dedup survivors (dedup
+    is the engine's job, not the agent's).
+
+    S2 variety-erosion: feeds the post-dedup survivor mean novelty through the
+    acceleration-of-decay assessor; keeps its OWN series (`novelty_window`) and streak counter.
+    Returns the assessor's dict (the caller persists its window/streak)."""
+    target = int(meta_now.get("candidates_per_generation", 0) or 0)
+    mon["submitted"] = submitted
+    mon["target_candidates"] = target
+    if target > 0 and submitted < econfig.under_generation_ratio * target:
+        mon["under_generation"] = True
+        mon["under_generation_note"] = (
+            f"only {submitted} candidates reached ingest vs target {target} "
+            f"(< {econfig.under_generation_ratio:.0%}); possible over-prefiltering "
+            f"— generate more / prefilter less next round"
+        )
+    else:
+        mon["under_generation"] = False
+
+    erosion = monitor.assess_variety_erosion(
+        meta_now.get("novelty_window", []),
+        int(meta_now.get("erosion_streak", 0)),
+        surv_mean_novelty,
+        submitted_healthy=not mon["under_generation"],
+        window=econfig.erosion_window,
+        accel_ratio=econfig.erosion_accel_ratio,
+        persist=econfig.erosion_persist,
+    )
+    mon["variety_eroding"] = erosion["variety_eroding"]
+    mon["variety_erosion"] = {  # advisory detail; never gates anything
+        "streak": erosion["erosion_streak"],
+        "slope_earlier": erosion["slope_earlier"],
+        "slope_recent": erosion["slope_recent"],
+        "note": "advisory; acceleration of survivor-novelty decay with healthy submits; "
+                "never affects collapsing or the calibration window",
+    }
+    return erosion
+
+
+def _compute_keep_ids(arc: "archive_mod.Archive", state: "State", domain: str,
+                      comparisons: List[Dict[str, Any]]) -> Set[str]:
+    """State hygiene's keep set: archive elites + pins + comparison ids — exactly what
+    dedup/novelty/slate, parents, and recall consume, so pruning to it changes no output.
+    Discards need no entry: their id list lives in discards.json (never pruned), a discarded id
+    that is still an elite is already kept via elite_ids(), and a non-elite discarded id needs
+    only its string, not its candidate record."""
+    keep_ids = set(arc.elite_ids())
+    keep_ids.update(state.read_pins(domain))
+    for ev in comparisons:
+        if ev.get("type") == "comparison":
+            keep_ids.update(i for i in (ev.get("winner"), ev.get("loser")) if i)
+    return keep_ids
+
+
+def _run_gap_probe(cyc: "_Cycle", slate_ids: List[str], open_axis, dim: int):
+    """Advisory surface/mechanism gap (measurement only; off by default). Never touches selection,
+    the monitor, the calibration window, or any gate — it only reads embeddings the cycle already
+    produced. See gap.py / CLAUDE.md. Returns the gap record, or None when the probe is off."""
+    if not cyc.econfig.gap_probe:
+        return None
+    try:
+        slate_cands = [cyc.cand_store[i] for i in slate_ids if i in cyc.cand_store]
+        slate_surf = _stack_embeddings(
+            [c["id"] for c in slate_cands if c["id"] in cyc.stored_emb],
+            cyc.stored_emb, dim,
+        )
+        if open_axis is not None and len(slate_cands) >= 2:
+            descs = [c.get("descriptor", {}) for c in slate_cands]
+            texts = [c.get("text", "") for c in slate_cands]
+            mech_vecs = cyc.embedder.embed(_open_axis_texts(open_axis, descs, texts))
+            return gap.surface_mechanism_gap(slate_surf, mech_vecs)
+        return {"n": len(slate_cands), "surface_spread": 0.0,
+                "mechanism_spread": 0.0, "gap": 0.0, "corr": None,
+                "skipped": "no open axis or slate < 2"}
+    except Exception as exc:  # never let an advisory probe break a cycle
+        return {"skipped": f"gap probe failed ({exc})"}
+
+
+def _evaluate_monitor(vecs: np.ndarray, niche_counts: List[int], baseline: List[float],
+                      econfig: "config.EngineConfig") -> Dict[str, Any]:
+    """The ONE place econfig's monitor knobs map onto ``monitor.evaluate`` (review-r5: the
+    five-kwarg threading was duplicated between the empty-cycle and real-cycle paths, so a new
+    monitor knob could silently evaluate under defaults on one of them)."""
+    return monitor.evaluate(
+        vecs, niche_counts, baseline=baseline,
+        cos_threshold=econfig.monitor_cos_threshold,
+        entropy_threshold=econfig.monitor_entropy_threshold,
+        margin=econfig.monitor_margin,
+        cos_ceiling=econfig.monitor_cos_ceiling,
+        min_baseline=econfig.monitor_min_baseline,
+    )
+
+
+def _ask_policy(econfig: "config.EngineConfig", gen_index: int) -> Dict[str, Any]:
+    """The ask-policy block both cycle paths report — generation, phase (from the single-homed
+    ``EngineConfig.phase_for_generation``), and the effective similarity weight (review-r5: the
+    dict shape and the explore predicate were each written twice)."""
+    return {
+        "generation": gen_index,
+        "phase": econfig.phase_for_generation(gen_index),
+        "ask_sim_weight_effective": econfig.ask_sim_weight_for_generation(gen_index),
+    }
+
+
 def _empty_cycle(
     state: "State",
     arc: "archive_mod.Archive",
@@ -460,15 +591,8 @@ def _empty_cycle(
     """
     meta = state.read_meta()
     gen_index = int(meta.get("cycles", 0))
-    mon = monitor.evaluate(
-        np.zeros((0, 1)), arc.niche_counts(),
-        baseline=list(meta.get("cos_window", [])),
-        cos_threshold=econfig.monitor_cos_threshold,
-        entropy_threshold=econfig.monitor_entropy_threshold,
-        margin=econfig.monitor_margin,
-        cos_ceiling=econfig.monitor_cos_ceiling,
-        min_baseline=econfig.monitor_min_baseline,
-    )
+    mon = _evaluate_monitor(np.zeros((0, 1)), arc.niche_counts(),
+                            list(meta.get("cos_window", [])), econfig)
     mon["submitted"] = 0
     mon["target_candidates"] = int(meta.get("candidates_per_generation", 0) or 0)
     mon["under_generation"] = False
@@ -479,18 +603,10 @@ def _empty_cycle(
     mon["variety_eroding"] = (
         int(meta.get("erosion_streak", 0)) >= econfig.erosion_persist
     )
-    in_explore = (
-        econfig.explore_until_generation > 0
-        and gen_index < econfig.explore_until_generation
-    )
     return {
         "slate": [],
         "ask_pairs": [],
-        "ask_policy": {
-            "generation": gen_index,
-            "phase": "explore" if in_explore else "refine",
-            "ask_sim_weight_effective": econfig.ask_sim_weight_for_generation(gen_index),
-        },
+        "ask_policy": _ask_policy(econfig, gen_index),
         "monitor": mon,
         "parents": [],
         "slate_mechanism_novelty": None,
@@ -552,18 +668,14 @@ def _stack_embeddings(
 
 
 def _place_survivors(
+    cyc: "_Cycle",
     survivors: List[Candidate],
     surv_vecs: np.ndarray,
     cells: List[Optional[int]],
     novelties: np.ndarray,
     open_axis: Optional[Any],
-    spec: AxesSpec,
-    arc: "archive_mod.Archive",
-    cand_store: Dict[str, Any],
-    stored_emb: Dict[str, List[float]],
     open_vecs: Optional[np.ndarray] = None,
     mech_novelties: Optional[np.ndarray] = None,
-    stored_mech_emb: Optional[Dict[str, List[float]]] = None,
 ) -> None:
     """Insert each survivor into its niche; record its candidate + embedding.
 
@@ -577,27 +689,21 @@ def _place_survivors(
         ocell = {}
         if open_axis is not None and cells[idx] is not None:
             ocell = {open_axis.name: cells[idx]}
-        nid, coords = archive_mod.compute_niche(c.descriptor, spec, ocell)
+        nid, coords = archive_mod.compute_niche(c.descriptor, cyc.spec, ocell)
         nov = float(novelties[idx])
-        arc.place(c.id, nid, coords, fitness=c.fitness, novelty=nov)
+        cyc.arc.place(c.id, nid, coords, fitness=c.fitness, novelty=nov)
         record = {**c.to_dict(), "niche_id": nid, "coords": coords, "novelty": nov}
         if mech_novelties is not None:
             record["mechanism_novelty"] = round(float(mech_novelties[idx]), 4)
-        cand_store[c.id] = record
-        stored_emb[c.id] = [float(x) for x in surv_vecs[idx]]
-        if (stored_mech_emb is not None and open_vecs is not None
-                and open_axis is not None and idx < open_vecs.shape[0]):
-            stored_mech_emb[c.id] = [float(x) for x in open_vecs[idx]]
+        cyc.cand_store[c.id] = record
+        cyc.stored_emb[c.id] = [float(x) for x in surv_vecs[idx]]
+        if (open_vecs is not None and open_axis is not None
+                and idx < open_vecs.shape[0]):
+            cyc.stored_mech_emb[c.id] = [float(x) for x in open_vecs[idx]]
 
 
 def _select_slate(
-    arc: "archive_mod.Archive",
-    stored_emb: Dict[str, List[float]],
-    cand_store: Dict[str, Any],
-    spec: AxesSpec,
-    seed: int,
-    max_dpp_pool: int = MAX_DPP_POOL,
-    quality_weight: float = QUALITY_WEIGHT,
+    cyc: "_Cycle",
     discards: Optional[Set[str]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     """DPP diverse slate over the current niche elites. Returns ``(slate, ids)``.
@@ -610,55 +716,50 @@ def _select_slate(
     discarded = discards or set()
     elites: List[Tuple[str, float, str]] = [
         (niche.elite_id, niche.fitness, nid)
-        for nid, niche in arc.niches.items()
-        if niche.elite_id and niche.elite_id in stored_emb
+        for nid, niche in cyc.arc.niches.items()
+        if niche.elite_id and niche.elite_id in cyc.stored_emb
         and niche.elite_id not in discarded
     ]
     # cap the pool by novelty for latency
-    if len(elites) > max_dpp_pool:
+    if len(elites) > cyc.econfig.max_dpp_pool:
         elites.sort(
-            key=lambda e: cand_store.get(e[0], {}).get("novelty", 0.0), reverse=True
+            key=lambda e: cyc.cand_store.get(e[0], {}).get("novelty", 0.0), reverse=True
         )
-        elites = elites[:max_dpp_pool]
+        elites = elites[:cyc.econfig.max_dpp_pool]
     if not elites:
         return [], []
 
     elite_ids = [e[0] for e in elites]
-    elite_vecs = np.asarray([stored_emb[i] for i in elite_ids], dtype=np.float32)
+    elite_vecs = np.asarray([cyc.stored_emb[i] for i in elite_ids], dtype=np.float32)
     quality = np.asarray([e[1] for e in elites], dtype=np.float64)
     sel = diversity.select_diverse(
-        elite_vecs, k=spec.slate_size, quality=quality, seed=seed,
-        quality_weight=quality_weight,
+        elite_vecs, k=cyc.spec.slate_size, quality=quality, seed=cyc.seed,
+        quality_weight=cyc.econfig.quality_weight,
     )
     slate_ids = [elite_ids[i] for i in sel]
-    slate = [_slate_item(cand_store[i]) for i in slate_ids]
+    slate = [_slate_item(cyc.cand_store[i]) for i in slate_ids]
     return slate, slate_ids
 
 
 def _persist_cycle(
-    state: State,
-    arc: "archive_mod.Archive",
-    stored_emb: Dict[str, List[float]],
-    cand_store: Dict[str, Any],
+    cyc: "_Cycle",
     vecs: np.ndarray,
-    embedder,
     mon: Dict[str, Any],
-    econfig: "config.EngineConfig",
     novelty_window: List[float],
     erosion_streak: int,
     gap_record=None,
-    stored_mech_emb: Optional[Dict[str, List[float]]] = None,
 ) -> None:
     """Write archive/embeddings/candidates, bump cycle metadata, roll the window."""
-    state.write_archive(arc.to_dict())
-    state.write_embeddings(stored_emb)
+    state, econfig = cyc.state, cyc.econfig
+    state.write_archive(cyc.arc.to_dict())
+    state.write_embeddings(cyc.stored_emb)
     # Advisory parallel store (S4). Always written — even an empty {} — so the
     # paths()-listed file is present on disk after any cycle (measurement only).
-    state.write_mech_embeddings(stored_mech_emb or {})
-    state.write_candidates(cand_store)
+    state.write_mech_embeddings(cyc.stored_mech_emb or {})
+    state.write_candidates(cyc.cand_store)
     meta = state.read_meta()
     meta["cycles"] = int(meta.get("cycles", 0)) + 1
-    meta["embedder"] = embedder.name
+    meta["embedder"] = cyc.embedder.name
     meta["embedding_dim"] = int(vecs.shape[1])
     meta["engine"] = econfig.to_dict()  # keep the resolved knobs visible/auditable
     # Roll the monitor's calibration window with this generation's mean cosine.
@@ -687,7 +788,7 @@ def _persist_cycle(
             "cycle": int(meta["cycles"]),
             **{k: gap_record[k] for k in ("surface_spread", "mechanism_spread", "gap", "corr", "n")},
         })
-        meta["gap_log"] = gap_log[-50:]  # bounded
+        meta["gap_log"] = gap_log[-GAP_LOG_CAP:]  # bounded
     state.write_meta(meta)
 
 
@@ -773,11 +874,13 @@ def _ingest_locked(
     if not cand_list:
         return _empty_cycle(state, arc, spec, econfig)
 
-    stored_emb: Dict[str, List[float]] = state.read_embeddings()
-    stored_mech_emb: Dict[str, List[float]] = state.read_mech_embeddings()
-    cand_store: Dict[str, Any] = state.read_candidates()
+    cyc = _Cycle(state=state, spec=spec, econfig=econfig, embedder=sess.embedder, seed=seed,
+                 arc=arc, cand_store=state.read_candidates(),
+                 stored_emb=state.read_embeddings(),
+                 stored_mech_emb=state.read_mech_embeddings())
+    stored_emb, stored_mech_emb, cand_store = cyc.stored_emb, cyc.stored_mech_emb, cyc.cand_store
 
-    embedder = sess.embedder
+    embedder = cyc.embedder
     vecs = embedder.embed([c.text for c in cand_list])
     _guard_embedding_dim(stored_emb, vecs, embedder, project)
 
@@ -814,29 +917,16 @@ def _ingest_locked(
         open_vecs, open_axis, existing_ids, stored_mech_emb,
         econfig.knn_k, len(survivors),
     )
-    _place_survivors(
-        survivors, surv_vecs, cells, novelties, open_axis,
-        spec, arc, cand_store, stored_emb,
-        open_vecs=open_vecs, mech_novelties=mech_novelties,
-        stored_mech_emb=stored_mech_emb,
-    )
+    _place_survivors(cyc, survivors, surv_vecs, cells, novelties, open_axis,
+                     open_vecs=open_vecs, mech_novelties=mech_novelties)
 
     # Accumulate the mechanism embeddings; once enough exist, fit + freeze the
     # partition once and re-key the archive onto the frozen cells.
-    _accumulate_and_maybe_freeze(
-        state, on_state, open_axis, open_vecs, arc, cand_store, spec,
-        embedder, seed, open_niches=econfig.open_niches,
-        freeze_factor=econfig.open_niche_freeze_factor,
-    )
+    _accumulate_and_maybe_freeze(cyc, on_state, open_axis, open_vecs)
 
     # User vetoes (discards) are namespaced by the session domain, like pins. Drop
     # them from the presented slate so a discarded idea stops re-appearing.
-    discards = set(sess.state.read_discards(sess.domain))
-    slate, slate_ids = _select_slate(
-        arc, stored_emb, cand_store, spec, seed,
-        max_dpp_pool=econfig.max_dpp_pool, quality_weight=econfig.quality_weight,
-        discards=discards,
-    )
+    slate, slate_ids = _select_slate(cyc, discards=set(state.read_discards(sess.domain)))
 
     # Read meta once: nothing rewrites it until _persist_cycle at the end, so the
     # rolling baseline and the per-generation target both come from one snapshot.
@@ -847,60 +937,11 @@ def _ingest_locked(
     # The baseline is the rolling window of prior generations' mean cosine, so the
     # similarity flag is calibrated to this project rather than a fixed constant.
     baseline = list(meta_now.get("cos_window", []))
-    mon = monitor.evaluate(
-        vecs, arc.niche_counts(), baseline=baseline,
-        cos_threshold=econfig.monitor_cos_threshold,
-        entropy_threshold=econfig.monitor_entropy_threshold,
-        margin=econfig.monitor_margin,
-        cos_ceiling=econfig.monitor_cos_ceiling,
-        min_baseline=econfig.monitor_min_baseline,
-    )
+    mon = _evaluate_monitor(vecs, arc.niche_counts(), baseline, econfig)
 
-    # Prefilter guard (soft). The monitor above runs on the SUBMITTED generation,
-    # so an agent that generates samey ideas is caught by `too_similar`. The blind
-    # spot is the *prefilter* stage the engine never sees: the agent dropping
-    # candidates as "off-brief" and cutting variety under cover of validity. We
-    # can't see what was dropped, but we can see how many reached ingest — if that
-    # is well below the per-generation target, flag it so the skill generates more
-    # / prefilters less next round. Sensor is at the submitted-vs-target boundary,
-    # NOT post-dedup survivors (dedup is the engine's own job, not the agent's).
-    # This NEVER affects `collapsing` or the calibration window — purely advisory.
-    target = int(meta_now.get("candidates_per_generation", 0) or 0)
-    submitted = len(cand_list)
-    mon["submitted"] = submitted
-    mon["target_candidates"] = target
-    if target > 0 and submitted < econfig.under_generation_ratio * target:
-        mon["under_generation"] = True
-        mon["under_generation_note"] = (
-            f"only {submitted} candidates reached ingest vs target {target} "
-            f"(< {econfig.under_generation_ratio:.0%}); possible over-prefiltering "
-            f"— generate more / prefilter less next round"
-        )
-    else:
-        mon["under_generation"] = False
-
-    # S2 — variety-erosion sensor (advisory). Feeds the post-dedup survivor mean
-    # novelty through the acceleration-of-decay assessor and attaches an advisory
-    # flag to `mon`. It NEVER sets or influences `collapsing`, never touches the
-    # monitor's calibration window (`cos_window`), and keeps its OWN series
-    # (`novelty_window`) and streak counter (`erosion_streak`). It only reports.
-    erosion = monitor.assess_variety_erosion(
-        meta_now.get("novelty_window", []),
-        int(meta_now.get("erosion_streak", 0)),
-        surv_mean_novelty,
-        submitted_healthy=not mon["under_generation"],
-        window=econfig.erosion_window,
-        accel_ratio=econfig.erosion_accel_ratio,
-        persist=econfig.erosion_persist,
-    )
-    mon["variety_eroding"] = erosion["variety_eroding"]
-    mon["variety_erosion"] = {  # advisory detail; never gates anything
-        "streak": erosion["erosion_streak"],
-        "slope_earlier": erosion["slope_earlier"],
-        "slope_recent": erosion["slope_recent"],
-        "note": "advisory; acceleration of survivor-novelty decay with healthy submits; "
-                "never affects collapsing or the calibration window",
-    }
+    erosion = _apply_advisory_sensors(mon, meta_now, econfig,
+                                      submitted=len(cand_list),
+                                      surv_mean_novelty=surv_mean_novelty)
 
     # Namespace preference memory by the session domain so ingest is consistent
     # with remember/recall/parents (all share Session's snapshot resolution).
@@ -919,61 +960,17 @@ def _ingest_locked(
             econfig.ask_novelty_weight,
         ),
     )
-    in_explore = (
-        econfig.explore_until_generation > 0
-        and gen_index < econfig.explore_until_generation
-    )
-    ask_policy = {
-        "generation": gen_index,
-        "phase": "explore" if in_explore else "refine",
-        "ask_sim_weight_effective": eff_sim,
-    }
+    ask_policy = _ask_policy(econfig, gen_index)
 
-    # State hygiene (long sessions): drop candidate records/embeddings nothing reads
-    # again. Keep set = archive elites + pins + comparison ids — exactly what
-    # dedup/novelty/slate, parents, and recall consume — so output is unchanged.
-    # Discards need no entry: their id list lives in discards.json (never pruned), a
-    # discarded id that is still an elite is already kept via elite_ids(), and a
-    # non-elite discarded id needs only its string, not its candidate record.
-    keep_ids = set(arc.elite_ids())
-    keep_ids.update(state.read_pins(domain))
-    for ev in comparisons:
-        if ev.get("type") == "comparison":
-            keep_ids.update(i for i in (ev.get("winner"), ev.get("loser")) if i)
     _maybe_prune_state(
-        cand_store, stored_emb, keep_ids, econfig.state_prune_threshold,
-        stored_mech_emb=stored_mech_emb,
+        cand_store, stored_emb, _compute_keep_ids(arc, state, domain, comparisons),
+        econfig.state_prune_threshold, stored_mech_emb=stored_mech_emb,
     )
 
-    # Advisory surface/mechanism gap (measurement only; off by default). Never touches
-    # selection, the monitor, the calibration window, or any gate — it only reads embeddings
-    # the cycle already produced. See gap.py / CLAUDE.md.
-    gap_record = None
-    if econfig.gap_probe:
-        try:
-            # open_axis is already resolved above (== spec.primary_axis).
-            slate_cands = [cand_store[i] for i in slate_ids if i in cand_store]
-            slate_surf = _stack_embeddings(
-                [c["id"] for c in slate_cands if c["id"] in stored_emb],
-                stored_emb, vecs.shape[1],
-            )
-            if open_axis is not None and len(slate_cands) >= 2:
-                descs = [c.get("descriptor", {}) for c in slate_cands]
-                texts = [c.get("text", "") for c in slate_cands]
-                mech_vecs = embedder.embed(_open_axis_texts(open_axis, descs, texts))
-                gap_record = gap.surface_mechanism_gap(slate_surf, mech_vecs)
-            else:
-                gap_record = {"n": len(slate_cands), "surface_spread": 0.0,
-                              "mechanism_spread": 0.0, "gap": 0.0, "corr": None,
-                              "skipped": "no open axis or slate < 2"}
-        except Exception as exc:  # never let an advisory probe break a cycle
-            gap_record = {"skipped": f"gap probe failed ({exc})"}
+    gap_record = _run_gap_probe(cyc, slate_ids, open_axis, vecs.shape[1])
 
-    _persist_cycle(
-        state, arc, stored_emb, cand_store, vecs, embedder, mon, econfig,
-        erosion["novelty_window"], erosion["erosion_streak"], gap_record=gap_record,
-        stored_mech_emb=stored_mech_emb,
-    )
+    _persist_cycle(cyc, vecs, mon, erosion["novelty_window"], erosion["erosion_streak"],
+                   gap_record=gap_record)
     # Advisory slate-level mean mechanism novelty (S4); None when no item carries it.
     _mvals = [s["mechanism_novelty"] for s in slate
               if s.get("mechanism_novelty") is not None]

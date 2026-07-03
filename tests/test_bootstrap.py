@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pytest
 
+from kg_engine import dirlock  # the lock's home since review-r5 (bootstrap wraps it)
+
 _BOOT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "bootstrap.py"
 
 
@@ -495,8 +497,8 @@ def test_dead_pid_lock_is_stolen_before_stale_window(tmp_path):
     # A held, FRESH lock (heartbeat just now) whose recorded holder is a dead pid on THIS host.
     bootstrap._lock_dir(venv_dir).mkdir(parents=True)
     bootstrap.heartbeat(venv_dir)
-    _write_info(venv_dir, pid=_dead_pid(), host=bootstrap._HOST)
-    assert bootstrap._lock_age(venv_dir) < bootstrap.STALE_LOCK_SECS  # NOT stale by age
+    _write_info(venv_dir, pid=_dead_pid(), host=dirlock._HOST)
+    assert dirlock.lock_age(bootstrap._lock_dir(venv_dir)) < bootstrap.STALE_LOCK_SECS  # NOT stale by age
     assert bootstrap.try_acquire(venv_dir) is True  # ...but the dead-pid probe reclaims it
     bootstrap.release(venv_dir)
 
@@ -505,7 +507,7 @@ def test_live_pid_fresh_lock_is_not_stolen(tmp_path):
     # The probe must not over-reclaim: a FRESH lock held by a LIVE pid (our own) stays held.
     venv_dir = tmp_path / "venv"
     assert bootstrap.try_acquire(venv_dir) is True  # records our live pid in info
-    age = bootstrap._lock_age(venv_dir)
+    age = dirlock.lock_age(bootstrap._lock_dir(venv_dir))
     assert age < bootstrap.STALE_LOCK_SECS
     assert bootstrap.try_acquire(venv_dir) is False  # live holder is not stolen
     bootstrap.release(venv_dir)
@@ -541,7 +543,7 @@ def test_steal_restores_lock_that_became_fresh_in_the_window(tmp_path, monkeypat
     old = bootstrap.time.time() - bootstrap.STALE_LOCK_SECS - 60
     os.utime(lock, (old, old))
     os.utime(hb, (old, old))
-    _write_info(venv_dir, pid=_dead_pid(), host=bootstrap._HOST)
+    _write_info(venv_dir, pid=_dead_pid(), host=dirlock._HOST)
 
     # ...but the holder "refreshes" in the steal window: re-validation of the SIDELINED dir
     # sees a fresh heartbeat + live pid, so the steal must back off and restore the lock.
@@ -556,7 +558,7 @@ def test_steal_restores_lock_that_became_fresh_in_the_window(tmp_path, monkeypat
             os.utime(Path(dst), (now, now))
             os.utime(Path(dst) / "heartbeat", (now, now))
             (Path(dst) / "info").write_text(
-                f"pid={os.getpid()} host={bootstrap._HOST} token=live t={now:.0f}\n",
+                f"pid={os.getpid()} host={dirlock._HOST} token=live t={now:.0f}\n",
                 encoding="utf-8",
             )
 
@@ -564,7 +566,7 @@ def test_steal_restores_lock_that_became_fresh_in_the_window(tmp_path, monkeypat
     assert bootstrap.try_acquire(venv_dir) is False  # lost the race -> live holder preserved
     # The lock is back at the live path and still carries the holder's live record.
     assert lock.exists()
-    assert bootstrap._parse_info_dir(lock).get("token") == "live"
+    assert dirlock.parse_info(lock).get("token") == "live"
 
 
 # --------------------------------------------------------------------------- #
@@ -577,12 +579,12 @@ def test_release_does_not_destroy_a_foreign_lock(tmp_path):
     # only removes a lock whose info still carries OUR token (mirrors LeaseLock.release F15).
     venv_dir = tmp_path / "venv"
     assert bootstrap.try_acquire(venv_dir) is True            # original holder (token A)
-    our_token = bootstrap._OWNED_TOKENS[str(bootstrap._lock_dir(venv_dir))]
+    our_token = dirlock._OWNED_TOKENS[str(bootstrap._lock_dir(venv_dir))]
 
     # A successor steals the path and writes its OWN token, as a real steal+reacquire would.
     lock = bootstrap._lock_dir(venv_dir)
     (lock / "info").write_text(
-        f"pid={os.getpid()} host={bootstrap._HOST} token=successor t={bootstrap.time.time():.0f}\n",
+        f"pid={os.getpid()} host={dirlock._HOST} token=successor t={bootstrap.time.time():.0f}\n",
         encoding="utf-8",
     )
     assert our_token != "successor"
@@ -590,7 +592,7 @@ def test_release_does_not_destroy_a_foreign_lock(tmp_path):
     bootstrap.release(venv_dir)  # the original holder releases on its way out
     # The successor's lock survives, with its token intact.
     assert lock.exists()
-    assert bootstrap._parse_info_dir(lock).get("token") == "successor"
+    assert dirlock.parse_info(lock).get("token") == "successor"
     # Clean up the successor lock (no recorded ownership -> manual rmtree).
     bootstrap.shutil.rmtree(lock, ignore_errors=True)
 
@@ -603,7 +605,7 @@ def test_release_removes_our_own_lock(tmp_path):
     assert lock.exists()
     bootstrap.release(venv_dir)
     assert not lock.exists()
-    assert str(lock) not in bootstrap._OWNED_TOKENS  # ownership forgotten on release
+    assert str(lock) not in dirlock._OWNED_TOKENS  # ownership forgotten on release
     assert not list(lock.parent.glob(f"{bootstrap.LOCK_NAME}.release-*"))  # no sideline leaked
 
 

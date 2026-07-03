@@ -20,7 +20,7 @@ import json
 import os
 from pathlib import Path
 
-from .atomicio import _fsync_dir, atomic_write_text
+from .atomicio import atomic_write_text, fsync_dir
 from .model import utcnow
 
 
@@ -64,7 +64,7 @@ class GroundAuditLog:
             f.write(json.dumps(rec) + "\n")
             f.flush()
             os.fsync(f.fileno())
-        _fsync_dir(self.path.parent)  # durable directory entry (a no-op on platforms rejecting dir fds)
+        fsync_dir(self.path.parent)  # durable directory entry (a no-op on platforms rejecting dir fds)
 
     def truncate(self, offset: int) -> bool:
         """Truncate the log back to ``offset`` — undoes records appended for a write that then failed, so
@@ -77,7 +77,7 @@ class GroundAuditLog:
                 f.truncate(offset)
                 f.flush()
                 os.fsync(f.fileno())
-            _fsync_dir(self.path.parent)
+            fsync_dir(self.path.parent)
             return True
         except OSError:
             return False
@@ -118,7 +118,7 @@ class GroundAuditLog:
         overwritten each sweep, so it always holds the LATEST checkpoint."""
         try:
             blob = self.checkpoint_path.read_bytes()
-        except (FileNotFoundError, OSError):
+        except OSError:  # FileNotFoundError included — any unreadable sidecar means "no checkpoint"
             return None
         try:
             rec = json.loads(blob.decode("utf-8", "replace"))
@@ -161,9 +161,7 @@ class GroundAuditLog:
         except Exception:  # noqa: BLE001 — a mid-batch append failure must still compensate (§1.8)
             # an append threw after appending 0..N-1 records durably: truncate them back before
             # re-raising so the failure path never leaves un-compensated orphans.
-            if not self.truncate(offset):
-                raise OrphanAuditError(
-                    f"audit append failed and orphan record(s) could not be truncated back to {offset}")
+            self._compensate_or_orphan(offset, "audit append failed")
             raise
         try:
             ok, payload = attempt()
@@ -171,13 +169,18 @@ class GroundAuditLog:
             # attempt() threw instead of returning a failure signal: truncate the just-appended records
             # the same way as the failure path so a thrown write never leaves orphan records that would
             # inflate the reconciler's consumed tally and let a later replay defeat forge detection (§1.8).
-            if not self.truncate(offset):
-                raise OrphanAuditError(
-                    f"write raised and orphan audit record(s) could not be truncated back to {offset}")
+            self._compensate_or_orphan(offset, "write raised")
             raise
-        if not ok and not self.truncate(offset):
-            # the write signalled failure but the compensating truncate could not drop the record(s):
-            # surface a hard error so the caller does not report a clean rollback (§1.8).
-            raise OrphanAuditError(
-                f"write failed and orphan audit record(s) could not be truncated back to {offset}")
+        if not ok:
+            # the write signalled failure: drop the just-appended record(s) (or raise — the caller must
+            # never report a clean rollback over a surviving orphan, §1.8).
+            self._compensate_or_orphan(offset, "write failed")
         return payload
+
+    def _compensate_or_orphan(self, offset: int, what: str) -> None:
+        """Truncate the log back to ``offset`` or raise ``OrphanAuditError`` — the §1.8 compensation
+        invariant stated ONCE for ``audited_write``'s three failure paths (review-r5: three hand-kept
+        copies could drift when the next failure mode is added)."""
+        if not self.truncate(offset):
+            raise OrphanAuditError(
+                f"{what} and orphan audit record(s) could not be truncated back to {offset}")

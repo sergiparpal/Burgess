@@ -16,6 +16,10 @@ const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url)); // <repo>/scripts
 const ROOT = process.env.CLAUDE_PLUGIN_ROOT || dirname(SCRIPT_DIR);
 const SCRIPTS = join(ROOT, "scripts");
 
+// Cap on one canonmerge run: far above any real 3-way merge of a single note, so it only fires on a
+// genuinely wedged interpreter — a hang here would hang `git merge` itself (review-low).
+const MERGE_TIMEOUT_MS = 60000;
+
 // Resolve the engine python via the pointer/conventional venv path; if no venv was ever provisioned (a
 // plain `git merge` outside a Claude Code session), fall back to a system Python >= 3.10 that ALSO has
 // PyYAML — kg_engine.canonmerge imports it transitively (model.py `import yaml`), so a dep-less
@@ -40,7 +44,7 @@ const env = withPythonpath(process.env, SCRIPTS);
 const r = spawnSync(py, ["-m", "kg_engine.canonmerge", ...process.argv.slice(2)], {
   stdio: "inherit",
   env,
-  timeout: 60000,
+  timeout: MERGE_TIMEOUT_MS,
 });
 if (r.error) {
   process.stderr.write(

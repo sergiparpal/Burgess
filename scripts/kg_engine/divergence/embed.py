@@ -1,6 +1,6 @@
 """Pluggable text embeddings + near-duplicate suppression.
 
-Four providers, selected by the ``KG_DIVERGE_EMBEDDER`` environment variable:
+Three providers, selected by the ``KG_DIVERGE_EMBEDDER`` environment variable:
 
 * ``static`` — model2vec ``minishlab/potion-multilingual-128M`` (256-dim, **101
   languages**, distilled from ``BAAI/bge-m3``, MIT). Static embeddings, so
@@ -14,9 +14,9 @@ Four providers, selected by the ``KG_DIVERGE_EMBEDDER`` environment variable:
 * ``hash``  — deterministic char-n-gram hashing vectorizer (no downloads). Used
   by the test suite and non-live ``selftest``. Lexically similar text → similar
   vectors, so dedup is meaningful.
-* ``api``   — a stub for a hosted provider (Voyage/Cohere/OpenAI), selected via
-  env so callers never change. Constructing it is cheap; embedding raises until
-  wired up.
+
+(``api`` is a reserved name for a hosted provider: selecting it raises a clear
+ConfigError until a real backend lands — review-r5 removed the hollow stub class.)
 
 All embedders return an ``(n, d)`` float32 array of **L2-normalized** rows, so
 cosine similarity is a plain dot product.
@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -127,7 +127,34 @@ class HashingEmbedder(Embedder):
         return self._vec.transform(texts).toarray()
 
 
-class StaticEmbedder(Embedder):
+class LazyModelEmbedder(Embedder):
+    """Base for embedders that download/load a model on FIRST USE (review-r5: StaticEmbedder and
+    LocalEmbedder copy-pasted the whole lazy-load scaffold, and a third provider would have cloned
+    it again). A subclass supplies ``_load() -> (model, dim)``; this base owns the lazy `_ensure`
+    (guard clause, not a 30-line nest), the model/dim caching, and the lazy `_dim_for_empty` — so a
+    new provider cannot forget the empty-input dim contract."""
+
+    def __init__(self, model_name: str):
+        self.model_name = model_name
+        self._model = None
+        self.dim = 0
+
+    def _load(self):  # pragma: no cover - abstract
+        """Import the backend, load the model, and return ``(model, dim)``."""
+        raise NotImplementedError
+
+    def _ensure(self):
+        if self._model is not None:
+            return self._model
+        self._model, self.dim = self._load()
+        return self._model
+
+    def _dim_for_empty(self) -> int:
+        self._ensure()  # dim is unknown until the model loads
+        return self.dim
+
+
+class StaticEmbedder(LazyModelEmbedder):
     """model2vec static embedder (lazy model load).
 
     Static token embeddings averaged per text, so **inference needs only numpy**
@@ -137,48 +164,40 @@ class StaticEmbedder(Embedder):
     name = "static"
 
     def __init__(self, model_name: str = DEFAULT_STATIC_MODEL):
-        self.model_name = model_name
-        self._model = None
-        self.dim = 0
+        super().__init__(model_name)
 
-    def _ensure(self):
-        if self._model is None:
-            # I9 (graceful degradation): the divergence layer must fail with a
-            # clear, actionable message when its deps/weights are unavailable —
-            # and NOTHING in the convergence (kg_*) path is affected, because
-            # this import happens only when an embedding is actually requested.
-            # Cache the model artifact in the plugin's persistent data dir when
-            # one is configured, so plugin updates don't re-download weights.
-            data_dir = os.environ.get("KG_DATA")
-            if data_dir and not os.environ.get("HF_HOME"):
-                os.environ["HF_HOME"] = str(Path(data_dir) / "models")
-            try:
-                from model2vec import StaticModel
-            except ImportError as exc:
-                raise ConfigError(
-                    "divergence embedder unavailable: the 'model2vec' package is "
-                    "not installed in the engine venv. Re-run provisioning (the "
-                    "SessionStart hook, or `python scripts/bootstrap.py`), or set "
-                    "KG_DIVERGE_EMBEDDER=hash for the deterministic offline "
-                    "embedder. Convergence (kg_*) tools are unaffected."
-                ) from exc
-            try:
-                self._model = StaticModel.from_pretrained(self.model_name)
-            except Exception as exc:
-                raise ConfigError(
-                    f"divergence embedder unavailable: could not load model "
-                    f"{self.model_name!r} ({exc}). If you are offline, retry once "
-                    f"the model has been downloaded (it is cached under "
-                    f"$HF_HOME after the first use), or set "
-                    f"KG_DIVERGE_EMBEDDER=hash for the deterministic offline "
-                    f"embedder. Convergence (kg_*) tools are unaffected."
-                ) from exc
-            self.dim = int(self._model.dim)
-        return self._model
-
-    def _dim_for_empty(self) -> int:
-        self._ensure()  # dim is unknown until the model loads
-        return self.dim
+    def _load(self):
+        # I9 (graceful degradation): the divergence layer must fail with a
+        # clear, actionable message when its deps/weights are unavailable —
+        # and NOTHING in the convergence (kg_*) path is affected, because
+        # this import happens only when an embedding is actually requested.
+        # Cache the model artifact in the plugin's persistent data dir when
+        # one is configured, so plugin updates don't re-download weights.
+        data_dir = os.environ.get("KG_DATA")
+        if data_dir and not os.environ.get("HF_HOME"):
+            os.environ["HF_HOME"] = str(Path(data_dir) / "models")
+        try:
+            from model2vec import StaticModel
+        except ImportError as exc:
+            raise ConfigError(
+                "divergence embedder unavailable: the 'model2vec' package is "
+                "not installed in the engine venv. Re-run provisioning (the "
+                "SessionStart hook, or `python scripts/bootstrap.py`), or set "
+                "KG_DIVERGE_EMBEDDER=hash for the deterministic offline "
+                "embedder. Convergence (kg_*) tools are unaffected."
+            ) from exc
+        try:
+            model = StaticModel.from_pretrained(self.model_name)
+        except Exception as exc:
+            raise ConfigError(
+                f"divergence embedder unavailable: could not load model "
+                f"{self.model_name!r} ({exc}). If you are offline, retry once "
+                f"the model has been downloaded (it is cached under "
+                f"$HF_HOME after the first use), or set "
+                f"KG_DIVERGE_EMBEDDER=hash for the deterministic offline "
+                f"embedder. Convergence (kg_*) tools are unaffected."
+            ) from exc
+        return model, int(model.dim)
 
     def _embed_raw(self, texts: List[str]) -> np.ndarray:
         model = self._ensure()
@@ -187,31 +206,23 @@ class StaticEmbedder(Embedder):
         return np.asarray(model.encode(list(texts)), dtype=np.float32)
 
 
-class LocalEmbedder(Embedder):
+class LocalEmbedder(LazyModelEmbedder):
     """sentence-transformers embedder (lazy model load)."""
 
     name = "local"
 
     def __init__(self, model_name: str = DEFAULT_LOCAL_MODEL):
-        self.model_name = model_name
-        self._model = None
-        self.dim = 0
+        super().__init__(model_name)
 
-    def _ensure(self):
-        if self._model is None:
-            from sentence_transformers import SentenceTransformer
+    def _load(self):
+        from sentence_transformers import SentenceTransformer
 
-            self._model = SentenceTransformer(self.model_name)
-            # method was renamed across sentence-transformers versions
-            get_dim = getattr(self._model, "get_embedding_dimension", None) or getattr(
-                self._model, "get_sentence_embedding_dimension"
-            )
-            self.dim = int(get_dim())
-        return self._model
-
-    def _dim_for_empty(self) -> int:
-        self._ensure()  # dim is unknown until the model loads
-        return self.dim
+        model = SentenceTransformer(self.model_name)
+        # method was renamed across sentence-transformers versions
+        get_dim = getattr(model, "get_embedding_dimension", None) or getattr(
+            model, "get_sentence_embedding_dimension"
+        )
+        return model, int(get_dim())
 
     def _embed_raw(self, texts: List[str]) -> np.ndarray:
         model = self._ensure()
@@ -223,28 +234,7 @@ class LocalEmbedder(Embedder):
         )
 
 
-class APIEmbedder(Embedder):
-    """Stub for a hosted embedding provider, selected via env vars.
-
-    Construction is intentionally cheap so a provider switch loads without import
-    errors; actually embedding raises until a backend is wired up.
-    """
-
-    name = "api"
-
-    def __init__(self):
-        self.provider = os.environ.get("KG_DIVERGE_EMBED_API", "voyage")
-        self.api_key = os.environ.get("KG_DIVERGE_EMBED_API_KEY", "")
-        self.dim = 0
-
-    def _embed_raw(self, texts: List[str]) -> np.ndarray:  # pragma: no cover
-        raise NotImplementedError(
-            f"API embedder provider {self.provider!r} is a stub; set "
-            f"{ENV_VAR}=local or =hash, or wire up a backend in APIEmbedder."
-        )
-
-
-_CACHE: dict = {}
+_CACHE: "Dict[str, Embedder]" = {}
 
 
 def get_embedder(provider: Optional[str] = None) -> Embedder:
@@ -262,10 +252,15 @@ def get_embedder(provider: Optional[str] = None) -> Embedder:
     elif provider == "local":
         emb = LocalEmbedder()
     elif provider == "api":
-        emb = APIEmbedder()
+        # A named-but-unwired provider (review-r5: the old APIEmbedder class was 19 hollow lines +
+        # two env-var contracts existing solely to phrase this error at first USE; failing at
+        # SELECTION is clearer). Reintroduce a real class when a hosted backend lands.
+        raise ConfigError(
+            f"embedder provider 'api' has no wired backend; set {ENV_VAR}=static, =hash or =local"
+        )
     else:
         raise ValueError(
-            f"unknown embedder provider {provider!r}; expected static|hash|local|api"
+            f"unknown embedder provider {provider!r}; expected static|hash|local"
         )
     _CACHE[provider] = emb
     return emb
@@ -281,7 +276,7 @@ def reset_cache() -> None:
 # --------------------------------------------------------------------------- #
 def dedupe(
     vecs: np.ndarray,
-    tau: float = 0.92,
+    tau: float = DEFAULT_DEDUP_TAU,
     existing: Optional[np.ndarray] = None,
 ) -> Tuple[List[int], List[int]]:
     """Greedy near-duplicate removal over normalized rows.

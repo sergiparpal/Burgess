@@ -42,7 +42,7 @@ def _replace_with_retry(tmp: str, path: Path) -> None:
             time.sleep(_REPLACE_BACKOFF * (attempt + 1))
 
 
-def _fsync_dir(directory: Path) -> None:
+def fsync_dir(directory: Path) -> None:
     """fsync a directory so a rename into it is durable across a crash (best-effort; not all
     platforms/filesystems support directory fds)."""
     try:
@@ -55,6 +55,11 @@ def _fsync_dir(directory: Path) -> None:
         pass
     finally:
         os.close(fd)
+
+
+# Back-compat alias for the pre-review-r5 underscore name: three modules consume this seam, so the
+# `_` prefix mis-signalled "don't depend on me".
+_fsync_dir = fsync_dir
 
 
 def atomic_write_bytes(
@@ -87,7 +92,9 @@ def atomic_write_bytes(
             pass  # destination absent (new file) or chmod unsupported — keep the mkstemp default
         _replace_with_retry(tmp, path)
         if fsync_dir:
-            _fsync_dir(path.parent)  # make the rename itself durable, not just the contents
+            # the public bool kwarg `fsync_dir` shadows the module function of the same name inside
+            # this body — call the module-level alias to make the rename itself durable.
+            _fsync_dir(path.parent)
     finally:
         # Best-effort cleanup: a failing unlink on the write-failure path (e.g. tmp already gone, or a
         # transient Windows sharing violation) must NOT mask the true exception propagating from the try.

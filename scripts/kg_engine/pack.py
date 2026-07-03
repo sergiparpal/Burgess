@@ -157,7 +157,8 @@ def _defined_terms(text: str) -> set[str]:
 
 def _main(argv: list[str]) -> int:
     if not argv or argv[0] not in {"validate", "coverage"}:
-        print("usage: python -m kg_engine.pack validate <pack.yaml> [source]", file=sys.stderr)
+        print("usage: python -m kg_engine.pack {validate <pack.yaml> [source] | coverage <pack.yaml> <source>}",
+              file=sys.stderr)
         return 2
     cmd = argv[0]
     path = argv[1] if len(argv) > 1 else "pack/pack.yaml"
