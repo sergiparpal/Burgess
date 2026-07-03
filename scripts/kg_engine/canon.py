@@ -641,14 +641,18 @@ class Canon:
                     _unlink(p)
         return removed
 
+    def parse_note(self, p: Path) -> "Node | None":
+        """Parse ONE note file under the canon's tolerance policy: an unreadable/malformed note
+        returns None instead of raising (one bad note must not crash every read, §1.2). The single
+        home of the per-file rule — all_nodes and the projector's stat-gated incremental parse
+        (review-r6) both consume it, so they can never disagree on which files count as nodes."""
+        try:
+            return node_from_markdown(p.read_text(encoding="utf-8"), fallback_id=p.stem)
+        except Exception:  # noqa: BLE001 — one unreadable/malformed note must not crash every read
+            return None
+
     def all_nodes(self) -> list[Node]:
-        out = []
-        for p in self.note_paths():
-            try:
-                out.append(node_from_markdown(p.read_text(encoding="utf-8"), fallback_id=p.stem))
-            except Exception:  # noqa: BLE001 — one unreadable/malformed note must not crash every read
-                continue
-        return out
+        return [n for p in self.note_paths() if (n := self.parse_note(p)) is not None]
 
     def all_edges(self) -> list[Edge]:
         return [e for n in self.all_nodes() for e in n.edges]

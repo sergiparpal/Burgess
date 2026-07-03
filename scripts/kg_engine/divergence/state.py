@@ -18,8 +18,8 @@ the knowledge graph, not the archive, is the durable memory. Layout::
         session/                  # I10: wiped on session change
             archive.json          # MAP-Elites: niche_id -> niche record
             candidates.json       # id -> candidate record (genealogy kept)
-            embeddings.json       # id -> embedding vector
-            mech_embeddings.json  # id -> mechanism-axis embedding
+            embeddings.npz        # id -> embedding vector (binary npz; review-r6 — was .json)
+            mech_embeddings.npz   # id -> mechanism-axis embedding (binary npz)
             open_nicher.json      # open-axis Voronoi partition
         tmp/                      # scratch dir for the skill's hand-off files
         memory/<domain>/
@@ -44,7 +44,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from ..atomicio import atomic_write_text
+from ..atomicio import atomic_write_bytes, atomic_write_text
 from .config import ConfigError
 
 _log = logging.getLogger(__name__)
@@ -123,13 +123,14 @@ def base_dir(project_dir: "str | Path | None" = None) -> Path:
     return Path(project).expanduser() / ".kg" / "diverge"
 
 
-def _atomic_write(path: Path, text: str) -> None:
+def _atomic_write(path: Path, text: str, *, durable: bool = True) -> None:
     """Crash-safe write via the shared ``kg_engine.atomicio`` protocol (review-r5). This module used
     to carry its own temp+fsync+replace copy that "mirrored" atomicio's guarded cleanup — but lacked
     its bounded ``os.replace`` retry for the transient Windows sharing-violation class, so divergence
     state writes could fail where a canon write would have succeeded. One implementation now; the I3
-    firewall is directional (verdict path must not import divergence), so this import is legal."""
-    atomic_write_text(path, text)
+    firewall is directional (verdict path must not import divergence), so this import is legal.
+    ``durable=False`` (the I10 session zone) skips the fsyncs but keeps atomicity — see atomicio."""
+    atomic_write_text(path, text, durable=durable)
 
 
 def _steal_stale_lock(lock: Path) -> None:
@@ -251,10 +252,22 @@ class State:
 
     @property
     def embeddings_path(self) -> Path:
+        """Binary npz vector store (review-r6). The pre-npz pretty-JSON shape re-parsed and rewrote
+        tens of MB of float reprs per ingest inside the project lock at large archives; values on
+        disk are float64, so the round-trip is exact. `_legacy_embeddings_json` is read as a
+        fallback so a session written by an older engine still loads."""
+        return self.session_dir / "embeddings.npz"
+
+    @property
+    def _legacy_embeddings_json(self) -> Path:
         return self.session_dir / "embeddings.json"
 
     @property
     def mech_embeddings_path(self) -> Path:
+        return self.session_dir / "mech_embeddings.npz"
+
+    @property
+    def _legacy_mech_embeddings_json(self) -> Path:
         return self.session_dir / "mech_embeddings.json"
 
     @property
@@ -362,6 +375,9 @@ class State:
         Best-effort: a missing file is not an error."""
         for path in (self.archive_path, self.candidates_path,
                      self.embeddings_path, self.mech_embeddings_path,
+                     # legacy pre-npz vector files (review-r6): an older session's leftovers must
+                     # not shadow a fresh geometry via the tolerant fallback read.
+                     self._legacy_embeddings_json, self._legacy_mech_embeddings_json,
                      self.open_nicher_path):
             with contextlib.suppress(OSError):
                 path.unlink(missing_ok=True)
@@ -396,8 +412,53 @@ class State:
                 f"backup) and retry"
             ) from exc
 
-    def write_json(self, path: Path, obj: Any) -> None:
-        _atomic_write(path, json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True))
+    def write_json(self, path: Path, obj: Any, *, durable: bool = True,
+                   compact: bool = False) -> None:
+        """``compact=True`` drops the indent/whitespace for big machine-only stores — values and key
+        order (sort_keys) are identical, only bytes shrink. ``durable=False`` skips the fsyncs for
+        the I10 session zone (loss on a crash is already an accepted outcome there); the atomic
+        temp+replace still means a reader never sees a torn file (review-r6)."""
+        text = json.dumps(obj, ensure_ascii=False, sort_keys=True,
+                          indent=None if compact else 2,
+                          separators=(",", ":") if compact else None)
+        _atomic_write(path, text, durable=durable)
+
+    # -- vector stores (npz; review-r6) -------------------------------------- #
+    def _read_vector_store(self, path: Path, legacy_json: Path) -> Dict[str, List[float]]:
+        """id -> vector store, npz-backed. ``.tolist()`` of the float64 rows returns the identical
+        Python floats ``json.loads`` produced from the legacy file, so consumers (and the
+        write/read == roundtrip) are unchanged. Falls back to the legacy pretty-JSON file so a
+        session written by an older engine still reads; the next write lands the npz and removes
+        the legacy file."""
+        if path.exists():
+            import io
+
+            import numpy as np
+            try:
+                with np.load(io.BytesIO(path.read_bytes())) as z:
+                    # keys are stored with a "v:" prefix — see _write_vector_store.
+                    return {k[2:]: z[k].tolist() for k in z.files}
+            except Exception as exc:  # noqa: BLE001 — corrupt zip/npy: mirror read_json's posture
+                raise StateError(
+                    f"state file {path} is corrupt ({exc}); remove it (or restore a "
+                    f"backup) and retry"
+                ) from exc
+        return self.read_json(legacy_json, {}) or {}
+
+    def _write_vector_store(self, path: Path, legacy_json: Path,
+                            embeddings: Dict[str, List[float]]) -> None:
+        import io
+
+        import numpy as np
+        buf = io.BytesIO()
+        # Candidate ids are caller-supplied strings; the "v:" prefix keeps any id (e.g. a literal
+        # "file") from colliding with np.savez's own parameter names while round-tripping verbatim.
+        np.savez(buf, **{f"v:{k}": np.asarray(v, dtype=np.float64)
+                         for k, v in embeddings.items()})
+        # Session zone (I10): atomic but not durable — see write_json.
+        atomic_write_bytes(path, buf.getvalue(), durable=False)
+        with contextlib.suppress(OSError):
+            legacy_json.unlink(missing_ok=True)
 
     # -- typed accessors ---------------------------------------------------- #
     def read_meta(self) -> Dict[str, Any]:
@@ -412,36 +473,44 @@ class State:
     def write_axes(self, axes: Dict[str, Any]) -> None:
         self.write_json(self.axes_path, axes)
 
+    # Session-zone (I10) writers pass durable=False: these files are wiped on the next session
+    # anyway, so per-cycle fsync pairs bought durability for data whose loss is an accepted
+    # outcome; atomicity (never a torn read) is kept. Durable stores (meta/axes/session/pins/
+    # discards/materialized) keep the full fsync protocol (review-r6).
     def read_archive(self) -> Dict[str, Any]:
         return self.read_json(self.archive_path, {}) or {}
 
     def write_archive(self, archive: Dict[str, Any]) -> None:
-        self.write_json(self.archive_path, archive)
+        self.write_json(self.archive_path, archive, durable=False)
 
     def read_candidates(self) -> Dict[str, Any]:
         return self.read_json(self.candidates_path, {}) or {}
 
     def write_candidates(self, candidates: Dict[str, Any]) -> None:
-        self.write_json(self.candidates_path, candidates)
+        # compact: the largest JSON store (full idea texts + genealogy), machine-only.
+        self.write_json(self.candidates_path, candidates, durable=False, compact=True)
 
     def read_embeddings(self) -> Dict[str, List[float]]:
-        return self.read_json(self.embeddings_path, {}) or {}
+        return self._read_vector_store(self.embeddings_path, self._legacy_embeddings_json)
 
     def write_embeddings(self, embeddings: Dict[str, List[float]]) -> None:
-        self.write_json(self.embeddings_path, embeddings)
+        self._write_vector_store(self.embeddings_path, self._legacy_embeddings_json, embeddings)
 
     def read_mech_embeddings(self) -> Dict[str, List[float]]:
-        return self.read_json(self.mech_embeddings_path, {}) or {}
+        return self._read_vector_store(self.mech_embeddings_path,
+                                       self._legacy_mech_embeddings_json)
 
     def write_mech_embeddings(self, embeddings: Dict[str, List[float]]) -> None:
-        self.write_json(self.mech_embeddings_path, embeddings)
+        self._write_vector_store(self.mech_embeddings_path,
+                                 self._legacy_mech_embeddings_json, embeddings)
 
     def read_open_nicher(self) -> Optional[Dict[str, Any]]:
         """Persisted open-axis nicher: cold-start accumulation or frozen centroids."""
         return self.read_json(self.open_nicher_path, None)
 
     def write_open_nicher(self, data: Dict[str, Any]) -> None:
-        self.write_json(self.open_nicher_path, data)
+        # compact: the pre-freeze accumulation buffer is up to freeze_factor*k raw vectors.
+        self.write_json(self.open_nicher_path, data, durable=False, compact=True)
 
     # -- memory (namespaced by domain) ------------------------------------- #
     def append_comparison(self, domain: str, event: Dict[str, Any]) -> None:

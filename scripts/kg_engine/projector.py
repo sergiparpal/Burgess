@@ -19,18 +19,21 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, Callable
 
-import networkx as nx
-
 from . import envconfig
 from .atomicio import atomic_write_text as _atomic_write
 from .canon import Canon, _git
 from .graphio import node_link_data
 from .harness import idf_seeds, node_specificity
 from .harness import specificity as _specificity_gate
-from .model import EpistemicState, FAILURE_STATE_VALUES, Provenance, node_content_hash
+from .model import Edge, EpistemicState, FAILURE_STATE_VALUES, Node, Provenance, node_content_hash
 from .sources import section_corpus
 
 if TYPE_CHECKING:  # type-only; the projector duck-types .verifies/.concat at runtime
+    # networkx is type-only at module scope and imported lazily inside the few graph-building/rank
+    # functions below (review-r6: hook-import-tax). Its import costs ~70ms, and the PreToolUse hook
+    # imports this module on every Grep/Glob/Read only to READ precomputed columns — a path that
+    # never touches networkx. `from __future__ import annotations` keeps the `nx.*` annotations lazy.
+    import networkx as nx
     from .sources import SourceSet
 
 GRAPH_JSON = "graph.json"
@@ -93,6 +96,11 @@ BRIDGE_LIMIT = 10          # top-N structural-bridge rows kg_context serves; exp
 MAX_QUERY_LIMIT = 10_000   # clamp for query_graph's LIMIT (a negative LIMIT is unbounded in SQLite)
 MAX_AGENDA_LIMIT = 50      # clamp for kg_agenda's limit
 _CHARS_PER_TOKEN = 4       # the crude chars-per-token estimate the context budget fill uses
+# Cap on the distinct query terms kg_context turns into LIKE clauses. Each term adds four
+# `LIKE '%…%'` predicates evaluated against EVERY edge row (span text included) — an unbounded
+# pasted-paragraph query would multiply that full-scan cost per term for match quality the budget
+# fill then truncates anyway (review-r6). Queries with more terms match on the first cap terms.
+_QUERY_TERM_CAP = 12
 _STALE_PREVIEW_LABELS = 3  # how many stale-verdict labels the advisory names inline
 # Cap the R3 stale-verdict advisory list in kg_context so it can't bypass the token budget (review-low).
 _STALE_VERDICTS_CAP = 50
@@ -131,6 +139,7 @@ def gate_ranking(gate_on: bool) -> "tuple[str, tuple[str, ...]]":
 
 def _leiden(undirected: nx.Graph) -> dict:
     """Return node_id -> community int. Leiden if available, else label propagation."""
+    import networkx as nx  # deferred — see the TYPE_CHECKING note (review-r6: hook-import-tax)
     if undirected.number_of_nodes() == 0:
         return {}
     try:
@@ -173,6 +182,7 @@ class _ParseCache(NamedTuple):
     sig: str
     nodes: list
     hashes: dict
+    stats: dict  # per-file stat map {file name: [size, mtime_ns, node id]} — the review-r6 parse gate
 
 
 @dataclass
@@ -278,6 +288,7 @@ class Projector:
         return node_content_hash(node)
 
     def _build_graph(self, nodes):
+        import networkx as nx  # deferred — see the TYPE_CHECKING note (review-r6: hook-import-tax)
         # MultiDiGraph (not DiGraph): two canon edges can share (source, target) but differ in
         # relation (e.g. `grounds` and `attacked_by`). A DiGraph keys edges by (u, v) only and would
         # silently collapse them — dropping edges from graph.json and undercounting n_edges, violating
@@ -314,6 +325,7 @@ class Projector:
 
     @staticmethod
     def _live_subgraph(G: nx.MultiDiGraph) -> nx.Graph:
+        import networkx as nx  # deferred — see the TYPE_CHECKING note (review-r6: hook-import-tax)
         # The advisory ranks (degree/communities/betweenness/spec_betweenness) are computed over the
         # NON-FAILED subgraph (§1.7). graph.json and the edges table stay COMPLETE — failure memory is
         # never pruned — but a `failed`/`rejected` edge must not inflate centrality: the adversarial
@@ -330,6 +342,7 @@ class Projector:
     # ---- ranks (off the hot path)
     def _ranks(self, G: nx.DiGraph, *, prior_topo_sig: str | None = None,
                prior_betweenness: dict | None = None) -> Ranks:
+        import networkx as nx  # deferred — see the TYPE_CHECKING note (review-r6: hook-import-tax)
         und = self._live_subgraph(G)
         comm = _leiden(und)
         # Degree is the DISTINCT-neighbour count, not the edge-multiplicity count. `und` is a MultiGraph
@@ -435,6 +448,7 @@ class Projector:
             if not self.db_path.exists() or self._schema_outdated():
                 self._connect().close()
             if not self.graph_path.exists():
+                import networkx as nx  # deferred — see the TYPE_CHECKING note (review-r6)
                 _atomic_write(self.graph_path, json.dumps(node_link_data(nx.MultiDiGraph())))
             return ProjectReport(up_to_date=self.db_path.exists() and self.graph_path.exists(),
                                  contended=True)
@@ -450,13 +464,14 @@ class Projector:
         cache = self._parse_cache
         self._parse_cache = None  # consume once, whether or not it hits
         cur_sig = self._cheap_sig()
-        if cache and cache.sig == cur_sig:
-            nodes, cur_hashes = cache.nodes, cache.hashes
-        else:
-            nodes = self.canon.all_nodes()
-            cur_hashes = {n.id: self._file_hash(n) for n in nodes}
-        head = self._head()
+        # prior meta is read BEFORE the parse (review-r6): the cache-miss parse is stat-gated
+        # against it. Independent of the canon files, so the reorder changes nothing else.
         prior = self._read_meta() if self.db_path.exists() else {}
+        if cache and cache.sig == cur_sig:
+            nodes, cur_hashes, cur_stats = cache.nodes, cache.hashes, cache.stats
+        else:
+            nodes, cur_hashes, cur_stats = self._parse_canon(prior)
+        head = self._head()
         prior_hashes = prior.get("file_hashes", {})
         # R3: the stale-verdict advisory is keyed on a hash of the SOURCE payload (SourceSet concat),
         # NOT the per-node canon hash (which never sees a source edit). Computed here, off the hot path —
@@ -520,10 +535,11 @@ class Projector:
         _atomic_write(self.graph_path, json.dumps(data, indent=2))
 
         if do_full:
-            self._write_full(nodes, ranks, head, cur_hashes, report, cur_source_hash, stale)
+            self._write_full(nodes, ranks, head, cur_hashes, report, cur_source_hash, stale,
+                             cur_stats)
         else:
             self._write_incremental(nodes, changed, removed, ranks, head, cur_hashes, report,
-                                    cur_source_hash, stale)
+                                    cur_source_hash, stale, cur_stats)
         # ranks (cheap_sig/topo_sig/etc.) are persisted by the write methods via _save_meta.
 
         report.n_nodes = G.number_of_nodes()
@@ -677,7 +693,7 @@ class Projector:
         }
         return tuple(v[name] for name in _EDGE_COLUMN_NAMES)
 
-    def _write_full(self, nodes, ranks: Ranks, head, hashes, report, source_hash, stale):
+    def _write_full(self, nodes, ranks: Ranks, head, hashes, report, source_hash, stale, stats):
         con = self._connect()
         try:
             con.execute("DELETE FROM nodes")
@@ -689,13 +705,14 @@ class Projector:
             con.executemany(self._EDGES_INSERT, erows)
             report.touched_nodes = [n.id for n in nodes]
             report.touched_edges = [e.id for n in nodes for e in n.edges]
-            self._save_meta(con, head, hashes, ranks.gate_on, source_hash, stale, ranks.topo_sig)
+            self._save_meta(con, head, hashes, ranks.gate_on, source_hash, stale, ranks.topo_sig,
+                            stats)
             con.commit()
         finally:
             con.close()
 
     def _write_incremental(self, nodes, changed, removed, ranks: Ranks, head, hashes, report,
-                           source_hash, stale):
+                           source_hash, stale, stats):
         con = self._connect()
         try:
             changed_ids = {c.id for c in changed}  # hoisted out of the per-node loop below
@@ -738,7 +755,8 @@ class Projector:
                 if old != new_vals:
                     con.execute(update_sql,
                                 tuple(row[c] for c in _RANK_UPDATE_COLUMNS) + (n.id,))
-            self._save_meta(con, head, hashes, ranks.gate_on, source_hash, stale, ranks.topo_sig)
+            self._save_meta(con, head, hashes, ranks.gate_on, source_hash, stale, ranks.topo_sig,
+                            stats)
             con.commit()
         finally:
             con.close()
@@ -808,9 +826,13 @@ class Projector:
                 if (e := edges.get(entry.get("edge_id"))) is not None
                 and self._is_stale_edge(e, sources)]
 
-    def _save_meta(self, con, head, hashes, gate_on=0, source_hash="", stale_verdicts=None, topo_sig=""):
+    def _save_meta(self, con, head, hashes, gate_on=0, source_hash="", stale_verdicts=None, topo_sig="",
+                   stats=None):
         con.execute("INSERT OR REPLACE INTO meta VALUES ('built_from_commit', ?)", (head,))
         con.execute("INSERT OR REPLACE INTO meta VALUES ('file_hashes', ?)", (json.dumps(hashes),))
+        # the per-file stat map the review-r6 incremental parse gates on: {name: [size, mtime_ns, id]}.
+        con.execute("INSERT OR REPLACE INTO meta VALUES ('file_stats', ?)",
+                    (json.dumps(stats or {}, sort_keys=True),))
         con.execute("INSERT OR REPLACE INTO meta VALUES ('cheap_sig', ?)", (json.dumps(self._cheap_sig()),))
         # the live-topology signature these ranks were computed over (projector-1): lets the next
         # projection reuse betweenness when the topology is unchanged.
@@ -841,6 +863,10 @@ class Projector:
             out["file_hashes"] = json.loads(rows.get("file_hashes", "{}"))
         except (ValueError, TypeError):
             out["file_hashes"] = {}
+        try:  # absent on a pre-review-r6 index -> {} -> _parse_canon falls back to the full parse
+            out["file_stats"] = json.loads(rows.get("file_stats", "{}"))
+        except (ValueError, TypeError):
+            out["file_stats"] = {}
         try:
             out["cheap_sig"] = json.loads(rows.get("cheap_sig", "null"))
         except (ValueError, TypeError):
@@ -868,22 +894,142 @@ class Projector:
         except sqlite3.Error:
             return None
 
-    def _rearm_cheap_sig(self, sig: str) -> None:
+    def _rearm_cheap_sig(self, sig: str, stats: "dict | None" = None) -> None:
         """Persist the current cheap-signature when is_stale() proves (via the content-hash fallthrough)
         that the canon is unchanged though its mtimes moved (projector-2/finding #2). Without this the
         cheap pre-gate stays stuck at the pre-touch value and every later is_stale() pays a full O(N)
-        canon parse forever. Best-effort + lock-free: a single-key meta upsert is WAL-safe under
-        busy_timeout; a read-only/locked vault just keeps the slow path (never raises from a read)."""
+        canon parse forever. ``stats`` (review-r6) re-arms the per-FILE stat map the same way — a
+        touched-but-identical note would otherwise stay "changed" against the stored stats and be
+        re-parsed on every later confirmation. Best-effort + lock-free: single-key meta upserts are
+        WAL-safe under busy_timeout; a read-only/locked vault just keeps the slow path (never raises
+        from a read)."""
         try:
             con = sqlite3.connect(self.db_path)
             try:
                 con.execute("PRAGMA busy_timeout=5000")
                 con.execute("INSERT OR REPLACE INTO meta VALUES ('cheap_sig', ?)", (json.dumps(sig),))
+                if stats is not None:
+                    con.execute("INSERT OR REPLACE INTO meta VALUES ('file_stats', ?)",
+                                (json.dumps(stats, sort_keys=True),))
                 con.commit()
             finally:
                 con.close()
         except sqlite3.Error:
             pass
+
+    # ---- the review-r6 incremental canon parse (stat-gated; shells for unchanged files)
+
+    def _parse_canon(self, prior: dict) -> "tuple[list, dict, dict]":
+        """(nodes, file_hashes, file_stats) for the CURRENT canon — the ONE parse the staleness
+        confirmation (is_stale) and projection (_project_locked) share. Parses only the files whose
+        (size, mtime_ns) moved since the prior projection and rebuilds the rest as derived-row
+        shells (review-r6: any one-note edit used to cost a full-canon YAML parse); node order stays
+        note_paths order (exactly all_nodes'), and a stat-unchanged file reuses its STORED content
+        hash. stat-unchanged ⇒ treated as content-unchanged: the same trust the cheap_sig pre-gate
+        has always granted the canon as a whole (an mtime-spoofed edit is the reconciler full
+        sweep's job, §1.8), now applied per file. Every precondition failure — no prior stats or
+        hashes, outdated schema, an id missing from the index, duplicate node ids, a sqlite error —
+        falls back to the full parse, so this path is never worse than the old one."""
+        entries = []
+        for p in self.canon.note_paths():
+            try:
+                st = p.stat()
+            except OSError:
+                continue  # vanished mid-scan (matches _cheap_sig's skip): treated as removed
+            entries.append((p, st.st_size, st.st_mtime_ns))
+        prior_stats = prior.get("file_stats") or {}
+        prior_hashes = prior.get("file_hashes") or {}
+        if prior_stats and prior_hashes and self.db_path.exists() and not self._schema_outdated():
+            out = self._parse_canon_incremental(entries, prior_stats, prior_hashes)
+            if out is not None:
+                return out
+        nodes, hashes, stats = [], {}, {}
+        for p, size, mt in entries:
+            n = self.canon.parse_note(p)
+            if n is None:
+                continue
+            nodes.append(n)
+            hashes[n.id] = self._file_hash(n)
+            stats[p.name] = [size, mt, n.id]
+        return nodes, hashes, stats
+
+    def _parse_canon_incremental(self, entries, prior_stats, prior_hashes):
+        """The stat-gated arm of _parse_canon; None means "fall back to the full parse"."""
+        plan = []
+        for p, size, mt in entries:
+            e = prior_stats.get(p.name)
+            hid = (e[2] if isinstance(e, list) and len(e) == 3 and e[0] == size and e[1] == mt
+                   and e[2] in prior_hashes else None)
+            plan.append((p, size, mt, hid))
+        shells = self._shell_nodes_from_derived([hid for *_, hid in plan if hid is not None])
+        if shells is None:
+            return None
+        nodes, hashes, stats = [], {}, {}
+        for p, size, mt, hid in plan:
+            if hid is not None:
+                n = shells[hid]
+            else:
+                n = self.canon.parse_note(p)
+                if n is None:
+                    continue
+            nodes.append(n)
+            hashes[n.id] = prior_hashes[hid] if hid is not None else self._file_hash(n)
+            stats[p.name] = [size, mt, n.id]
+        if len(hashes) != len(nodes):
+            # duplicate node ids across files: whose content wins is order-dependent, and a shell
+            # could launder the stale copy — let the full parse decide exactly as before.
+            return None
+        return nodes, hashes, stats
+
+    def _shell_nodes_from_derived(self, ids: list) -> "dict[str, Node] | None":
+        """PROJECTION SHELLS ONLY — Node objects rebuilt from the derived rows for stat-UNCHANGED
+        canon files. The derived layer deliberately omits canon-only fields (body, timestamps,
+        verdict_by/verdict_at, edge notes — see _connect's DDL comment), so a shell must NEVER be
+        written back to the canon or content-hashed; the projector reuses the file's stored hash and
+        only feeds shells to _build_graph / _ranks / _stale_verdicts / _node_row / _edge_row, whose
+        column sets the derived rows cover completely. Returns None (→ full parse) when any id is
+        missing, a pre-owner edge row exists (ownership unknowable), or the index is unreadable."""
+        if not ids:
+            return {}
+        want = set(ids)
+        try:
+            con = sqlite3.connect(self.db_path)
+            con.row_factory = sqlite3.Row
+            try:
+                con.execute("PRAGMA busy_timeout=5000")
+                if con.execute("SELECT COUNT(*) FROM edges WHERE owner IS NULL").fetchone()[0]:
+                    return None
+                nrows = list(con.execute("SELECT * FROM nodes"))
+                # ORDER BY rowid: a shell's edge order is its derived insertion order (not the canon
+                # file order, which only a parse can know) — pinned so identical indexes hydrate
+                # identically across platforms.
+                erows = list(con.execute(
+                    "SELECT " + ",".join(_EDGE_COLUMN_NAMES) + " FROM edges ORDER BY rowid"))
+            finally:
+                con.close()
+        except sqlite3.Error:
+            return None
+        by_owner: dict = {}
+        for r in erows:
+            by_owner.setdefault(r["owner"], []).append(r)
+        shells: "dict[str, Node]" = {}
+        for r in nrows:
+            nid = r["id"]
+            if nid not in want:
+                continue
+            edges = [Edge(source=e["source"], target=e["target"], relation=e["relation"],
+                          provenance=e["provenance"], authored_by=e["authored_by"],
+                          epistemic_state=e["epistemic_state"], span=e["span"] or "",
+                          source_file=e["source_file"] or "", confidence=e["confidence"],
+                          confidence_score=e["confidence_score"])
+                     for e in by_owner.get(nid, ())]
+            shells[nid] = Node(id=nid, label=r["label"], node_type=r["node_type"],
+                               file_type=r["file_type"], provenance=r["provenance"],
+                               authored_by=r["authored_by"], epistemic_state=r["epistemic_state"],
+                               edges=edges)
+        if want - set(shells):
+            return None
+        return shells
 
     def is_stale(self) -> bool:
         if not self.db_path.exists() or not self.graph_path.exists():
@@ -905,20 +1051,22 @@ class Projector:
             return False
         # the cheap signal moved -> authoritative per-node content-hash comparison. This catches any
         # uncommitted canon change (a kg_ground verdict, a hand edit) regardless of HEAD; content
-        # equality means the derived layer matches the canon whatever the commit is.
-        nodes = self.canon.all_nodes()
-        cur_hashes = {n.id: self._file_hash(n) for n in nodes}
+        # equality means the derived layer matches the canon whatever the commit is. The parse is
+        # stat-gated per file (review-r6): only files whose (size, mtime_ns) moved are re-parsed and
+        # re-hashed; the rest reuse their stored hash and hydrate as derived-row shells.
+        nodes, cur_hashes, cur_stats = self._parse_canon(prior)
         if prior.get("file_hashes", {}) == cur_hashes:
             # content is identical though the cheap signal moved (an mtime-only touch: a no-op checkout,
             # an editor re-save, or an idempotent kg_write/kg_ground that rewrote a note to identical
-            # bytes — os.replace always yields a fresh mtime). Re-arm the cheap pre-gate so the NEXT
-            # is_stale() short-circuits instead of re-parsing the whole canon forever (finding #2).
-            self._rearm_cheap_sig(cur_sig)
+            # bytes — os.replace always yields a fresh mtime). Re-arm the cheap pre-gate (and the
+            # per-file stat map, review-r6) so the NEXT is_stale() short-circuits instead of
+            # re-parsing the whole canon forever (finding #2).
+            self._rearm_cheap_sig(cur_sig, cur_stats)
             return False
         # genuinely stale -> stash this parse so the project() that follows reuses it rather than parsing
         # the whole canon a second time (projector-5/-11). cur_sig keys the cache so a concurrent write
         # in the gap invalidates it.
-        self._parse_cache = _ParseCache(sig=cur_sig, nodes=nodes, hashes=cur_hashes)
+        self._parse_cache = _ParseCache(sig=cur_sig, nodes=nodes, hashes=cur_hashes, stats=cur_stats)
         return True
 
 
@@ -1126,6 +1274,7 @@ class DerivedReader:
         attached as a node attribute (PLAN Stage 3 — the generative layer reads ranks O(1) off this).
         Read-only; assumes the caller has already projected. A dangling edge target (a node referenced
         but not itself a canon note) is auto-created attribute-less, so generators must `.get()` ranks."""
+        import networkx as nx  # deferred — see the TYPE_CHECKING note (review-r6: hook-import-tax)
         con = self._ro()
         try:
             G = nx.MultiDiGraph()
@@ -1243,7 +1392,7 @@ class DerivedReader:
             return "", []
         seen: set = set()
         terms = [t for t in re.findall(r"[A-Za-z0-9_-]{3,}", query.lower())
-                 if not (t in seen or seen.add(t))]
+                 if not (t in seen or seen.add(t))][:_QUERY_TERM_CAP]
         clause = ("(source LIKE ? ESCAPE '\\' OR target LIKE ? ESCAPE '\\' "
                   "OR relation LIKE ? ESCAPE '\\' OR span LIKE ? ESCAPE '\\')")
         if terms:
@@ -1319,7 +1468,13 @@ class DerivedReader:
 
             def _fill(where_sql, args, order_sql, cap):
                 rows, used = [], 0
-                for r in con.execute(f"SELECT {cols} FROM edges WHERE {where_sql} ORDER BY {order_sql}", args):
+                # LIMIT cap+1 is provably output-identical: every accepted row costs >= 1 token
+                # against `cap` and the loop STOPS at the first over-budget row (no skip-and-
+                # continue), so it can never look past row cap+1. The bound turns the CASE-expression
+                # ORDER BY (which no index can serve) into a bounded top-N sort instead of a full
+                # sort of every matching edge (review-r6).
+                for r in con.execute(f"SELECT {cols} FROM edges WHERE {where_sql} "
+                                     f"ORDER BY {order_sql} LIMIT ?", [*args, int(cap) + 1]):
                     rec = dict(r)
                     tok = max(1, len(json.dumps(rec)) // _CHARS_PER_TOKEN)
                     if used + tok > cap:

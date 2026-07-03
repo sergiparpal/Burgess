@@ -24,8 +24,11 @@ AXES = {
     "candidates_per_generation": 6,
 }
 
-GEOMETRY_FILES = {"archive.json", "candidates.json", "embeddings.json",
-                  "mech_embeddings.json", "open_nicher.json"}
+GEOMETRY_FILES = {"archive.json", "candidates.json", "embeddings.npz",
+                  "mech_embeddings.npz", "open_nicher.json",
+                  # legacy pre-npz vector store names (review-r6): the detector keeps catching
+                  # an older engine's artifacts so a mixed-version state dir can't dodge I10.
+                  "embeddings.json", "mech_embeddings.json"}
 
 
 def _cands(n, tag=""):

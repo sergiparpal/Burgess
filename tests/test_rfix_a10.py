@@ -84,7 +84,10 @@ def test_fallback_passes_links_key_through_unrenamed(monkeypatch):
             H.add_edge(e["source"], e["target"])
         return H
 
-    monkeypatch.setattr(graphio.nx, "node_link_graph", fake_node_link_graph)
+    # Patch the networkx module itself: graphio imports nx lazily inside its helpers (review-r6:
+    # hook-import-tax), so `graphio.nx` no longer exists — the function-level import binds this same
+    # module object, and the pinned fallback behavior is exercised identically.
+    monkeypatch.setattr(nx, "node_link_graph", fake_node_link_graph)
 
     G = nx.MultiDiGraph()
     G.add_node("a")

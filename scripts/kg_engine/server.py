@@ -24,17 +24,18 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from . import __version__, envconfig
-from .boundary import DEFAULT_MAX_EDGES_PER_KB, MIN_SPAN_CHARS, merge_results_into_nodes, validate_payload
 from .canon import Canon
 from .groundaudit import GroundAuditLog
 from .model import (
     AuthoredBy,
+    DEFAULT_MAX_EDGES_PER_KB,
     Disposition,
     Edge,
     EpistemicState,
     FAILURE_STATES,
     FAILURE_STATE_VALUES,
     GROUNDABLE_STATES,
+    MIN_SPAN_CHARS,
     Node,
     Provenance,
     UNDECLARED_TYPE,
@@ -43,7 +44,6 @@ from .model import (
     slug,
     utcnow,
 )
-from .pack import load_pack
 from .projector import Projector
 from .reconciler import GROUND_AUDIT, Reconciler
 from .scrub import Scrubber
@@ -416,16 +416,19 @@ class _SourceResolver:
         self._cache = None
 
 
-def _wire_projector(canon, derived_dir, *, sources, pack, metrics_mode) -> Projector:
+def _wire_projector(canon, derived_dir, *, sources, pack_get, metrics_mode) -> Projector:
     """The SINGLE construction site for a Projector's source-corpus + specificity-seed + metrics wiring,
     shared by the writer engine (KGEngine.__init__) and the read-only PreToolUse hook
     (KGEngine.read_only_projector). Routing both through here means a hook-triggered projection computes
     the SAME IDF/specificity gate, spec_betweenness, and R3 stale-verdict scan as the server — it can
     never write a degraded empty-corpus derived layer the server then serves as fresh (finding:
-    precontext-bypasses-facade). `sources` is a _SourceResolver; `pack` may be None."""
+    precontext-bypasses-facade). `sources` is a _SourceResolver; `pack_get` is a ZERO-ARG loader that
+    may return None — a callable (not the pack itself) so the hook's common fast path (fresh index →
+    kg_context only) never loads the pack at all; the projector evaluates the seeds lambda only inside
+    a real projection (review-r6: hook-import-tax — load_pack pulls pydantic+yaml)."""
     return Projector(canon, derived_dir, metrics_mode=metrics_mode,
                      source_text=sources.text, source_set=sources.resolve,
-                     specificity_seeds=lambda: dict(getattr(pack, "specificity_seeds", {}) or {}))
+                     specificity_seeds=lambda: dict(getattr(pack_get(), "specificity_seeds", {}) or {}))
 
 
 def _load_pack_or_none(pack_path):
@@ -435,6 +438,9 @@ def _load_pack_or_none(pack_path):
     constructors)."""
     if not (pack_path and Path(pack_path).exists()):
         return None
+    # Deferred import (review-r6: hook-import-tax): pack.py pulls pydantic (~75ms) + yaml for its
+    # schema models; the read-only hook must reach this only when a projection actually needs seeds.
+    from .pack import load_pack
     try:
         return load_pack(pack_path)
     except Exception:  # noqa: BLE001 — a bad pack must not crash engine construction
@@ -468,7 +474,8 @@ class KGEngine:
         self.pack = _load_pack_or_none(self.pack_path)
         # The projector reads source/specificity lazily, once per real reprojection, off the hot path.
         self.projector = _wire_projector(self.canon, self.data_dir / envconfig.DERIVED_DIRNAME,
-                                         sources=self._sources, pack=self.pack, metrics_mode=metrics_mode)
+                                         sources=self._sources, pack_get=lambda: self.pack,
+                                         metrics_mode=metrics_mode)
         self.scrubber = Scrubber(sensitivity)
         self._scrub_map: dict[str, str] = {}  # accumulated egress placeholder -> original (§1.9)
         self.sensitivity = sensitivity
@@ -521,17 +528,20 @@ class KGEngine:
         metrics_mode) but over a no-side-effect Canon(ensure_layout=False) — for the read-only PreToolUse
         hook. Goes through the SAME _wire_projector seam as __init__, so the hook can never project a
         degraded (empty-corpus) derived layer the server then serves as fresh (finding:
-        precontext-bypasses-facade). The pack is loaded eagerly (the hook holds no engine); a missing or
-        bad pack degrades to no specificity seeds, exactly as __init__ does. ``lease_ttl`` shortens the
-        canon lease for callers that can be SIGKILLed mid-projection (the hook's 5s cap — review-r4:
-        hook-kill-wedges-windows-writers) — a constructor seam instead of the reach-through
-        ``proj.canon.lock.ttl`` mutation the hook used to do (review-r5)."""
+        precontext-bypasses-facade). The pack is loaded LAZILY, memoized, on first projection — the
+        hook fires on every Grep/Glob/Read and its common path (fresh index → kg_context) never needs
+        the pack, so it must not pay load_pack's pydantic+yaml import (review-r6: hook-import-tax); a
+        missing or bad pack still degrades to no specificity seeds, exactly as __init__ does.
+        ``lease_ttl`` shortens the canon lease for callers that can be SIGKILLed mid-projection (the
+        hook's 5s cap — review-r4: hook-kill-wedges-windows-writers) — a constructor seam instead of
+        the reach-through ``proj.canon.lock.ttl`` mutation the hook used to do (review-r5)."""
         canon = Canon(project_dir, ensure_layout=False)
         if lease_ttl is not None:
             canon.lock.ttl = float(lease_ttl)
-        pack = _load_pack_or_none(pack_path)
+        pack_get = functools.lru_cache(maxsize=1)(lambda: _load_pack_or_none(pack_path))
         return _wire_projector(canon, Path(data_dir) / envconfig.DERIVED_DIRNAME,
-                               sources=_SourceResolver(source_path), pack=pack, metrics_mode=metrics_mode)
+                               sources=_SourceResolver(source_path), pack_get=pack_get,
+                               metrics_mode=metrics_mode)
 
     # ---- tools -----------------------------------------------------------
     def kg_ping(self) -> dict:
@@ -728,6 +738,10 @@ class KGEngine:
             # kg_write calls re-parses only the notes each write touched, not the whole canon.
             existing_nodes = list(self._canon_baseline().values())
         existing_edges = [e for n in existing_nodes for e in n.edges]
+        # Deferred import (review-r6: hook-import-tax): boundary pulls pydantic (~75ms), which only
+        # this write path needs — the read-only PreToolUse hook imports this module on every
+        # Grep/Glob/Read and must not pay for it. Same pattern as generate/advisory_geometry/export.
+        from .boundary import merge_results_into_nodes, validate_payload
         results = validate_payload(payload, pack=self.pack, source_text=self.source_text(),
                                    sources=self.source_set(),
                                    existing=existing_edges,

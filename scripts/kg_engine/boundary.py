@@ -22,11 +22,13 @@ if TYPE_CHECKING:  # import only for typing; the boundary duck-types .verifies/.
 from .model import (
     AuthoredBy,
     Confidence,
+    DEFAULT_MAX_EDGES_PER_KB,
     Disposition,
     Edge,
     EpistemicState,
     FAILURE_STATES,
     GROUNDABLE_STATES,
+    MIN_SPAN_CHARS,
     Node,
     Provenance,
     UNDECLARED_TYPE,
@@ -35,15 +37,12 @@ from .model import (
     slug,
 )
 
-# A span must be a verbatim anchor, not a degenerate one: a 1-char span ('a') is a substring of
-# almost any prose and meets span-present letter-of-the-law while citing nothing. Require a minimum
-# of real (non-whitespace) characters so the structural guarantee stays meaningful (§1.5).
-MIN_SPAN_CHARS = 4
-
-# Anti-injection-flooding rate limit (§Stage 9): a hostile or oversized source must not be able to
-# stuff the canon with unbounded edges. The budget scales with source size but has a floor so normal
-# small corpora are never affected; writable edges past the budget are REJECTED `rate-limited-flood`.
-DEFAULT_MAX_EDGES_PER_KB = 20.0
+# MIN_SPAN_CHARS / DEFAULT_MAX_EDGES_PER_KB are single-homed in model.py since review-r6 (see the
+# note there: server.py needs them at import time, and this module's pydantic import must stay off
+# the read-only hook path). Re-imported above so `boundary.MIN_SPAN_CHARS` /
+# `boundary.DEFAULT_MAX_EDGES_PER_KB` keep working for every existing importer.
+# The flood budget has a floor so normal small corpora are never affected; writable edges past the
+# budget are REJECTED `rate-limited-flood`.
 MIN_EDGE_BUDGET = 64
 
 

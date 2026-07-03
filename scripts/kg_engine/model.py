@@ -82,6 +82,19 @@ FAILURE_STATES = {EpistemicState.REJECTED, EpistemicState.FAILED}
 # a consumer that had re-typed ("failed", "rejected") by hand (review-r5).
 FAILURE_STATE_VALUES = frozenset(s.value for s in FAILURE_STATES)
 UNDECLARED_TYPE = "undeclared-type"
+# The two boundary numbers server.py needs at import time — single-homed HERE (not boundary.py, their
+# original home) since review-r6: importing them from boundary made the read-only PreToolUse hook pay
+# boundary's pydantic import (~75ms) on every Grep/Glob/Read for two plain constants. boundary.py
+# re-imports them, so its validation logic and every existing `from .boundary import ...` site are
+# unchanged.
+# A span must be a verbatim anchor, not a degenerate one: a 1-char span ('a') is a substring of
+# almost any prose and meets span-present letter-of-the-law while citing nothing. Require a minimum
+# of real (non-whitespace) characters so the structural guarantee stays meaningful (§1.5).
+MIN_SPAN_CHARS = 4
+# Anti-injection-flooding rate limit (§Stage 9): a hostile or oversized source must not be able to
+# stuff the canon with unbounded edges. The budget scales with source size; its floor
+# (MIN_EDGE_BUDGET) lives in boundary.py next to the budget logic that applies it.
+DEFAULT_MAX_EDGES_PER_KB = 20.0
 # The three shared provenance axes that must be unwrapped from Enum to str on egress (§1.3). Stated
 # once so Edge.to_dict and Node.frontmatter cannot drift; a raw Enum leak here would break the
 # projector's json.dumps(frontmatter) content hash. Edge adds `confidence` on top of these.

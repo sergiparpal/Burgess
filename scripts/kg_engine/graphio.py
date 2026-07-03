@@ -12,13 +12,17 @@ projector, harness, and generate all import DOWNWARD, so the `projector <-> harn
 Depends only on networkx + the stdlib; nothing in `kg_engine` is imported here, so this module can never
 participate in a cycle. The two helpers wrap the `edges="links"` keyword whose default flipped across
 NetworkX versions, so the engine's serialization stays byte-stable regardless of the installed version.
+
+networkx itself is imported lazily INSIDE the two (de)serialization helpers (review-r6:
+hook-import-tax): the projector imports this leaf at module scope, and the PreToolUse hook imports
+the projector on every Grep/Glob/Read — a module-level networkx import here would put its ~70ms back
+on that hot path no matter what the projector defers.
 """
 from __future__ import annotations
 
-import networkx as nx
-
 
 def node_link_data(G) -> dict:
+    import networkx as nx  # deferred — see the module docstring (review-r6: hook-import-tax)
     try:
         return nx.node_link_data(G, edges="links")
     except TypeError:
@@ -33,6 +37,7 @@ _node_link_data = node_link_data
 
 
 def node_link_graph(data: dict):
+    import networkx as nx  # deferred — see the module docstring (review-r6: hook-import-tax)
     try:
         return nx.node_link_graph(data, edges="links", directed=data.get("directed", True))
     except TypeError:

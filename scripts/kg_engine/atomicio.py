@@ -63,7 +63,8 @@ _fsync_dir = fsync_dir
 
 
 def atomic_write_bytes(
-    path: Path, data: bytes, *, mkparents: bool = True, fsync_dir: bool = True
+    path: Path, data: bytes, *, mkparents: bool = True, fsync_dir: bool = True,
+    durable: bool = True,
 ) -> None:
     """Write ``data`` to ``path`` atomically (temp + fsync + ``os.replace``).
 
@@ -71,6 +72,12 @@ def atomic_write_bytes(
     rename so the directory entry is durable too. Callers that know the parent already exists
     and do not need directory durability (e.g. the bootstrap readiness pointer/stamp) pass both
     ``False`` to keep the write minimal.
+
+    ``durable=False`` skips BOTH fsyncs (file and directory) while keeping the temp +
+    ``os.replace`` atomicity: readers still never observe a torn file; only crash durability is
+    given up. For state whose loss on a power cut is already an accepted outcome — the divergence
+    session zone (I10) pays several fsync pairs per ingest for files that are wiped on the next
+    session anyway (review-r6).
     """
     path = Path(path)
     if mkparents:
@@ -80,7 +87,8 @@ def atomic_write_bytes(
         with os.fdopen(fd, "wb") as f:
             f.write(data)
             f.flush()
-            os.fsync(f.fileno())
+            if durable:
+                os.fsync(f.fileno())
         # Preserve the destination's existing permission bits across the inode-replacing os.replace.
         # mkstemp fixes the temp at 0o600, so without this every write would silently reset the canon
         # note (a "human-editable" vault file) to owner-only, stripping any group/other bit a user or
@@ -91,7 +99,7 @@ def atomic_write_bytes(
         except OSError:
             pass  # destination absent (new file) or chmod unsupported — keep the mkstemp default
         _replace_with_retry(tmp, path)
-        if fsync_dir:
+        if durable and fsync_dir:
             # the public bool kwarg `fsync_dir` shadows the module function of the same name inside
             # this body — call the module-level alias to make the rename itself durable.
             _fsync_dir(path.parent)
@@ -112,8 +120,10 @@ def atomic_write_text(
     mkparents: bool = True,
     fsync_dir: bool = True,
     encoding: str = "utf-8",
+    durable: bool = True,
 ) -> None:
     """Atomic text write — ``atomic_write_bytes`` over ``text.encode(encoding)``."""
     atomic_write_bytes(
-        Path(path), text.encode(encoding), mkparents=mkparents, fsync_dir=fsync_dir
+        Path(path), text.encode(encoding), mkparents=mkparents, fsync_dir=fsync_dir,
+        durable=durable,
     )
