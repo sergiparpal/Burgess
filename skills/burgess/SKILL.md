@@ -152,5 +152,5 @@ Keep this guide tight; full detail lives in `references/` and is read only when 
   and the eval gate thresholds,
 - the deterministic CLI cheatsheet (`f4_probe.py`, `kg_engine.pack`, `kg_engine.harness`).
 
-The authoritative data model is `ARCHITECTURE.md` and the engine source under `scripts/kg_engine`.
-When in doubt about a field or symbol, grep the engine rather than guessing.
+The authoritative data model is the engine source under `scripts/kg_engine` (start at `model.py`
+and `boundary.py`). When in doubt about a field or symbol, grep the engine rather than guessing.

@@ -908,7 +908,7 @@ class KGEngine:
         """The node counterpart of `_promote_hypothesis`: a hypothesized NODE (a generated compression
         node / primitive from the propose lane) earns grounding only with support, which UPGRADES its
         provenance. A Node has no `span`/`notes` field, so the support is restated into the node BODY (the
-        only persisted free-text — ARCHITECTURE: "Body prose … may restate cited spans") rather than a
+        only persisted free-text — body prose may restate cited spans) rather than a
         stray span attr. Mutates `node` in place on success and returns (promoted_to, None); on a refusal
         it leaves the node UNTOUCHED and returns (None, error). `support_span` (a verbatim source
         substring) → span-present; `support_note` (an external citation) → inferred; neither →

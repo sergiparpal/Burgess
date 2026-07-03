@@ -1,7 +1,7 @@
 # The WRITE / BOUNDARY contract (reference)
 
 The precise specification the extractor and grounders bind to. This mirrors the engine source
-(`scripts/kg_engine/boundary.py`, `model.py`) and `ARCHITECTURE.md`. When the prose here and the engine
+(`scripts/kg_engine/boundary.py`, `model.py`). When the prose here and the engine
 ever disagree, the engine wins — grep `scripts/kg_engine/` rather than guessing.
 
 `mcp__plugin_burgess_burgess__kg_write(payload)` is the ONLY path from language into the canon. It writes nothing
@@ -111,8 +111,9 @@ Written, but one axis was downgraded. Reasons (joined by `;` when several fire):
   in-process parser is deterministic; a write can't self-declare it to skip the span-present check (§5),
   so the edge then needs a verifying span like any agent edge.
 
-(`ARCHITECTURE.md` also lists a span-present→inferred provenance demotion at the boundary; the agent
-extractor should not rely on it — claim only what the span supports.)
+(The boundary leaves `provenance` exactly as the payload declared it — a verifying span never
+auto-promotes `inferred` → `span-present`, and nothing demotes an over-claim for you; claim only
+what the span supports.)
 
 ### QUARANTINED
 Structurally valid but untrusted; not merged into trusted canon, routed to the `undeclared-type` bucket.

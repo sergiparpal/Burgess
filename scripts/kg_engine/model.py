@@ -1,7 +1,8 @@
 """Core data model for the canon: the three axes, Node/Edge, span verification, frontmatter I/O.
 
 This module is dependency-free (stdlib + pyyaml) and is the spine every other module binds to.
-See ARCHITECTURE.md for the full contract.
+The write/boundary contract built on it is mirrored in skills/burgess/references/contract.md;
+this code is authoritative.
 """
 from __future__ import annotations
 
@@ -135,7 +136,7 @@ def normalize_text(s: str) -> str:
     # ABOVE), a non-NFC sequence that NFC — already applied above, and not idempotent across casefold —
     # will NOT recompose back to a bare 'i'. So a source written with 'İ' would fold to a 9-char form
     # that a lowercased verbatim span ('istanbul') can't substring-match, falsely rejecting an honest
-    # span (the §1.5 gate promises case-insensitive matching, ARCHITECTURE.md). Fold it to 'i' BEFORE
+    # span (the §1.5 gate promises case-insensitive matching). Fold it to 'i' BEFORE
     # casefold (so the spurious combining dot is never introduced); applied to span and source alike
     # via this shared function, so the symmetry the substring test relies on holds.
     s = s.replace("İ", "i")

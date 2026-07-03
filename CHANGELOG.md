@@ -56,6 +56,14 @@ Fixes from the 2026-07 full-codebase review (review-r4; regression-tested in
 - Depend on `igraph` directly (the `python-igraph` name is a deprecated PyPI
   alias for the same package).
 
+### Docs
+
+- Scrubbed the stale references to the donor's `ARCHITECTURE.md` (deliberately
+  not vendored — see ATTRIBUTION.md) from SKILL.md, `references/contract.md`
+  and two engine comments; the contract.md note on provenance demotion now
+  states what `boundary.py` actually does (provenance is left exactly as
+  declared). Added `CLAUDE.md` (repo guide for Claude Code).
+
 ### Tests
 
 - New `tests/test_review_r4.py` regression file (12 tests) covering all of the
