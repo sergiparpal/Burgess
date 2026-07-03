@@ -39,7 +39,7 @@ from .model import FAILURE_STATE_VALUES, edge_id
 _FAILURE_VALUES = FAILURE_STATE_VALUES  # single vocabulary home in model (review-r5)
 
 # The mechanism vocabulary. The DEFAULT_SET is what `/kg-generate` runs unless the user opts into all
-# six (PLAN Stage 6 non-blocking survey). "all" runs ALL_SET.
+# seven (PLAN Stage 6 non-blocking survey). "all" runs ALL_SET.
 DEFAULT_SET = ["bridge", "seed", "compression"]
 # `periphery` (§5, low-degree sources) is ALL-only: it deliberately stays OUT of DEFAULT_SET so the
 # default `/kg-generate` slate — and every golden expectation built on it — is byte-identical, exactly
