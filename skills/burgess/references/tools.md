@@ -1,8 +1,11 @@
 # Reference: tools & CLIs
 
-Load on demand. The MCP **tool surface** (graph mutation + read), then the deterministic **CLI surface**
-(`f4_probe.py`, `kg_engine.pack`, `kg_engine.harness`). Every name, signature, and return shape below
-mirrors `scripts/kg_engine/server.py` + `scripts/kg_engine/projector.py`. Nothing here is invented — if a
+Load on demand. The MCP **tool surface** — the twenty graph tools (§1), then the seven divergence-surface
+tools (§1B) — then the deterministic **CLI surface**
+(`f4_probe.py`, `kg_engine.pack`, `kg_engine.harness`, `kg_engine.divergence`). Every name, signature, and
+return shape below
+mirrors `scripts/kg_engine/server.py` + `scripts/kg_engine/projector.py` (+ `scripts/kg_engine/divergence/`
+for §1B). Nothing here is invented — if a
 field is missing, grep the engine source, don't guess. Every tool is also wrapped by a uniform
 transport-error envelope: a RAISED internal exception (not a deliberate domain `{ok:false}` disposition)
 returns `{"ok": false, "error": "<message>", "error_kind": "<ExceptionType>"}` and is logged, so a tool
@@ -18,6 +21,7 @@ plugin and the server are named `burgess`, so every tool is `mcp__plugin_burgess
 graph tools — the verify/read tools (§1.1–§1.11, including `kg_merge` §1.5b and the read-only egress
 `kg_explain_path` §1.10b) plus the four generative-layer tools (§1.12–§1.15)
 plus the read-only `kg_agenda` (§1.16), `kg_export` (§1.17), and the projection-free `kg_status` (§1.18).
+The seven **divergence-surface** tools (§1B) complete the server's **twenty-seven**.
 There is no `kg_build` / `kg_query` /
 `kg_project` MCP tool — those are slash commands (`/kg-build`, …) that *orchestrate* these tools.
 
@@ -384,7 +388,7 @@ Returns the `kg_write` shape plus two fields:
 `refused_text_claims` counts the call-site `propose-lane-text-claim` refusals (folded into `details[]` and the
 `REJECTED` count).
 
-### 1.13 `mcp__plugin_burgess_burgess__kg_generate(mechanism="bridge", k=10, second_graph=None)`
+### 1.13 `mcp__plugin_burgess_burgess__kg_generate(mechanism="bridge", k=10, second_graph=None, dpp=None)`
 
 The **discovery engine** (PLAN Stage 3). **READ-ONLY** — projects if stale, reads precomputed ranks O(1),
 dispatches to the chosen mechanism, and returns ranked candidates. It never writes; `/kg-generate` routes the
@@ -397,6 +401,17 @@ candidates through `kg_propose`.
 - `k: int = 10` — max candidates returned (ranked).
 - `second_graph: str | None` — path to a second construction's `graph.json` for `ensemble`; without one,
   `ensemble`/`all` **degrades to `regroup`** and says so in `note` (run `/kg-perturb` to supply one).
+- `dpp: bool | None = None` — the **advisory-DPP presentation** (I5). `None` falls back to the pack's
+  `divergence.dpp` (default **off**). When ON and >1 candidate came back, the SAME candidate set is
+  reordered by hybrid-descriptor DPP — one semantic axis (batch k-NN novelty over candidate embeddings)
+  plus three graph-structural axes (`community` intra/cross, endpoint `graph_distance`, `grounded_mix` of
+  the neighborhood) — and a `divergence_advisory` block is added: `{applied, order:"dpp", axes,
+  candidates:[{bins, semantic_novelty, cliche_distance}], cliche_hubs, pool, note}`. `cliche_distance` is
+  distance from the graph's "center" (the top-6 grounded-degree hubs — the structural cliché map);
+  only the first 200 candidates enter the DPP pool (the rest keep mechanism order, reported via
+  `beyond_cap_kept_in_donor_order`). **Advisory ceiling, snapshot-enforced:** same candidates, same
+  scores, bit-identical grounding downstream; if the divergence deps are unavailable the deterministic
+  mechanism ranking is kept and `note` says why (I9).
 
 ```json
 {"mechanism": "bridge", "k": 10, "gate_on": 0, "count": 2, "note": "",
@@ -532,6 +547,142 @@ Unlike `kg_metrics` (§1.6) this NEVER opens the derived db. Granted to `/kg-bui
 
 ---
 
+## 1B · The divergence surface (`kg_diverge_*`) — seven tools
+
+The divergence engine (`scripts/kg_engine/divergence/` — embedder, MAP-Elites archive, k-NN novelty, DPP
+slates, anti-collapse monitor) runs inside the same MCP server as seven tools. They sit **below the
+grounding boundary**: geometry affects what is proposed and in what order, never what is true (I5); nothing
+under `divergence/` can set or upgrade an epistemic state (I3, import-firewalled); and every `kg_*` graph
+tool keeps working when the divergence deps are blocked (I9) — a `kg_diverge_*` call then returns a
+provisioning error to relay verbatim.
+
+**State layout** — project-local under `.kg/diverge/<project-slug>/` (base dir: `$KG_DIVERGE_HOME` if set,
+else `$KG_PROJECT_DIR`, else cwd):
+
+```text
+meta.json  axes.json  session.json  materialized.json     durable
+session/                                                  EPHEMERAL (I10)
+  archive.json          MAP-Elites niches + counts
+  candidates.json       id -> candidate record
+  embeddings.npz        surface vectors (binary npz)
+  mech_embeddings.npz   open-axis/mechanism vectors (npz)
+  open_nicher.json      the open-axis Voronoi partition
+memory/<domain-slug>/                                     durable
+  pins.json  discards.json  comparisons.jsonl
+```
+
+**Session rule (I10):** `kg_diverge_init` with a NEW (or omitted) `session` id wipes `session/` plus the
+geometry-coupled meta series (cycle count, cosine/novelty windows, erosion streak, gap log); re-passing the
+SAME id resumes it. Pins, discards, comparisons and the `materialized.json` ledger always survive — the
+knowledge graph, not the archive, is the durable store.
+
+### 1B.1 `kg_diverge_init(project, axes=None, seed=0, session=None)`
+
+Begin/resume a divergence session for a brief. `axes` resolves by cascade: an inline axes dict → a path or
+shipped template name (`pack/domains/*.yaml`, `pack/domains/examples/*.yaml`) → `None`, which prefers the
+pack's `divergence:` section and falls back to `pack/domains/generic.yaml`. Also syncs materialized fates
+(see §1B.7): any previously materialized pin whose canon node/edge has landed in `FAILURE_STATES`
+(`rejected`/`failed`) is folded into this brief's **discards** (unified negative memory, I8) and reported.
+
+```json
+{"ok": true, "domain": "generic", "reset": false, "session_id": "sess-…", "new_session": true,
+ "paths": {"state_dir": "…/.kg/diverge/cold-brew-launch"}, "materialized_failures_discarded": []}
+```
+
+### 1B.2 `kg_diverge_ingest(project, candidates, axes=None, seed=0)`
+
+One divergence cycle: embed → near-duplicate dedupe → MAP-Elites placement → k-NN novelty → DPP slate,
+with the monitor reading the round. Candidate shape (see `/kg-diverge` step 6):
+`{id, text, descriptor: {<axis>: value, …, mechanism: "…"}, fitness?, genealogy: {operator_id, parents}}`.
+
+```json
+{"slate": [{"id": "c3", "text": "…", "coords": {"angle": "…"}, "niche_id": "…", "novelty": 0.41,
+            "mechanism_novelty": 0.38, "fitness": 0.8}],
+ "ask_pairs": [["c3", "c7"]], "ask_policy": "refine",
+ "monitor": {"collapsing": false, "under_generation": false, "variety_eroding": false,
+             "mean_cosine": 0.34, "entropy": 0.82},
+ "parents": [], "slate_mechanism_novelty": 0.44, "open_axis": {"frozen": false, "n": 9}}
+```
+
+Field honesty: `novelty` is mean k-NN cosine distance (k=5) to THIS SESSION's own ideas — a variety proxy,
+never originality against the world; `mechanism_novelty` is the same for the open-axis value. `monitor`
+flags are advisory notices (react per `/kg-diverge` step 9). When the axes set `engine: {gap_probe: true}`
+the result also carries a `surface_mechanism_gap` block (measurement only).
+
+### 1B.3 `kg_diverge_remember(project, event)`
+
+Append one durable preference event: `{"type": "pin", "id": …}` · `{"type": "discard", "id": …}` ·
+`{"type": "comparison", "winner": …, "loser": …}`. Pins are the strongest signal (always parents, recalled
+across sessions, materializable); a discard is durable negative memory (never re-slated, never bred from;
+re-pinning un-discards). Returns `{ok, type, …}`.
+
+### 1B.4 `kg_diverge_parents(project, k=4, seed=0)`
+
+Diverse stepping stones for the next generation, DPP-selected from the archive — pins ALWAYS included,
+discards NEVER. Returns `{"parents": [{id, text, coords, niche_id, novelty, pinned}]}`.
+
+### 1B.5 `kg_diverge_metrics(project)`
+
+Archive health: `{entropy, mean_cosine, coverage, n, mechanism_spread, mechanism_n, open_axis}` (+
+`gap_log` when the gap probe is on).
+
+### 1B.6 `kg_diverge_recall(project, k=10)`
+
+The brief's preference memory, for injection into generation: `{domain, preferences, pins, discards,
+summary: {n_comparisons, win_counts, preferred_values}}`. Like `init`, it first syncs materialized fates
+(I8) — generate AWAY from `discards`, FROM `pins`.
+
+### 1B.7 `kg_diverge_materialize(project, candidate_ids=None, node_type="claim", edges=None)`
+
+The **explicit door** from divergence into the graph — the ONLY way an idea leaves `.kg/diverge/`.
+Materializes pinned ideas (`candidate_ids` defaults to all pins) as nodes routed **exclusively through the
+propose lane** (`kg_propose` → the same boundary as every write):
+
+- Only **pinned** candidates with a live session record materialize; a non-pinned id is `refused`
+  (`not-pinned`); a pin whose session record is gone (I10) is `skipped` (`no-session-record` — re-ingest it
+  first).
+- Node id `idea-<project-slug>-<candidate-slug>`; the body carries the full lineage:
+  `[diverge] pinned candidate=<id> brief=<project> session=<id> mechanism=<open-axis value>
+  operator=<genealogy.operator_id>`.
+- The boundary forces `provenance=hypothesized`, `epistemic_state=unverified`, `authored_by=agent` — a
+  materialized pin earns promotion only via `kg_ground` with support, like any hypothesis.
+- Optional `edges` link the new nodes to existing ones and transit the same boundary (text-claim provenance
+  refused, forged verdicts stripped).
+- The `materialized.json` ledger maps each candidate to its written nodes/edges; if grounding later FAILS
+  one, the next `init`/`recall` auto-discards it from the brief (I8). The sync only *reads* verdicts —
+  verdicts stay `kg_ground`'s monopoly.
+
+```json
+{"ok": true, "materialized": 2,
+ "results": [{"candidate": "c3", "status": "materialized", "node": "idea-cold-brew-launch-c3"},
+             {"candidate": "c9", "status": "skipped", "reason": "no-session-record"}],
+ "propose": {"dispositions": {"ACCEPTED": 2}, "…": "…"}}
+```
+
+### Engine constants (drift-guarded by tests)
+
+- **Embedder** (`KG_DIVERGE_EMBEDDER`): `static` (default) = model2vec `minishlab/potion-multilingual-128M`
+  — 256-dim, CPU/numpy, torch-free, ~120 MB, lazily downloaded, cached under `$HF_HOME` (pointed at
+  `$KG_DATA/models` when unset); `hash` = deterministic 512-dim char-n-gram vectorizer (tests/offline
+  escape hatch — an unavailable static model raises with instructions, it never silently degrades);
+  `local` = sentence-transformers `BAAI/bge-small-en-v1.5` (384-dim, needs torch). Embedding widths may
+  not mix within a project.
+- **Geometry:** k-NN novelty `k=5`; near-duplicate cosine tau per embedder (static 0.93, hash 0.92,
+  local 0.94); DPP pool cap 200; novelty-reference cap 500; open-axis Voronoi niches 24, partition frozen
+  once 2×24 = 48 mechanisms accumulate; continuous axes bin 5 by default.
+- **Judge bounds:** fitness blended at weight 0.3, affine-rescaled and clipped to a [0.7, 1.3] multiplier —
+  it sharpens within-niche ordering, it can never prune variety.
+- **Monitor:** mean-cosine threshold 0.55 (absolute fallback) / entropy threshold 0.50 (≥3 occupied
+  niches) / relative flag at baseline+0.15 with absolute ceiling 0.80, rolling window 5, min baseline 2;
+  variety-erosion sensor: window 5, fires at ≥1.5× decay acceleration for 2 consecutive generations;
+  `under_generation` below 0.6× the per-generation target.
+- Per-domain overrides live in the axes spec's `engine:` block — schema + defaults table in
+  `pack/domains/_schema.md`.
+- **Env:** `KG_DIVERGE_EMBEDDER` (provider), `KG_DIVERGE_HOME` (state base override),
+  `KG_DIVERGE_DEBUG` (tracebacks).
+
+---
+
 ## 2 · Deterministic CLI surface
 
 Run via Bash. **Dev**: repo venv `/home/sergi/Burgess/.venv/bin/python` (or `uv run`). **Runtime**:
@@ -595,9 +746,9 @@ PACK OK: domain='conceptual theory' node_types=6 edge_types=10 glossary=12
 - `glossary_grounded_in_source` — fraction of glossary terms that actually occur in the source (don't invent
   vocabulary the source never uses).
 
-### 2.3 `python -m kg_engine.harness` — agreement · specificity · ideation
+### 2.3 `python -m kg_engine.harness` — agreement · specificity · ideation · convergence
 
-Deterministic measurement over data the subagents produce. Three subcommands, each reads/writes JSON. If the
+Deterministic measurement over data the subagents produce. Four subcommands, each reads/writes JSON. If the
 optional path is missing, each falls back to a built-in demo and notes it on stderr.
 
 #### `agreement [label_sets.json]`
@@ -673,6 +824,51 @@ unsupported_rate` and a `verdict` comparing **graph vs control**:
 ```
 
 The `graph` condition "wins" only if it is `>=` control on diversity AND novelty, **strictly greater** on at least one of them, AND its `unsupported_rate` is no more than `control + 0.05` — i.e. measurably more/better ideas **without** more unsupported claims (an exact tie on both axes is not a win).
+The canonical arm names are `control | graph | graph+generate | graph+generate+dpp | rag | lightrag`; when
+the extra arms are present the output also carries `generate_verdict`, `dpp_verdict`, and
+`lightrag_verdict` under the same win rule.
+
+#### `convergence [generation_labels.json]`
+
+The **convergence gate** for `kg_generate`'s advisory tally. Input: labeled generated edges, each with its
+`convergence` count (distinct mechanisms that proposed it) and its grounding outcome. Compares the grounding
+rate of the HIGH band (`convergence >= 2`) vs the LOW band (`== 1`); `gate_on` is `true` only when the high
+band grounds at a rate more than **0.10** above the low band with enough samples per band. Until then the
+tally stays a display-only prior — it never reorders the grounding queue.
+
+### 2.4 `python -m kg_engine.divergence` — the divergence engine, no MCP needed
+
+The same engine the `kg_diverge_*` tools call, as a CLI (dev/debug; `/kg-diverge` uses the tools):
+
+```bash
+python -m kg_engine.divergence init-project --project <slug> --axes <dict|path|template> [--seed N] [--session ID]
+python -m kg_engine.divergence ingest   --project <slug> --candidates <json> --axes <…> [--seed N]
+python -m kg_engine.divergence recall   --project <slug> [--k 10]
+python -m kg_engine.divergence remember --project <slug> --event <json>
+python -m kg_engine.divergence parents  --project <slug> [--k 4] [--seed N]
+python -m kg_engine.divergence metrics  --project <slug>
+python -m kg_engine.divergence paths    --project <slug>          # print resolved state paths
+python -m kg_engine.divergence selftest [--live] [--seed N]       # exit 1 on failure
+python -m kg_engine.divergence import-cambrian --project <slug> [--from <dir>]
+```
+
+**`selftest`** is the engine's offline correctness contract (hash embedder unless `--live`; also run by the
+suite's `selftest`-marked e2e test). `ok` requires ALL of:
+
+- **variety gate** — the engine beats a single-shot baseline on mean pairwise distance (margin +0.10) AND
+  Vendi score (margin +0.5) AND niche entropy; the DPP slate beats taking the first N (margin +0.01,
+  averaged over 3 seeds); on a uniform pool the DPP does not regress below a random subset (eps 0.02,
+  50 trials); a higher within-niche fitness wins its niche (and swapping flips the elite);
+- **collapse reversal** — a deliberately samey generation trips `collapsing: true`, and the next diverse
+  one recovers with a lower mean cosine;
+- **files written** — the session state files all exist afterwards.
+
+`import-cambrian` maps a pre-fusion project's preference memory (pins, discards, comparisons — per domain,
+read-only on the source, default `~/.cambrian/<project>` or `$CAMBRIAN_HOME`) into
+`.kg/diverge/<slug>/memory/`. Geometry files and `meta.json`/`axes.json` are deliberately NOT imported
+(session-ephemeral by design; re-created by `init`) and are reported as `skipped` so nothing disappears
+silently. Report: `{ok, source, target, imported: {<domain>: {pins, discards, comparisons}}, skipped,
+errors}`.
 
 ---
 
@@ -697,8 +893,16 @@ The `graph` condition "wins" only if it is `>=` control on diversity AND novelty
 | generate structural idea candidates (read-only) | `kg_generate(mechanism=?, k=?, second_graph=?)` |
 | run a §8 endo operation (collapse/explode/regroup/open) | `kg_operate(op, …)` |
 | score the §14 absorption window | `kg_absorption()` |
+| start/resume a divergence session for a brief | `kg_diverge_init(project, axes=?, session=?)` |
+| run one divergence cycle (embed → slate → monitor) | `kg_diverge_ingest(project, candidates, …)` |
+| record a pin / discard / A-vs-B answer | `kg_diverge_remember(project, event)` |
+| diverse stepping stones (pins in, discards out) | `kg_diverge_parents(project, k=?)` |
+| archive health / gap log | `kg_diverge_metrics(project)` |
+| recall a brief's pins/discards/comparisons | `kg_diverge_recall(project)` |
+| carry pinned ideas into the hypothesized lane | `kg_diverge_materialize(project, …)` |
 | score extraction precision | `f4_probe.py summary|sheet|score` |
 | validate the pack / glossary coverage | `kg_engine.pack validate|coverage` |
 | inter-annotator agreement | `kg_engine.harness agreement` |
 | bridge-metric gate verdict | `kg_engine.harness specificity` |
 | value-of-the-graph experiment | `kg_engine.harness ideation` |
+| divergence engine offline correctness contract | `kg_engine.divergence selftest` |

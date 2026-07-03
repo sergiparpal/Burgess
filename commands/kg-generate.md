@@ -23,8 +23,8 @@ semantic novelty, and distance to the graph's "center" (the top grounded hubs, t
 cliché map — the periphery mechanism and cliché-distance are two views of the same
 away-from-center pressure). Present candidates in that order with those labels, exactly like a
 /kg-diverge slate. It is ADVISORY ONLY (I5, snapshot-enforced): same candidates, same scores,
-bit-identical grounding downstream; if the advisory layer is unavailable the donor ordering is
-kept and `note` says why.
+bit-identical grounding downstream; if the advisory layer is unavailable the engine's own
+deterministic mechanism ranking is kept and `note` says why.
 
 A generated candidate enters as `provenance=hypothesized`, `epistemic_state=unverified`, **with no span**.
 It is a *proposal from a discovery mechanism*, never a text claim — stored in a lane that can never be

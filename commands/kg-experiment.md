@@ -127,7 +127,7 @@ generation; this command never sees which arm is which until the JSON comes back
 
 `Task(subagent_type: "kg-evaluator", description: "blind ideation A/B/C/D", prompt: …)` — instruct it to:
 
-1. For **each** of the N prompts, build the context blocks (four donor arms + the dpp arm):
+1. For **each** of the N prompts, build the context blocks (the four base arms + the dpp arm):
    - **control** → no context.
    - **graph** → the result of `mcp__plugin_burgess_burgess__kg_context(query=<prompt>, budget=2000)`, rendered as
      opaque text — the **grounded** `items[]` only. Carry through the pack's `advisory` (e.g.

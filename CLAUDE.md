@@ -19,7 +19,7 @@ Other gates CI runs (all from repo root):
 
 ```bash
 python -m kg_engine.pack validate pack/pack.yaml examples/source.md   # pack ↔ source coverage
-python -m kg_engine.harness agreement|specificity|ideation            # eval harness CLIs
+python -m kg_engine.harness agreement|specificity|ideation|convergence   # eval harness CLIs
 python scripts/validate_plugin.py    # manifest/component structural check (enforces plugin.json version == kg_engine.__version__)
 claude plugin validate ./ --strict   # real plugin validator (best-effort in CI)
 python scripts/check_donors_clean.py # donor pin gate — see "Donors" below; installed as local pre-commit hook
@@ -75,7 +75,7 @@ Burgess was fused from two pinned donor repos expected as siblings: `../Sproutgr
 ## Conventions and gotchas
 
 - Comments and docs cite plan sections (`§1.5`, `§2.2`) and invariant/decision IDs (`I1`–`I11`, `D1`–`D5`). The decision record lives in `docs/fusion/` (FUSION_PLAN.md, DECISIONS.md, PLAN_STATE.md, EXPERIMENT.md, ATTRIBUTION.md) — consult it before changing invariant-adjacent behavior; code comments here carry rationale, keep that density when editing.
-- The donor's `ARCHITECTURE.md` was deliberately not vendored (`docs/fusion/ATTRIBUTION.md`) — the engine source is the authority. When in doubt about a field or symbol, grep `scripts/kg_engine` rather than guessing.
+- `docs/ARCHITECTURE.md` is the self-contained architecture reference (no donor doc was ever vendored — see `docs/fusion/ATTRIBUTION.md`). The engine source stays the final authority: when in doubt about a field or symbol, grep `scripts/kg_engine` rather than guessing, and keep ARCHITECTURE.md in sync when invariant-adjacent behavior changes.
 - Runtime/session state at the project root (`.kg/`, `.kg-ground-audit.jsonl*`, `.kg-reconcile-state.json`, `derived/`) is gitignored engine state, never canon.
 - `canon/*.md` routes through the `kgcanon` semantic merge driver (`.gitattributes`); activation is an opt-in `git config` per clone (see the comment in `.gitattributes`).
 - Engine env contract (`.mcp.json`): `KG_PROJECT_DIR`, `KG_DATA`, `KG_PACK_PATH`, `KG_SOURCE_PATH`; `KG_ENGINE_VENV` overrides the venv; divergence knobs are `KG_DIVERGE_*`; the optional lightrag experiment arm needs the `lightrag` extra + `KG_LIGHTRAG=1` + `OPENAI_API_KEY`.

@@ -42,8 +42,8 @@ into the graph plugin's trust boundary:
 | State in `~/.cambrian/<project>/` | Project-local `.kg/diverge/<brief-slug>/` (git-friendly) |
 | MAP-Elites archive persists across sessions | **Session-ephemeral** (I10): a new session wipes the geometry archive; pins, discards and comparisons persist. The knowledge graph is the durable archive — pin what matters, materialize it. |
 | `CAMBRIAN_EMBEDDER` / `CAMBRIAN_HOME` / `CAMBRIAN_DEBUG` | `KG_DIVERGE_EMBEDDER` / `KG_DIVERGE_HOME` / `KG_DIVERGE_DEBUG` |
-| Domain configs `config/domains/*.yaml` | Pack fragments `pack/domains/*.yaml` (same schema), or a `divergence:` section inside `pack.yaml` |
-| `python -m cambrian_engine selftest` | `python -m kg_engine.divergence selftest` (same gates, same margins) |
+| Domain configs `config/domains/*.yaml` | Pack fragments `pack/domains/*.yaml` (schema + engine-tuning defaults: `pack/domains/_schema.md`), or a `divergence:` section inside `pack.yaml` |
+| `python -m cambrian_engine selftest` | `python -m kg_engine.divergence selftest` — the same correctness contract: variety gate (engine beats single-shot on mean pairwise distance +0.10, Vendi +0.5, and entropy; DPP beats first-N +0.01), null no-regression check, within-niche fitness check, collapse-trip-and-reversal, state files written (gate details: `skills/burgess/references/tools.md` §2.4) |
 | — | New: pinned ideas can **materialize** into the graph's hypothesized lane and earn grounding (or permanent falsification, which auto-discards them from the brief) |
 
 **Preference memory importer** (one-shot, read-only on the source):
@@ -55,11 +55,19 @@ python -m kg_engine.divergence import-cambrian --project <brief-slug> \
 
 Pins, discards, and A-vs-B comparisons are mapped per domain into
 `.kg/diverge/<brief-slug>/memory/`. Geometry files (`archive.json`,
-embeddings, open-nicher) are deliberately NOT imported — session-ephemeral by
+`candidates.json`, `embeddings.json`, `mech_embeddings.json`,
+`open_nicher.json`) are deliberately NOT imported — session-ephemeral by
 design — and `meta.json`/`axes.json` are re-created by `kg_diverge_init`; the
-importer reports both as `skipped` so nothing disappears silently.
+importer reports both as `skipped` so nothing disappears silently. It is
+read-only on the source and reports
+`{ok, imported: {<domain>: {pins, discards, comparisons}}, skipped, errors}`.
 
-Judge bounds (weight 0.3, fitness clip [0.7, 1.3]), monitor thresholds
-(0.55 / 0.50 / +0.15 ceiling 0.80), k-NN k=5, DPP pool cap 200, open-axis
-niching 24×2, dedup taus, and the embedder id are the donor's constants,
-verbatim, drift-guarded by tests.
+The engine constants carried over unchanged, drift-guarded by tests: judge
+fitness blended at weight 0.3 and clipped to a [0.7, 1.3] multiplier; monitor
+thresholds mean-cosine 0.55 / entropy 0.50 / relative margin +0.15 with
+ceiling 0.80; k-NN novelty k=5; DPP pool cap 200; open-axis Voronoi niching
+24 cells frozen after 2×24 mechanisms; per-embedder near-duplicate taus
+(static 0.93, hash 0.92, local 0.94); embedder `potion-multilingual-128M`.
+The full constants table with per-domain overrides lives in
+`pack/domains/_schema.md`; the tool-by-tool reference in
+`skills/burgess/references/tools.md` §1B.

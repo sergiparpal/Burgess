@@ -75,6 +75,8 @@ Plus everything the convergence side always did: `/kg-build`, `/kg-query`, `/kg-
 
 The knowledge-graph spine: canon = one human-editable Markdown file per node (git-mergeable, semantic merge driver); derived = regenerable NetworkX/SQLite projections; MCP server (`burgess`, 27 tools) is the trust boundary; six subagents (extractor, grounder, adversarial-grounder, generator, annotator, evaluator) do the language work; the engine stays deterministic.
 
+The full, self-contained architecture reference — module map, data model, write-boundary contract, tool surface, divergence internals and constants, runtime and environment — is [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
 ## What this does not guarantee
 
 In the spirit of both donors, honestly:

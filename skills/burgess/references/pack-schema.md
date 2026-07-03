@@ -25,9 +25,11 @@ From `pack.py`, `class PackContract(BaseModel)`:
 | `edge_types`         | `list[str]`         | **`min_length=1`**, unique, non-empty names | the only relation types the boundary will ACCEPT |
 | `glossary`           | `dict[str, str]`    | default `{}`                                | `term -> definition` |
 | `specificity_seeds`  | `dict[str, float]`  | default `{}`                                | `term -> IDF-like score` (higher = rarer/more specific) |
+| `divergence`         | `dict \| None`      | OPTIONAL; shape-checked (see §2b)           | descriptor axes + `dpp` flag for the divergence side |
 
 `extra="forbid"` means an unknown top-level key (typo, stray field) makes the pack **invalid** — the
-loader raises and `validate` prints `PACK INVALID: ...` (exit 1). The `_nonempty_unique` validator runs
+loader raises and `validate` prints `PACK INVALID: ...` (exit 1); the seven keys above are the whole
+declared vocabulary. The `_nonempty_unique` validator runs
 on both type lists: a duplicate type → `types must be unique`; a blank/whitespace type → `type names must
 be non-empty`. Two further validators also reject a pack: a name appearing in both `node_types` and `edge_types` → `a type may not be both a node_type and an edge_type`; and a non-finite `specificity_seeds` value (NaN/inf) → `specificity seeds must be finite numbers`.
 
@@ -91,6 +93,38 @@ specificity" is *not* a verifiable span.)
 `betweenness`, `specificity-weighted betweenness`, `degree`, `failed`, `negative information`, `canon`,
 `derived`. `pack.yaml:glossary` is the *authoritative* machine copy; `pack/glossary.md` is the
 human-readable companion.
+
+---
+
+## 2b. The optional `divergence:` section
+
+One pack carries both vocabularies: the extraction types above AND (optionally) the divergence
+side's descriptor axes. A pack without a `divergence:` section works untouched — `/kg-diverge`
+then falls back to the neutral `pack/domains/generic.yaml` template, and the advisory-DPP flag
+defaults off.
+
+```yaml
+divergence:
+  dpp: false                      # advisory DPP ordering of /kg-generate slates (default off)
+  unit_of_generation: idea        # idea | concept | hypothesis | name | feature | ...
+  axes:                           # 4-6 descriptor axes; exactly one open/primary_novelty axis
+    - {name: angle, type: categorical}
+    - {name: boldness, type: continuous, range: [0.0, 1.0]}
+    - {name: mechanism, type: open, primary_novelty: true}
+  slate_size: 6                   # ideas surfaced per cycle
+  candidates_per_generation: 12   # ideas the agent drafts per cycle
+  engine: {}                      # OPTIONAL per-domain engine-tuning overrides
+```
+
+The full axis/engine schema — axis types, validation rules, and the engine-knob defaults table —
+is `pack/domains/_schema.md`; shipped domain templates (the same shape, minus `dpp`) live at
+`pack/domains/generic.yaml` and `pack/domains/examples/*.yaml`.
+
+Validation split (the I3 import firewall): `pack.py` itself only **shape-checks** the section — if
+`axes` is present it must be a non-empty list of named mappings, and `dpp` must be a boolean —
+so loading a pack never imports the divergence engine. Deep validation (axis types, ranges,
+duplicate names, the single-`primary_novelty` rule, `engine:` bounds) happens in
+`divergence/config.py` when `/kg-diverge` or the advisory-DPP path actually resolves the axes.
 
 ---
 

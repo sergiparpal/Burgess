@@ -18,7 +18,8 @@ A conceptual document does not verify itself the way code verifies against a par
 (`examples/source.md` §intro). A naive extractor turns such prose into convincing nonsense.
 This plugin extracts a graph, then forces every non-trivial edge to earn its place against the
 *original text* and against adversarial attack. A deterministic Python engine (`scripts/kg_engine`,
-733 tests green) does the rule-bound work; this session and its subagents do the LANGUAGE work and
+pinned by the ~1000-test suite — the README carries the generated count) does the rule-bound work;
+this session and its subagents do the LANGUAGE work and
 hand structured JSON back across the MCP boundary. Your job is to orchestrate, not to forge.
 
 ## The model: canon vs derived (§1.2)
@@ -68,7 +69,8 @@ afterward. The portico moved from the door of imagination to after generation.
 5. **`/kg-eval`** — run the deterministic gates: extraction precision (`f4_probe.py score`, gate
    ≥ 0.70), inter-coder agreement (`harness agreement`, Krippendorff α ≥ 0.67), and the
    bridge-metric gate (`harness specificity`). **kg-annotator** drives these and reports verdicts.
-6. **`/kg-experiment`** — control \| graph \| graph+generate \| rag ideation comparison via `harness ideation`.
+6. **`/kg-experiment`** — control \| graph \| graph+generate \| graph+generate+dpp \| rag ideation
+   comparison via `harness ideation`.
 
 ## Who does what
 
@@ -146,11 +148,17 @@ Use only these in extraction. Glossary and per-term specificity seeds live in `p
 ## References (load on demand)
 
 Keep this guide tight; full detail lives in `references/` and is read only when needed:
-- the canon note frontmatter + `edges:` schema and the full `kg_write` payload contract,
-- the boundary disposition decision table and reason strings,
-- the F4-probe label vocabulary (`correct | fabricated | vague | wrong_type`, `span_found: y|n`)
-  and the eval gate thresholds,
-- the deterministic CLI cheatsheet (`f4_probe.py`, `kg_engine.pack`, `kg_engine.harness`).
+- `contract.md` — the canon note frontmatter + `edges:` schema, the full `kg_write` payload
+  contract, and the boundary disposition decision table with reason strings,
+- `tools.md` — every MCP tool's signature and return shape, plus the deterministic CLI
+  cheatsheet (`f4_probe.py`, `kg_engine.pack`, `kg_engine.harness`) and the F4-probe label
+  vocabulary (`correct | fabricated | vague | wrong_type`, `span_found: y|n`) with the eval
+  gate thresholds,
+- `pack-schema.md` — the domain-pack schema (`pack/pack.yaml`), coverage check, and
+  specificity seeds,
+- `operators.md`, `judge_rubric.md`, `axis_inference.md` — the divergence-side language work:
+  variation operators, the validity-only judge rubric, and how to infer descriptor axes from
+  a brief (`/kg-diverge`).
 
 The authoritative data model is the engine source under `scripts/kg_engine` (start at `model.py`
 and `boundary.py`). When in doubt about a field or symbol, grep the engine rather than guessing.

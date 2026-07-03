@@ -1,5 +1,57 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **2026-07 maintainability review (review-r5)**: ~45 findings applied — single
+  homes for duplicated logic (`envconfig`, `dirlock`, `pathing`,
+  `sources.split_sections`, failure-state vocabulary, `node_content_hash`, the
+  derived-layer reader), decompositions of the largest functions (reconciler
+  `scan`, divergence ingest, canon `write_nodes`, `run_generators`, bootstrap
+  install), and clarity renames. Pinned in `tests/test_review_r5.py`
+  (23 tests, including JS↔Python env-resolution parity).
+- **2026-07 performance review (review-r6)**: lazy heavy imports (server import
+  ~190 ms → ~60 ms), binary `.npz` divergence vector stores (legacy `.json`
+  still read, migrated on next write), capped mechanism-spread computation,
+  lazy-row farthest-point selection, stat-gated incremental canon parsing,
+  glossary term cap + SQL LIMIT, and fsync skipped for session-ephemeral state.
+  Pinned in `tests/test_review_r6.py`.
+
+### Fixed
+
+- Completed the I5 clock freeze in the test suite: canon's `utcnow` binding
+  leaked wall time into the frozen-clock snapshot tests.
+
+### Docs
+
+- **`docs/ARCHITECTURE.md`** — new self-contained architecture reference
+  written from the engine source (module map, data model, boundary
+  dispositions, verdict path, derived layer, divergence internals with the
+  shipped constants, tool surface, env contract, provisioning/supervision,
+  invariants). The documentation no longer relies on either donor's docs.
+- `references/tools.md`: new §1B documenting the seven `kg_diverge_*` tools
+  (parameters, return shapes, `.kg/diverge/` state layout, session
+  ephemerality, engine constants) and §2.4 for the
+  `python -m kg_engine.divergence` CLI incl. the selftest gates and importer
+  report; `kg_generate`'s `dpp` parameter and `divergence_advisory` block
+  documented; the harness section now covers all four subcommands
+  (`convergence` was missing) and the full ideation arm list.
+- `references/pack-schema.md`: the optional `divergence:` pack section is now
+  part of the documented `PackContract` (shape-check vs deep-validation split
+  per the I3 firewall); `pack/domains/_schema.md` stale pre-fusion paths
+  (`config/domains/…`) corrected to `pack/domains/…`.
+- `docs/MIGRATION.md` made self-contained: the selftest gates/margins, importer
+  report shape, and every carried-over engine constant are stated in-file
+  instead of deferring to "the donor's" values.
+- SKILL.md: stale hand-written test count removed (the README's generated count
+  is the single home), the `graph+generate+dpp` experiment arm added, and the
+  references index now lists all six reference files.
+- Donor-relative phrasings scrubbed from `commands/kg-generate.md`,
+  `commands/kg-experiment.md`, and `references/contract.md`.
+- `FUSION_PLAN.md` relocated from the repo root to `docs/fusion/`, joining the
+  rest of the fusion decision record.
+
 ## 0.1.1 — 2026-07-03
 
 Patch release: every finding from the 2026-07 full-codebase review (review-r4;

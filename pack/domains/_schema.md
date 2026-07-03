@@ -5,11 +5,12 @@ idea space. Diversity is only meaningful relative to a set of axes; this file is
 how a session declares them. Axes are resolved per session via a cascade:
 
 1. **named** — the user names a domain that has a shipped config in
-   `config/domains/examples/` → load it;
+   `pack/domains/` or `pack/domains/examples/` → load it;
 2. **inferred** — the agent infers 4–6 axes from the brief (see
-   `references/axis_inference.md`) and confirms them with the user, writing an
-   `axes.json` in the same shape as below;
-3. **generic** — neither applies → fall back to `config/domains/generic.yaml`.
+   `skills/burgess/references/axis_inference.md`) and confirms them with the user,
+   passing an inline axes dict in the same shape as below;
+3. **pack / generic** — neither applies → the engine prefers the `divergence:`
+   section of `pack/pack.yaml`, falling back to `pack/domains/generic.yaml`.
 
 All three paths produce the same internal `AxesSpec`. The engine never assumes a
 domain — the resolved axes are always passed in explicitly.
