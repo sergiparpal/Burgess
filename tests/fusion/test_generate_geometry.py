@@ -36,13 +36,24 @@ _EDGES = [
 
 
 def _freeze_clocks(monkeypatch):
+    """Freeze EVERY module-level `utcnow` binding the grounding flow stamps bytes through.
+
+    `from .model import utcnow` gives each importer its OWN binding, so patching model alone
+    covers only calls resolved in model's namespace — every importing module must be patched
+    too. canon was missing (ci-flake 2026-07-03): canon.write_nodes stamps `updated_at` into
+    the note frontmatter through its own binding, so whenever the off-arm and on-arm writes
+    straddled a wall-clock second the two canons' BYTES differed and the I5 digest assert
+    failed — a timing flake seen on the slow Windows runner with the engine code unchanged.
+    If a new module ever imports utcnow and stamps persisted bytes, add it here."""
     frozen = lambda: "2026-01-01T00:00:00+00:00"  # noqa: E731
+    import kg_engine.canon
     import kg_engine.groundaudit
     import kg_engine.model
     import kg_engine.server
     monkeypatch.setattr(kg_engine.model, "utcnow", frozen)
     monkeypatch.setattr(kg_engine.server, "utcnow", frozen)
     monkeypatch.setattr(kg_engine.groundaudit, "utcnow", frozen)
+    monkeypatch.setattr(kg_engine.canon, "utcnow", frozen)
 
 
 def _build(tmp_path, name):
