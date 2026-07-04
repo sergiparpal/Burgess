@@ -32,9 +32,27 @@ claude --plugin-dir /path/to/Burgess
 
 On first load a SessionStart hook provisions a local Python venv (Python ≥ 3.11 recommended; `uv` preferred, stdlib `venv`+`pip` fallback) in the plugin's persistent data dir. Everything runs locally; the divergence embedder is [model2vec](https://github.com/MinishLab/model2vec) `potion-multilingual-128M` (CPU, torch-free, ~120 MB, cached after first download).
 
-## Tutorial
+## Quick start
 
-New here, or handing Burgess to a non-technical teammate? **[`TUTORIAL.md`](TUTORIAL.md)** is a complete, plain-language walkthrough of one full creative cycle — brainstorm → capture → build → verify → expand → use — with every slash command explained in the order you'd actually reach for it. No prior knowledge of knowledge graphs, grounding, or the codebase is assumed.
+Installed? This is the whole everyday flow — the commands you'll actually type, in the order you'd reach for them. Run each in Claude Code and steer the rest in plain chat; skip any phase you don't need.
+
+`/kg-diverge` → `/kg-build` → `/kg-ground` → `/kg-generate` → `/kg-query` · `/kg-view`
+
+1. **Brainstorm** *(optional)* — `/kg-diverge <brief>` opens a wide, non-cliché idea slate. **Pin** the keepers in chat, then ask Claude to *materialize* them into the graph as hypotheses. No document required — this half stands alone.
+2. **Build** — `/kg-build <file / folder / glob>` turns your source into a span-anchored graph; everything starts **unverified**. It's additive — run it again with another document to grow the same graph.
+3. **Verify** — `/kg-ground` is the **only** command that can mark anything trusted: it confirms each relationship against a verbatim span in your source. Whatever fails becomes permanent negative memory and is never re-proposed.
+4. **Expand** *(optional)* — `/kg-generate` lets the graph's own structure propose fresh hypotheses (unlinked pairs, neglected concepts, …). Generation never filters — run `/kg-ground` again to judge the new candidates.
+5. **Use** — `/kg-query <question>` answers from the grounded graph with trust levels and provenance attached; `/kg-view` renders an offline `graph.html` + `GRAPH_REPORT.md`.
+
+If you just have a document and a question, that's a three-command first session:
+
+```text
+/kg-build notes/*.md      # build a graph from your source(s)
+/kg-ground                # fact-check it against that source
+/kg-query "<question>"    # ask it — answers carry their provenance
+```
+
+Prefer it in plain language, nothing assumed? The full walkthrough is [`TUTORIAL.md`](TUTORIAL.md); every command's exact arguments are in the [cheat sheet](#command-cheat-sheet) below.
 
 ## The fused pipeline
 
