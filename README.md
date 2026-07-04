@@ -58,19 +58,23 @@ New here, or handing Burgess to a non-technical teammate? **[`TUTORIAL.md`](TUTO
 
 Plus everything the convergence side always did: `/kg-build`, `/kg-query`, `/kg-eval`, `/kg-experiment` (now with a `graph+generate+dpp` arm), `/kg-perturb`, `/kg-view`.
 
-## Commands
+## Command cheat sheet
 
-| Command | What it does |
-|---|---|
-| `/kg-build` | Extract a span-anchored graph from your source document (wave-parallel extractors) |
-| `/kg-ground` | Run the grounding loop: verdicts, promotions with support, permanent failure memory |
-| `/kg-diverge` | Diverge from any brief into a non-cliché slate; pins/discards; optional materialization |
-| `/kg-generate` | Propose hypothesized candidates from graph structure (7 mechanisms; optional DPP presentation) |
-| `/kg-query` | Query the grounded graph (context packs, paths, neighbors, agenda) |
-| `/kg-eval` | Precision/agreement/specificity evaluation harness |
-| `/kg-experiment` | Blind multi-arm ideation experiment (control / graph / graph+generate / graph+generate+dpp / rag) |
-| `/kg-perturb` | Build a second construction and cross-generate against it |
-| `/kg-view` | Render the offline graph.html + report |
+Every slash command, with its arguments. The everyday flow is **diverge → build → ground → generate → query → view**; `/kg-perturb`, `/kg-eval`, and `/kg-experiment` are the optional "going further" commands. Arguments in `<angle brackets>` are **required**; those in `[square brackets]` are **optional** and fall back to a sensible default.
+
+| Command | What it does | The detail in brackets |
+| --- | --- | --- |
+| `/kg-diverge <brief> [domain-template]` | Diverge from a brief into a non-cliché slate; pin/discard in chat; optionally materialize the pins — no graph or source needed | **Required:** your creative brief. *Optional:* a domain template to steer the mechanisms |
+| `/kg-build [source_path] [wave_size]` | Extract a span-anchored graph from your source (wave-parallel extractors); additive to any existing graph | *Optional:* the document / folder / glob to build from (defaults to your `source_path` config); how many sections per parallel wave |
+| `/kg-ground [query-or-node-filter]` | Run the grounding loop — the **only** verdict path: promotions need support, failures become permanent memory | *Optional:* limit it to one topic or node area (defaults to the whole backlog) |
+| `/kg-generate [mechanism-set] [k]` | Propose hypothesized candidates from graph structure (7 mechanisms; optional advisory-DPP order) | *Optional:* which mechanism(s) — `bridge\|seed\|compression\|regroup\|transplant\|ensemble\|periphery`; how many candidates |
+| `/kg-perturb [second_source_or_graph_json]` | Build a second, independent construction and cross-generate to surface bridges your own view would resist | *Optional:* a second document or `graph.json` (defaults to a re-angle of the same source) |
+| `/kg-query <question>` | Answer from the grounded graph, with provenance and falsification counters attached | **Required:** your question |
+| `/kg-view [html\|report\|all]` | Render the offline `graph.html` + `GRAPH_REPORT.md`; read-only — it never changes the graph | *Optional:* which artifact to render (defaults to both) |
+| `/kg-eval [graph.json]` | Measure extractor precision (Stage 4) and grounding reliability (Stage 7) | *Optional:* which `graph.json` to grade (defaults to the current derived graph) |
+| `/kg-experiment [prompts_path]` | Blind multi-arm ideation experiment (control / graph / graph+generate / graph+generate+dpp / rag) | *Optional:* a file of test prompts (defaults to the built-in set) |
+
+Remember: the status check (`kg_ping`) and the other behind-the-scenes MCP tools have **no** slash — just ask Claude for them in plain words.
 
 ## Architecture in six invariants
 
