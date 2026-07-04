@@ -109,7 +109,7 @@ Burgess is a fusion of two MIT-licensed plugins by the same author, both of whic
 - **Sproutgraph** — <https://github.com/sergiparpal/Sproutgraph> — the convergence spine (engine, MCP boundary, commands, agents, experiment harness, canon/derived model), vendored at `17c4066`.
 - **Cambrian** — <https://github.com/sergiparpal/Cambrian> — the divergence engine (embedder, MAP-Elites, novelty, DPP, monitor, judge bounds, cliché discipline), vendored at `a2adfa1`.
 
-Per-file attribution with SHAs and every adaptation: [`docs/fusion/ATTRIBUTION.md`](docs/fusion/ATTRIBUTION.md). Migrating from either donor: [`docs/MIGRATION.md`](docs/MIGRATION.md). How this plugin was built (the full fusion plan and its decision log): [`docs/fusion/FUSION_PLAN.md`](docs/fusion/FUSION_PLAN.md) + [`docs/fusion/`](docs/fusion/).
+Per-file attribution with SHAs and every adaptation: [`docs/fusion/ATTRIBUTION.md`](docs/fusion/ATTRIBUTION.md). Migrating from either donor: [`docs/MIGRATION.md`](docs/MIGRATION.md). How this plugin was built (the full fusion plan and its decision log): [`docs/fusion/`](docs/fusion/).
 
 ## License
 
