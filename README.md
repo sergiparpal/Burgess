@@ -4,6 +4,10 @@
 
 **The full creative cycle in one Claude Code plugin: diverge without collapsing to the mean, converge without believing your own ideas.**
 
+> 📖 **New to Burgess?** Start with the tutorial — a plain-language guide for non-technical users through one full creative cycle, from a blank page to a grounded knowledge graph. No programming required.
+>
+> Sergi Parpal. *A Complete Walkthrough — from a Blank Page to Grounded Knowledge* (Burgess tutorial). [`TUTORIAL.md`](TUTORIAL.md).
+
 Burgess fuses two engines around one boundary:
 
 - a **convergence engine** (from [Sproutgraph](https://github.com/sergiparpal/Sproutgraph)) that grows source documents into a rigorously grounded, queryable knowledge graph — human-editable canon, three-axis provenance, a span-present write boundary, a grounding loop with permanent memory of failures, and a regenerable NetworkX/SQLite derived layer;
@@ -27,6 +31,10 @@ claude --plugin-dir /path/to/Burgess
 ```
 
 On first load a SessionStart hook provisions a local Python venv (Python ≥ 3.11 recommended; `uv` preferred, stdlib `venv`+`pip` fallback) in the plugin's persistent data dir. Everything runs locally; the divergence embedder is [model2vec](https://github.com/MinishLab/model2vec) `potion-multilingual-128M` (CPU, torch-free, ~120 MB, cached after first download).
+
+## Tutorial
+
+New here, or handing Burgess to a non-technical teammate? **[`TUTORIAL.md`](TUTORIAL.md)** is a complete, plain-language walkthrough of one full creative cycle — brainstorm → capture → build → verify → expand → use — with every slash command explained in the order you'd actually reach for it. No prior knowledge of knowledge graphs, grounding, or the codebase is assumed.
 
 ## The fused pipeline
 
