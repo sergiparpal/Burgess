@@ -1,7 +1,7 @@
 ---
 description: Drain the grounding queue — verdict unverified edges, attack hub candidates, then report verdict counts and falsification memory.
 argument-hint: "[query-or-node-filter]"
-allowed-tools: Task, mcp__plugin_burgess_burgess__kg_metrics, mcp__plugin_burgess_burgess__kg_context, mcp__plugin_burgess_burgess__query_graph, mcp__plugin_burgess_burgess__kg_agenda, mcp__plugin_burgess_burgess__kg_merge
+allowed-tools: Task, Bash, mcp__plugin_burgess_burgess__kg_metrics, mcp__plugin_burgess_burgess__kg_context, mcp__plugin_burgess_burgess__query_graph, mcp__plugin_burgess_burgess__kg_agenda, mcp__plugin_burgess_burgess__kg_merge
 ---
 
 # /kg-ground — grounding loop + adversarial grounder + memory of failures (§1.6/§1.7/§1.8, plan Stage 6)

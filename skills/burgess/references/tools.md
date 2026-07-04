@@ -406,7 +406,7 @@ candidates through `kg_propose`.
   reordered by hybrid-descriptor DPP — one semantic axis (batch k-NN novelty over candidate embeddings)
   plus three graph-structural axes (`community` intra/cross, endpoint `graph_distance`, `grounded_mix` of
   the neighborhood) — and a `divergence_advisory` block is added: `{applied, order:"dpp", axes,
-  candidates:[{bins, semantic_novelty, cliche_distance}], cliche_hubs, pool, note}`. `cliche_distance` is
+  bins, semantic_novelty, cliche_distance, cliche_hubs, pool, beyond_cap_kept_in_donor_order, note}`. `cliche_distance` is
   distance from the graph's "center" (the top-6 grounded-degree hubs — the structural cliché map);
   only the first 200 candidates enter the DPP pool (the rest keep mechanism order, reported via
   `beyond_cap_kept_in_donor_order`). **Advisory ceiling, snapshot-enforced:** same candidates, same

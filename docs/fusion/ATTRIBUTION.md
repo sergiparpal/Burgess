@@ -13,7 +13,7 @@ Burgess is a fusion of two MIT-licensed donor plugins by the same author. Both d
 
 | Burgess path | Donor path | Adaptations |
 |---|---|---|
-| `scripts/kg_engine/**` (20 modules + templates) | `scripts/kg_engine/**` | identity strings only (`sproutgraph→burgess` in `__init__.py` docstring, `server.py` kg_ping name + `FastMCP("burgess")`, `backend.py` system prompt, `templates/graph_html.py` titles); `__version__` 0.6.1→0.1.0 |
+| `scripts/kg_engine/**` (21 modules + templates) | `scripts/kg_engine/**` | identity strings only (`sproutgraph→burgess` in `__init__.py` docstring, `server.py` kg_ping name + `FastMCP("burgess")`, `backend.py` system prompt, `templates/graph_html.py` titles); `__version__` 0.6.1→0.1.0 |
 | `scripts/{bootstrap.py, launch_server.mjs, _engine_resolve.mjs, canon_merge_driver.mjs, validate_plugin.py, f4_probe.py}` | same paths | identity strings (`[burgess]` log prefixes, `PLUGIN_NAME="burgess"`, `skills/burgess/SKILL.md` required path) |
 | `commands/*.md` (8) | `commands/*.md` | tool-namespace prefix `mcp__plugin_sproutgraph_sproutgraph__` → `mcp__plugin_burgess_burgess__`; prose identity |
 | `agents/*.md` (6) | `agents/*.md` | same namespace + prose identity |

@@ -110,7 +110,7 @@ Engine package: `skills/ideate/scripts/cambrian_engine/` (version 0.5.1). **DISC
 
 # Part II — Sproutgraph @ `17c4066` (convergence donor)
 
-Plugin `sproutgraph` 0.6.1; engine package `kg-engine` 0.6.1 at `scripts/kg_engine/` (20 modules, ~9.4k LoC). Python `>=3.10`. Deps: `mcp>=1.2,<2`, `pydantic>=2,<3`, `networkx>=3,<4`, `pyyaml>=6,<7`, `python-igraph>=0.11,<2`, `leidenalg>=0.10,<1`; extras `backend=[anthropic>=0.77]`, `dev=[pytest>=8]`, `lightrag=[lightrag-hku>=1.4,<2]`.
+Plugin `sproutgraph` 0.6.1; engine package `kg-engine` 0.6.1 at `scripts/kg_engine/` (21 modules, ~9.4k LoC). Python `>=3.10`. Deps: `mcp>=1.2,<2`, `pydantic>=2,<3`, `networkx>=3,<4`, `pyyaml>=6,<7`, `python-igraph>=0.11,<2`, `leidenalg>=0.10,<1`; extras `backend=[anthropic>=0.77]`, `dev=[pytest>=8]`, `lightrag=[lightrag-hku>=1.4,<2]`.
 
 ## S1. Write boundary (I2 anchor)
 

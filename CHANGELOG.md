@@ -80,6 +80,18 @@
   `commands/kg-experiment.md`, and `references/contract.md`.
 - `FUSION_PLAN.md` relocated from the repo root to `docs/fusion/`, joining the
   rest of the fusion decision record.
+- **2026-07-04 doc drift-audit** (full doc↔source audit, adversarially
+  verified): corrected six stale claims — the vendored Sproutgraph engine
+  module count 20 → 21 (`docs/fusion/ATTRIBUTION.md`, `docs/fusion/INVENTORY.md`,
+  and this changelog's 0.1.0 spine entry; the donor @`17c4066` has 21 top-level
+  `.py` files, matching the sibling Cambrian "15 modules" convention);
+  `references/contract.md`'s core-tool count "eleven" → "sixteen" (`server.py`
+  exposes 16 core + 4 generative graph tools); `references/tools.md`'s
+  `kg_generate` `divergence_advisory` block, now documented as the parallel
+  `bins`/`semantic_novelty`/`cliche_distance` arrays plus
+  `beyond_cap_kept_in_donor_order` that `advisory_geometry.py` returns (not a
+  `candidates` list); and a missing `Bash` grant in `/kg-ground`'s frontmatter,
+  whose Stage-0 note runs `python -m kg_engine.harness convergence`.
 
 ## 0.1.1 — 2026-07-03
 
@@ -165,7 +177,7 @@ divergence engine, one MCP trust boundary, one domain-pack format.
 
 ### The spine (vendored from Sproutgraph @ `17c4066`)
 
-- Deterministic graph engine (`scripts/kg_engine/`, 20 modules): canon/derived
+- Deterministic graph engine (`scripts/kg_engine/`, 21 modules): canon/derived
   split, span-present write boundary, `kg_ground` verdict monopoly, reconciler
   re-quarantine, span-staleness advisory, egress scrub, experiment harness.
 - 8 slash commands, 6 subagents, SessionStart provisioning chain (uv + pip

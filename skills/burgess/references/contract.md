@@ -14,7 +14,7 @@ Before extraction, the §1.9 **egress scrub** `mcp__plugin_burgess_burgess__kg_s
 text to the subagent. `kg_write` **restores** the placeholder spans to the ORIGINAL text before writing, so
 the boundary stores the restored original span in the canon (the span still verifies against the unscrubbed
 source, §5). For a no-PII source the scrub is a no-op (`redactions=0`). The full tool surface adds the
-generative layer's tools on top of the eleven core read/write tools: `kg_ping`, `kg_scrub`, `kg_write`, **`kg_propose`**
+generative layer's tools on top of the sixteen core read/write tools: `kg_ping`, `kg_scrub`, `kg_write`, **`kg_propose`**
 (§5a), `kg_ground`, `kg_rename`, `kg_merge` (deliberate node-merge with edge dedup), `kg_metrics`, `kg_status`,
 `query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_explain_path` (read-only grounded-only
 associative chain + advisory `leap`, §2), `kg_context`, `kg_agenda` (read-only structural agenda),
