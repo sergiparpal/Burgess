@@ -20,6 +20,35 @@
 
 ### Fixed
 
+- **2026-07 correctness review (review-r7)**: 7 verified findings fixed and
+  pinned in `tests/test_review_r7.py` (21 tests):
+  - `model.py` frontmatter regex: the closing-fence `\s*` greedily ate the
+    body's first-line indentation, making `node_from_markdown`∘`node_to_markdown`
+    lossy (a 4-space code block lost its first line) and silently defeating
+    canon's idempotent-no-op write guard (`node_content_hash` mismatch →
+    spurious rewrite + timestamp-only commit). Now horizontal-whitespace-only.
+  - `server.py` egress: `kg_write`, `kg_rename`, and `kg_merge` returned the
+    canon rollback reason (`info.error`) unscrubbed, leaking an absolute vault
+    path across the §1.9 boundary that every sibling error-return scrubs (the
+    `_tool_result` envelope scrubs raised exceptions, not returned dicts). All
+    three now route through `_scrub_error`.
+  - `export.py`: chained `.replace()` rescanned the inlined data payload, so a
+    node label equal to the `__KG_FAILURE_STATES_JSON__` sentinel corrupted the
+    graph.html JSON. Now a single-pass `re.sub` that never rescans replacements.
+  - `harness.py`: the `ideation`/`convergence`/`specificity` CLIs crashed with
+    an uncaught `AttributeError`/`TypeError` on a malformed top-level JSON shape
+    (array/scalar) instead of the clean exit-2 usage error `agreement` emits.
+  - `generate.py`: `run_generators` was defined twice; the duplicate shadowed
+    the first def and the review-r5 module-level helpers (`_convergence_tally`,
+    `_dedup_candidates`, `_edge_key`), leaving them dead. The duplicate is
+    removed so the module-level helpers are live and testable in isolation.
+  - `agents/evaluator.md` / `commands/kg-experiment.md`: granted `kg_generate`,
+    which the kg-evaluator is instructed to call for the graph+generate+dpp arm.
+  - `commands/kg-ground.md` Stage 0b: the stale-verdict remedy prescribed
+    `kg_ground(grounded, support_span=…)`, which is a no-op for a span-present
+    edge (support_* only promote hypothesized items), so the flag never cleared;
+    it now relocates the span via `kg_write` (a canon edit that re-opens
+    grounding).
 - Completed the I5 clock freeze in the test suite: canon's `utcnow` binding
   leaked wall time into the frozen-clock snapshot tests.
 

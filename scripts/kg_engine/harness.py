@@ -112,6 +112,12 @@ def specificity(graph_data: dict, corpus: list[str], *, precomputed_betweenness:
     """
     import networkx as nx
 
+    # shape guard: on the CLI path (precomputed_undirected is None) a top-level JSON array/scalar would
+    # reach node_link_graph and raise an opaque AttributeError on `data.get(...)`, escaping _main's
+    # ValueError handler. The projector always passes precomputed_undirected, so this only guards the
+    # standalone CLI (review-r7).
+    if precomputed_undirected is None and not isinstance(graph_data, dict):
+        raise ValueError("graph must be a node-link object (a JSON object with nodes/links)")
     G = precomputed_undirected if precomputed_undirected is not None else node_link_graph(graph_data).to_undirected()
     if G.number_of_nodes() < 3:
         return {"gate_on": False, "reason": "graph too small", "n": G.number_of_nodes()}
@@ -182,6 +188,11 @@ def convergence(history: list[dict]) -> dict:
     gate, it stays closed on a small or flat sample: until then convergence is displayed but decides
     nothing (G5).
     """
+    # shape guard (mirrors agreement()'s): a top-level JSON scalar (e.g. `5`) makes `(history or [])`
+    # non-iterable → `for r in 5` raises an opaque TypeError that escapes _main's ValueError handler
+    # (raw traceback + exit 1). A list of malformed ROWS is still tolerated below (review-r7).
+    if not isinstance(history, list):
+        raise ValueError("history must be a list of {convergence, grounded} objects")
     rows = [r for r in (history or []) if isinstance(r, dict)]
 
     def _conv(r) -> int:
@@ -531,6 +542,11 @@ def _cmd_ideation(argv: list[str]) -> int:
                         "rag": ["A relates to B somehow."]}}
     blob, _ = _load_json_or_demo(_positional_path(argv), demo,
                                  notice="no outputs file; using demo outputs")
+    # shape guard BEFORE .get: a top-level JSON array/scalar would otherwise raise an opaque
+    # AttributeError here (escaping _main's ValueError handler → raw traceback + exit 1). Surface a
+    # clean usage error like ideation()'s own guard does for its argument (review-r7).
+    if not isinstance(blob, dict):
+        raise ValueError('outputs file must be a JSON object like {"source": ..., "outputs": {...}}')
     src_text = blob.get("source", "")
     # when outputs aren't nested under "outputs", treat the rest of the blob as conditions but
     # never let the top-level "source" string leak in as a fake (char-iterated) condition.

@@ -55,13 +55,19 @@ projector recomputes this off the hot path and surfaces it (read-only — it **n
    `failed` edge whose stored span no longer verifies against its source file. (Empty when nothing diverged —
    the common case; if so, skip to Stage 1.)
 2. For each `edge_id`, route it to the `kg-grounder` (same Task as Stage 1) to **re-verify against the current
-   source** and re-apply a verdict via `kg_ground`:
-   - if the claim still holds at a new location in the source → `kg_ground(edge_id, verdict="grounded",
-     support_span="<the new verbatim span>")` (re-earns the verdict against the live text);
-   - if the source no longer supports it → `kg_ground(edge_id, verdict="rejected", note="source no longer
-     supports this span")`.
-   The advisory is a **heuristic, not a verdict**: re-grounding (the only thing that changes the state) clears
-   the flag on the next projection. Never edit `epistemic_state` directly to silence it (§1.4/§1.8).
+   source**:
+   - if the claim still holds but the span **moved to new text** → the stored span must be relocated, which is
+     a canon edit, so re-emit the edge with the new verbatim span via
+     `kg_write({"edges": [{"source": ..., "target": ..., "relation": ..., "span": "<the new verbatim span>"}]})`.
+     Do **not** use `kg_ground(..., support_span=...)` for this: `support_span` only supports promoting a
+     *hypothesized* item — it is ignored for a span-present edge, so the stored span never moves and the flag
+     would persist. The span edit re-opens the edge for grounding, and Stage 1 re-verdicts it against the live
+     text.
+   - if the source no longer supports it at all → `kg_ground(edge_id, verdict="rejected", note="source no
+     longer supports this span")`.
+   The advisory is a **heuristic, not a verdict**: the flag clears on the next projection once the edge leaves
+   the grounded/`failed` set (re-grounded to `rejected`, or re-opened by the span edit) **or** its stored span
+   verifies again — never by editing `epistemic_state` directly to silence it (§1.4/§1.8).
 
 ## Stage 1 — Verdict the unverified edges (kg-grounder)
 

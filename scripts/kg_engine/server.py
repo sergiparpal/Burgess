@@ -777,7 +777,11 @@ class KGEngine:
                          "reason": r.reason, "retryable": r.retryable} for r in results],
             "written_nodes": written,
             "rolled_back": rolled_back,
-            "error": (info.error if rolled_back else None),
+            # scrub like every sibling error-return (883/926/1065/1113/1218/1276): info.error is str(e)
+            # of the canon write fault and can embed an absolute vault path; the _tool_result envelope
+            # only scrubs RAISED exceptions, never a returned dict, so an unscrubbed path would cross the
+            # §1.9 egress boundary (review-r7).
+            "error": (self._scrub_error(info.error) if rolled_back else None),
             "receipt": receipt,
         }
         # Cache the response under the idempotency key (bounded LRU) so an exact retry replays it verbatim.
@@ -1105,7 +1109,10 @@ class KGEngine:
             if info.rolled_back:
                 # the batch rolled back — do NOT unlink the old note, or the node would be lost entirely
                 # (its migrating audit records were already truncated by GroundAuditLog.audited_write).
-                return {"ok": False, "error": f"rename rolled back: {info.error}", "old": old, "new": new}
+                # scrub: info.error can embed an absolute vault path (str of the write fault), and the
+                # _tool_result envelope never scrubs a returned dict — mirror the sibling branch below (review-r7).
+                return {"ok": False, "error": self._scrub_error(f"rename rolled back: {info.error}"),
+                        "old": old, "new": new}
             try:
                 self.canon.node_path(old).unlink(missing_ok=True)
             except OSError as e:  # the new note already landed; surface a structured error, not a raw raise
@@ -1267,7 +1274,9 @@ class KGEngine:
             if info.rolled_back:
                 # the batch rolled back — do NOT unlink `from` (its migrating records were already
                 # truncated by audited_write); the graph is left exactly as it was.
-                return {"ok": False, "error": f"merge rolled back: {info.error}",
+                # scrub: info.error can embed an absolute vault path (str of the write fault), and the
+                # _tool_result envelope never scrubs a returned dict — mirror the sibling branch below (review-r7).
+                return {"ok": False, "error": self._scrub_error(f"merge rolled back: {info.error}"),
                         "from": frm, "into": into}
             try:
                 self.canon.node_path(frm).unlink(missing_ok=True)  # retire the now-empty source node

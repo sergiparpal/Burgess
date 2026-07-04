@@ -14,6 +14,7 @@ tool), and ``/kg-view``.
 from __future__ import annotations
 
 import json
+import re
 import sys
 from collections import Counter
 from pathlib import Path
@@ -133,9 +134,15 @@ def build_html(engine) -> Path:
                .replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026"))
     # The failure-state vocabulary is injected from its single model home (review-r5) — sorted so
     # the rendered HTML bytes stay deterministic for a given derived state.
-    html = (HTML_TEMPLATE
-            .replace("__KG_DATA_JSON__", payload)
-            .replace("__KG_FAILURE_STATES_JSON__", json.dumps(sorted(FAILURE_STATE_VALUES))))
+    #
+    # SINGLE-PASS substitution (review-r7): chaining `.replace(DATA).replace(FAILURE_STATES)` rescanned
+    # the already-inserted payload, so a node label equal to the "__KG_FAILURE_STATES_JSON__" sentinel
+    # got rewritten mid-JSON and broke the whole render. re.sub replaces each placeholder from the
+    # ORIGINAL template and never re-examines replacement text, so neither substitution can corrupt the
+    # other's output regardless of what the payload contains.
+    _subs = {"__KG_DATA_JSON__": payload,
+             "__KG_FAILURE_STATES_JSON__": json.dumps(sorted(FAILURE_STATE_VALUES))}
+    html = re.sub("|".join(re.escape(k) for k in _subs), lambda m: _subs[m.group(0)], HTML_TEMPLATE)
     out = engine.projector.derived / "graph.html"
     _atomic_write(out, html)
     return out

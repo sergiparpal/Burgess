@@ -1,7 +1,7 @@
 ---
 description: Stage 8/9 — blind ideation experiment (control|graph|graph+generate|rag); score with the harness and append the verdict to PROGRESS.md
 argument-hint: "[prompts_path]"
-allowed-tools: Task, Bash, mcp__plugin_burgess_burgess__kg_context
+allowed-tools: Task, Bash, mcp__plugin_burgess_burgess__kg_context, mcp__plugin_burgess_burgess__kg_generate
 ---
 
 # /kg-experiment — does the graph actually help ideation? (§Stage 8, §4)

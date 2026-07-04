@@ -325,7 +325,12 @@ class Node:
 
 # --------------------------------------------------------------------------- markdown I/O
 
-_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", re.DOTALL)
+# The closing fence's trailing whitespace is HORIZONTAL-only (`[^\S\n]*`): a bare `\s*` here is greedy
+# ACROSS newlines and eats the body's first-line indentation, so node_from_markdown(node_to_markdown(n))
+# is lossy — a 4-space Markdown code block loses its first line, and worse, the re-parsed on-disk body
+# no longer equals the incoming body, silently defeating Canon._write_batch's idempotent-no-op guard
+# (node_content_hash mismatch → a spurious rewrite + timestamp-only commit on every touch) — review-r7.
+_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---[^\S\n]*\r?\n?(.*)$", re.DOTALL)
 
 
 def node_to_markdown(node: Node) -> str:
