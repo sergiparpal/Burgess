@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.1.2 — 2026-07-04
+
+Hardening release: the full 2026-07 review trilogy — maintainability
+(review-r5), performance (review-r6), and correctness (review-r7) — plus a
+documentation pass that makes the docs self-contained and drift-free against
+the engine source. No user-facing API or tool-surface changes.
 
 ### Changed
 
