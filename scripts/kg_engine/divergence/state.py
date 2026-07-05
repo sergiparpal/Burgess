@@ -576,6 +576,19 @@ class State:
             self._remove_pin(domain, candidate_id)
             return discards
 
+    def remove_discard(self, domain: str, candidate_id: str) -> List[str]:
+        """Un-seal (the explicit inverse of ``add_discard``): drop a candidate from this domain's
+        discards so it returns to the proposal pool. Locked read-modify-write, mirroring ``add_discard``.
+        Does NOT re-pin it (pin/discard mutual exclusivity is a latest-action rule; un-sealing is neither
+        a pin nor a discard). No-op if the id isn't discarded. Used by the re-examinable un-seal lever."""
+        path = self.discards_path(domain)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _file_lock(path):
+            discards = self.read_discards(domain)
+            if candidate_id in discards:
+                self.write_discards(domain, [d for d in discards if d != candidate_id])
+            return self.read_discards(domain)
+
     def _remove_pin(self, domain: str, candidate_id: str) -> None:
         pins = self.read_pins(domain)
         if candidate_id in pins:

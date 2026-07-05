@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Added
+
+- **Re-examinable-verdicts advisory (R3-mirror) for non-monotonic evidence.**
+  Grounding verdicts are permanent negative memory and the grounder never
+  revisits them; the only source-change reaction (the R3 stale-verdict advisory)
+  fired one direction — a `grounded`/`failed` span-present edge whose span
+  *disappeared*. A new **read-only** mirror flags the opposite case: a
+  `failed`/`rejected` item — **nodes and span-less items included, which R3
+  cannot cover** — that was judged against a source set which has since **grown
+  or changed**, so it may now be supportable and deserves a re-look. It **never
+  mutates a verdict and never re-queues** (re-grounding stays a `kg_ground`
+  decision); a term-overlap filter keeps only items the changed source actually
+  mentions. Surfaced in `kg_context.advisory.reexaminable_verdicts` and a
+  `## Re-examinable verdicts` GRAPH_REPORT section (new projector meta keys
+  `reexaminable_verdicts` + `source_file_sigs`; no model schema change; R3 and
+  the global `FAILURE_STATES` untouched). The divergence side mirrors it:
+  `failed`-fated brief discards are surfaced as `reexaminable_discards` on a
+  source change, with an **explicit** un-seal lever
+  `kg_diverge_recall(project, reexamine=[candidate_ids])` (never auto-un-sealed).
+  Pinned in `tests/test_reexaminable_verdicts.py` (9 tests) and
+  `tests/fusion/test_materialization.py` (4 new tests).
+
 ### Fixed
 
 - **Grounding no longer permanently buries novel `/kg-diverge` pins.**

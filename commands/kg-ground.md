@@ -69,6 +69,27 @@ projector recomputes this off the hot path and surfaces it (read-only — it **n
    the grounded/`failed` set (re-grounded to `rejected`, or re-opened by the span edit) **or** its stored span
    verifies again — never by editing `epistemic_state` directly to silence it (§1.4/§1.8).
 
+## Stage 0c — Reconsider re-examinable verdicts (R3-mirror — source set changed since judged)
+
+Evidence is non-monotonic: a verdict correct against the source set *at the time it was judged* can become
+wrong when the source set later **grows or changes** (sources contradict each other). R3 above catches only
+one direction (a span that vanished); this **mirror** catches the other — a `failed`/`rejected` item, **nodes
+and span-less items included** (which R3 cannot see), that was judged against a source set that has since
+changed, so it may now be supportable and deserves a second look. The grounder queue never re-surfaces
+verdicted items on its own, so this is the only place they come back up.
+
+1. `mcp__plugin_burgess_burgess__kg_context(query="$ARGUMENTS")` → read `advisory.reexaminable_verdicts[]`.
+   Each entry is `{item_id, kind: "node"|"edge", state: "failed"|"rejected", reason:
+   "source-set-changed-since-judged"}`, restricted by a term-overlap filter to items the changed source
+   actually mentions. (Empty when the source set has not moved since these items were judged — the common
+   case; if so, skip to Stage 1.)
+2. For each `item_id`, decide whether the **new** source now supports it, then re-verdict it **only** via
+   `kg_ground` — exactly as for a fresh item: promote to `grounded` with real support (a verbatim
+   `support_span` for a hypothesized item, else `support_note`), or leave the negative verdict in place. This
+   advisory is **strictly read-only**: it changes no `epistemic_state` and enqueues nothing; re-grounding is
+   always a manual `kg_ground` decision. The flag self-clears on the next projection once the item leaves the
+   `{failed, rejected}` set.
+
 ## Stage 1 — Verdict the unverified edges (kg-grounder)
 
 Launch the `kg-grounder` subagent via the Task tool to drain the `unverified` queue. It walks each pending

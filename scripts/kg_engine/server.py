@@ -519,6 +519,18 @@ class KGEngine:
         corpus. Span verification itself is per-file via source_set().verifies, not this blob."""
         return self._sources.text()
 
+    def _source_signature(self) -> str:
+        """sha256 of the current source payload (the SourceSet concat), matching
+        ``projector._source_hash`` — the divergence-side twin of the graph advisory's source-change
+        pre-gate (Stage 5, re-examinable verdicts). ``""`` when no source is configured. Used to stamp
+        the source a materialized-pin failure was fated against, so a later source change can surface it
+        as re-examinable on the brief side exactly as the graph side surfaces failed/rejected items."""
+        try:
+            payload = self.source_set().concat
+        except Exception:  # noqa: BLE001 — a source-read hiccup degrades to "" (no signature), never crashes the sync
+            return ""
+        return hashlib.sha256(payload.encode()).hexdigest() if payload else ""
+
     @property
     def source_path(self):
         """The configured source Path (or None), backed by the shared resolver. Kept as a settable
@@ -1723,13 +1735,24 @@ class KGEngine:
             domain = sess.domain
         except Exception:  # no axes snapshot yet — nothing to sync into
             return []
+        # The source the fates in this sync are judged against — stamped on each newly-folded entry so a
+        # LATER source change can surface it as re-examinable on the brief side (Stage 5, the divergence
+        # mirror of the graph R3-mirror). Computed once, off the per-entry loop.
+        current_source_sig = self._source_signature()
         newly_discarded: list = []
         changed = False
         for cid, entry in ledger.items():
-            if cid == "_edges":
-                continue  # extra edges with no candidate mapping: nothing to discard
+            if cid in ("_edges", "_source_sig"):
+                continue  # reserved ledger keys (extra edges / brief-level marker): no candidate to discard
             if entry.get("fate") in FAILURE_STATE_VALUES:
                 continue  # already folded into discards
+            # An entry the user EXPLICITLY un-sealed against the CURRENT source stays out of discards
+            # until the source changes again (or they re-ground the still-`failed` graph item) — otherwise
+            # this very sync would re-fold it and silently undo the un-seal (Stage 5). A source change
+            # moves the signature, lifting the guard, so a still-falsified pin re-folds (and re-surfaces
+            # as re-examinable) exactly as before. Read-only otherwise; never touches a verdict.
+            if entry.get("unsealed_source_sig") and entry.get("unsealed_source_sig") == current_source_sig:
+                continue
             failed_state = None
             for node_id in entry.get("nodes", ()):
                 try:
@@ -1750,11 +1773,74 @@ class KGEngine:
             if failed_state:
                 state.add_discard(domain, cid)
                 entry["fate"] = failed_state
+                # Record the source this failure was fated against (Stage 5). Kept ON THE LEDGER ENTRY
+                # only — the returned `newly_discarded` record shape is UNCHANGED ({candidate, fate}), so
+                # existing callers/tests that dict-compare it stay green.
+                entry["fate_source_sig"] = current_source_sig
                 newly_discarded.append({"candidate": cid, "fate": failed_state})
                 changed = True
         if changed:
             state.write_materialized(ledger)
         return newly_discarded
+
+    def _reexaminable_discards(self, project: str) -> list:
+        """The divergence mirror of the graph R3-mirror advisory (Stage 5): materialized-pin failures
+        (`fate == "failed"`) that were fated against a source set which has since CHANGED, so the brief's
+        permanent negative memory (I8) deserves a re-look. SURFACE-ONLY — it removes nothing and clears
+        no fate (that is the explicit un-seal lever); the discard stays sealed until the user un-seals it.
+        Empty when no source is configured. An entry fated before this feature (no `fate_source_sig`) is
+        NOT surfaced — there is no baseline source to diff against, mirroring the graph side's cold-start
+        rule (a one-projection lag, not a false burst)."""
+        from kg_engine.divergence.session import Session as _DSession
+
+        sess = _DSession(project, home=self._diverge_home())
+        ledger = sess.state.read_materialized()
+        if not ledger:
+            return []
+        current = self._source_signature()
+        if not current:
+            return []  # no source configured → nothing to re-examine (mirror the graph advisory)
+        out: list = []
+        for cid, entry in ledger.items():
+            if cid in ("_edges", "_source_sig") or not isinstance(entry, dict):
+                continue
+            if (entry.get("fate") == EpistemicState.FAILED.value
+                    and "fate_source_sig" in entry
+                    and entry.get("fate_source_sig") != current):
+                out.append({"candidate": cid, "fate": entry["fate"],
+                            "reason": "source-set-changed-since-judged"})
+        return out
+
+    def _unseal_discards(self, project: str, candidate_ids: list) -> list:
+        """The EXPLICIT un-seal lever (Stage 5): for each named candidate, drop it from the brief's
+        discards (return it to the proposal pool) and clear its `fate` in materialized.json so it can be
+        re-materialized / re-grounded against the new source. Records `unsealed_source_sig` so the next
+        fate-sync does NOT immediately re-fold the still-`failed` graph item (see _sync_materialized_fates).
+        NEVER auto-invoked and NEVER touches a graph verdict. Returns the candidates actually un-sealed."""
+        from kg_engine.divergence.session import Session as _DSession
+
+        sess = _DSession(project, home=self._diverge_home())
+        state = sess.state
+        try:
+            domain = sess.domain
+        except Exception:  # no axes snapshot yet — no discard namespace to un-seal from
+            return []
+        current_source_sig = self._source_signature()
+        ledger = state.read_materialized()
+        unsealed: list = []
+        changed = False
+        for cid in [str(c) for c in (candidate_ids or [])]:
+            state.remove_discard(domain, cid)  # return to the proposal pool (locked read-modify-write)
+            entry = ledger.get(cid) if isinstance(ledger, dict) else None
+            if isinstance(entry, dict):
+                entry.pop("fate", None)          # clear the failure fate — re-open for re-grounding
+                entry.pop("fate_source_sig", None)
+                entry["unsealed_source_sig"] = current_source_sig
+                changed = True
+            unsealed.append(cid)
+        if changed:
+            state.write_materialized(ledger)
+        return unsealed
 
     def kg_diverge_materialize(self, project: str, candidate_ids=None,
                                node_type: str = "claim", edges=None) -> dict:
@@ -2151,6 +2237,11 @@ def _register(mcp, engine: KGEngine) -> None:
         fates = engine._sync_materialized_fates(project)
         if fates:
             out["materialized_failures_discarded"] = fates
+        # R3-mirror (Stage 5): surface `failed`-fated discards whose source set has since changed as
+        # RE-EXAMINABLE — a re-look candidate, never an auto-un-seal. Surface-only.
+        reexaminable = engine._reexaminable_discards(project)
+        if reexaminable:
+            out["reexaminable_discards"] = reexaminable
         return out
 
     @mcp.tool()
@@ -2203,17 +2294,30 @@ def _register(mcp, engine: KGEngine) -> None:
 
     @mcp.tool()
     @_tool_result
-    def kg_diverge_recall(project: str, k: int = 10) -> dict:
+    def kg_diverge_recall(project: str, k: int = 10, reexamine: list | None = None) -> dict:
         """Preference memory for injection at session start: recent pins, discards, and
         comparison summaries for this brief — so a resumed brief generates AWAY from what
         the human already discarded and TOWARD what they pinned. Also syncs the fate of
-        previously materialized pins: one whose graph item was FAILED/REJECTED by grounding
-        joins this brief's discards (unified negative memory, I8)."""
+        previously materialized pins: one whose graph item was FAILED by grounding joins
+        this brief's discards (unified negative memory, I8).
+
+        On a source change it surfaces `failed`-fated discards under `reexaminable_discards` (a re-look
+        candidate list — the divergence mirror of the graph R3-mirror; SURFACE-ONLY, never auto-un-sealed).
+        Pass `reexamine=[candidate_ids]` to EXPLICITLY un-seal those candidates: each is dropped from the
+        brief's discards and its failure fate cleared so it returns to the proposal pool to be
+        re-materialized / re-grounded against the new source. Un-sealing never changes a graph verdict."""
         from kg_engine.divergence import pipeline as dpipe
+        # Explicit un-seal FIRST, so this call's recall/discard view reflects the un-sealed candidates.
+        unsealed = engine._unseal_discards(project, reexamine) if reexamine else []
         out = dpipe.recall(project, k=k, home=engine._diverge_home())
         fates = engine._sync_materialized_fates(project)
         if fates:
             out["materialized_failures_discarded"] = fates
+        if unsealed:
+            out["reexamined_unsealed"] = unsealed
+        reexaminable = engine._reexaminable_discards(project)
+        if reexaminable:
+            out["reexaminable_discards"] = reexaminable
         return out
 
     @mcp.tool()

@@ -25,7 +25,8 @@ from .canon import Canon, _git
 from .graphio import node_link_data
 from .harness import idf_seeds, node_specificity
 from .harness import specificity as _specificity_gate
-from .model import Edge, EpistemicState, FAILURE_STATE_VALUES, Node, Provenance, node_content_hash
+from .model import (Edge, EpistemicState, FAILURE_STATE_VALUES, Node, Provenance,
+                    node_content_hash, normalize_text)
 from .sources import section_corpus
 
 if TYPE_CHECKING:  # type-only; the projector duck-types .verifies/.concat at runtime
@@ -104,6 +105,36 @@ _QUERY_TERM_CAP = 12
 _STALE_PREVIEW_LABELS = 3  # how many stale-verdict labels the advisory names inline
 # Cap the R3 stale-verdict advisory list in kg_context so it can't bypass the token budget (review-low).
 _STALE_VERDICTS_CAP = 50
+# The R3-MIRROR re-examinable-verdicts advisory (non-monotonic evidence): a READ-ONLY signal that a
+# failed/rejected item was judged against a source set that has since changed, so it deserves a
+# grounder re-look. Cap parallels the stale-verdict advisory's (_STALE_VERDICTS_CAP) so the inline
+# kg_context list can never bust the token budget. The advisory NEVER mutates a verdict, never re-queues.
+_REEXAMINABLE_CAP = 50
+# The two verdict states the re-examinable advisory covers — the SAME negative-memory vocabulary as
+# model.FAILURE_STATES ({REJECTED, FAILED}), referenced here (never redefining that global) so
+# extending the vocabulary there extends this advisory too. Unlike R3, the predicate is item-agnostic
+# (nodes AND edges) and span-agnostic (span-present AND span-less) — falsified divergence pins, the
+# motivating case, are typically span-less nodes R3 cannot see.
+_REEXAMINABLE_STATES = (EpistemicState.FAILED, EpistemicState.REJECTED)
+# Term-overlap noise filter (§Stage 6): tokens for the relevance test that decides whether the CHANGED
+# source text actually bears on a failed/rejected item. Applied AFTER normalize_text (which casefolds),
+# so the class is lowercase-only; it deliberately splits on '-'/'_' (unlike harness._WORD, which keeps
+# them) so a slug endpoint id like `generality-confound` matches prose "generality confound" across the
+# item↔source boundary. >=3 chars mirrors the kg_context query-term floor.
+_OVERLAP_WORD = re.compile(r"[a-z][a-z0-9]{2,}")
+# Non-content terms dropped before the overlap test so a shared "with"/"that"/"from" can never make an
+# unrelated changed source flag an item. Small, generic, English-only by design — the filter only needs
+# to remove obviously-uninformative overlaps, not to be a full stoplist (sub-3-char words like a/is/of/
+# to/in are already excluded by the length floor above).
+_OVERLAP_STOPWORDS = frozenset({
+    "the", "and", "but", "for", "with", "from", "are", "was", "were", "been", "being", "this", "that",
+    "these", "those", "not", "nor", "too", "very", "can", "will", "would", "should", "could", "may",
+    "might", "must", "does", "did", "has", "have", "had", "its", "their", "our", "your", "who", "whom",
+    "which", "what", "when", "where", "why", "how", "all", "any", "each", "few", "more", "most", "other",
+    "some", "such", "only", "own", "same", "about", "into", "over", "under", "out", "off", "again",
+    "once", "here", "there", "also", "one", "two", "new", "then", "than", "them", "his", "her", "you",
+    "use", "used", "using", "per", "via", "etc",
+})
 
 # R6 (kg_agenda) detector thresholds. A node with >= _HUB_DEGREE live edges is a "hub"; its
 # grounded/(grounded+unverified) ratio splits well-grounded (answerable) from under-grounded (blocked).
@@ -511,6 +542,26 @@ class Projector:
             stale = refiltered + [s for s in self._stale_verdicts(changed, sources)
                                   if s["edge_id"] not in seen_ids]
 
+        # R3-MIRROR: the re-examinable-verdicts advisory (READ-ONLY, non-monotonic evidence). Same
+        # source_hash pre-gate as R3, folded into the SAME `sources`/`nodes` pass (§8). On a full rebuild
+        # OR a source change, term-filter every failed/rejected item against the CHANGED source text;
+        # otherwise (canon-only change) just re-verify the already-flagged items so a re-grounded/deleted
+        # one self-clears. On the full/source-moved branch we ALSO carry forward prior flags that still
+        # qualify, so a LATER unrelated source change never silently drops an earlier, un-acted-on flag
+        # (and a full rebuild with an UNCHANGED source keeps existing flags — changed_text is empty then,
+        # so the fresh scan adds nothing and the carry-forward preserves them). It never mutates a verdict
+        # and never re-queues anything (the grounder's queue stays unverified-only).
+        cur_source_sigs = self._source_file_sigs(sources)
+        prior_reexaminable = prior.get("reexaminable_verdicts") or []
+        if do_full or cur_source_hash != prior.get("source_hash", ""):
+            fresh_reex = self._reexaminable_verdicts(nodes, sources,
+                                                     self._changed_source_text(sources, prior))
+            carried_reex = self._refilter_reexaminable(prior_reexaminable, nodes, sources)
+            seen_reex = {r["item_id"] for r in carried_reex}
+            reexaminable = carried_reex + [r for r in fresh_reex if r["item_id"] not in seen_reex]
+        else:
+            reexaminable = self._refilter_reexaminable(prior_reexaminable, nodes, sources)
+
         G = self._build_graph(nodes)
         # On an incremental reproject hand _ranks the prior topology signature + prior betweenness so it
         # can skip the O(V·E) betweenness pass when the live topology is unchanged (projector-1). On a
@@ -536,10 +587,10 @@ class Projector:
 
         if do_full:
             self._write_full(nodes, ranks, head, cur_hashes, report, cur_source_hash, stale,
-                             cur_stats)
+                             cur_stats, reexaminable, cur_source_sigs)
         else:
             self._write_incremental(nodes, changed, removed, ranks, head, cur_hashes, report,
-                                    cur_source_hash, stale, cur_stats)
+                                    cur_source_hash, stale, cur_stats, reexaminable, cur_source_sigs)
         # ranks (cheap_sig/topo_sig/etc.) are persisted by the write methods via _save_meta.
 
         report.n_nodes = G.number_of_nodes()
@@ -693,7 +744,8 @@ class Projector:
         }
         return tuple(v[name] for name in _EDGE_COLUMN_NAMES)
 
-    def _write_full(self, nodes, ranks: Ranks, head, hashes, report, source_hash, stale, stats):
+    def _write_full(self, nodes, ranks: Ranks, head, hashes, report, source_hash, stale, stats,
+                    reexaminable=None, source_file_sigs=None):
         con = self._connect()
         try:
             con.execute("DELETE FROM nodes")
@@ -706,13 +758,13 @@ class Projector:
             report.touched_nodes = [n.id for n in nodes]
             report.touched_edges = [e.id for n in nodes for e in n.edges]
             self._save_meta(con, head, hashes, ranks.gate_on, source_hash, stale, ranks.topo_sig,
-                            stats)
+                            stats, reexaminable, source_file_sigs)
             con.commit()
         finally:
             con.close()
 
     def _write_incremental(self, nodes, changed, removed, ranks: Ranks, head, hashes, report,
-                           source_hash, stale, stats):
+                           source_hash, stale, stats, reexaminable=None, source_file_sigs=None):
         con = self._connect()
         try:
             changed_ids = {c.id for c in changed}  # hoisted out of the per-node loop below
@@ -756,7 +808,7 @@ class Projector:
                     con.execute(update_sql,
                                 tuple(row[c] for c in _RANK_UPDATE_COLUMNS) + (n.id,))
             self._save_meta(con, head, hashes, ranks.gate_on, source_hash, stale, ranks.topo_sig,
-                            stats)
+                            stats, reexaminable, source_file_sigs)
             con.commit()
         finally:
             con.close()
@@ -826,8 +878,120 @@ class Projector:
                 if (e := edges.get(entry.get("edge_id"))) is not None
                 and self._is_stale_edge(e, sources)]
 
+    # ---- R3-mirror: the re-examinable-verdicts advisory (non-monotonic evidence, READ-ONLY)
+
+    @staticmethod
+    def _source_file_sigs(sources) -> dict:
+        """Per-source-file content signatures ``{basename: sha256(text)}`` — the baseline the term-
+        overlap filter diffs to find the CHANGED source text. Content-hashed (not stat), mirroring
+        ``node_content_hash``'s content-not-mtime rule, so a byte-identical re-touch never registers as
+        a change. ``{}`` when no source is configured."""
+        if not sources:
+            return {}
+        try:
+            texts = sources.texts  # {basename → raw_text} (a copy; the SourceSet is engine-memoized)
+        except Exception:  # noqa: BLE001 — a source-read hiccup degrades to no signatures, never crashes projection
+            return {}
+        return {name: hashlib.sha256((t or "").encode()).hexdigest() for name, t in texts.items()}
+
+    def _changed_source_text(self, sources, prior) -> str:
+        """The concatenated text of source files whose per-file signature MOVED (edited) or that are
+        NEWLY ADDED since the prior projection — the "what changed" the term-overlap filter (§Stage 6)
+        tests each failed/rejected item against. Returns ``""`` (→ no item is re-examinable) when there
+        is no source OR no prior signature baseline (a cold first projection, or the one-projection lag
+        on a pre-feature index whose meta lacks ``source_file_sigs`` — mirroring R3's Q3 lag). Removed
+        source files contribute nothing: a deleted source can't newly SUPPORT a failed idea."""
+        if not sources or "source_file_sigs" not in prior:
+            return ""
+        prior_sigs = prior.get("source_file_sigs") or {}
+        try:
+            texts = sources.texts
+        except Exception:  # noqa: BLE001 — degrade to "no changed text" rather than crash the projection
+            return ""
+        changed = [t for name, t in texts.items()
+                   if hashlib.sha256((t or "").encode()).hexdigest() != prior_sigs.get(name)]
+        return "\n".join(changed)
+
+    @staticmethod
+    def _content_terms(text) -> set:
+        """The non-trivial term set of a piece of text for the overlap filter: normalize (case/
+        typographic fold, reusing model.normalize_text — the SAME primitive span verification uses),
+        tokenize with ``_OVERLAP_WORD``, drop stopwords. Empty for empty/stopword-only text."""
+        return {t for t in _OVERLAP_WORD.findall(normalize_text(text or ""))
+                if t not in _OVERLAP_STOPWORDS}
+
+    @classmethod
+    def _node_terms(cls, n) -> set:
+        """A node's own terms: its label + body. (An incremental-parse SHELL carries no body — the
+        derived layer omits it — so a shell node contributes label terms only; a graceful degradation,
+        the label being the salient text anyway.)"""
+        return cls._content_terms(f"{n.label or ''} {n.body or ''}")
+
+    @classmethod
+    def _edge_terms(cls, e, by_id) -> set:
+        """An edge's own terms: its span, notes, relation, and BOTH endpoint labels (falling back to the
+        endpoint id — itself a slug of the label — for a dangling target). A rejected edge is typically
+        span-less, so the endpoint labels + relation carry the relevance signal."""
+        src = by_id.get(e.source)
+        tgt = by_id.get(e.target)
+        return cls._content_terms(" ".join([
+            e.span or "", getattr(e, "notes", "") or "", e.relation or "",
+            (src.label if src else e.source) or "", (tgt.label if tgt else e.target) or "",
+        ]))
+
+    @staticmethod
+    def _reexaminable_entry(item_id, kind, state) -> dict:
+        """The advisory record for one re-examinable item — one shape for the full scan and the refilter.
+        ``kind`` is ``"node"``/``"edge"``; ``state`` is the current ``failed``/``rejected`` value."""
+        return {"item_id": item_id, "kind": kind,
+                "state": state.value if isinstance(state, EpistemicState) else state,
+                "reason": "source-set-changed-since-judged"}
+
+    def _reexaminable_verdicts(self, nodes, sources, changed_text="") -> list[dict]:
+        """R3-MIRROR (READ-ONLY): failed/rejected items — nodes AND edges, span-present AND span-less —
+        that were judged against a source set which has since changed, so they deserve a grounder re-look.
+        Item-agnostic and span-agnostic on purpose (R3 covers neither nodes nor span-less items), because
+        the motivating case — a falsified divergence pin — is a span-less node. It NEVER mutates a verdict
+        (re-grounding stays a kg_ground decision) and never re-queues anything. Empty when no source is
+        configured (mirror _stale_verdicts). The term-overlap filter (§Stage 6) keeps only items the
+        CHANGED source text actually bears on; an empty ``changed_text`` (no detectable change) flags
+        nothing — the filter carries the relevance load so the source-hash pre-gate need not."""
+        if not sources:
+            return []
+        changed_terms = self._content_terms(changed_text)
+        if not changed_terms:  # nothing meaningfully changed → nothing bears on any item
+            return []
+        by_id = {n.id: n for n in nodes}
+        out: list[dict] = []
+        for n in nodes:
+            if n.epistemic_state in _REEXAMINABLE_STATES and (self._node_terms(n) & changed_terms):
+                out.append(self._reexaminable_entry(n.id, "node", n.epistemic_state))
+            for e in n.edges:
+                if e.epistemic_state in _REEXAMINABLE_STATES and (self._edge_terms(e, by_id) & changed_terms):
+                    out.append(self._reexaminable_entry(e.id, "edge", e.epistemic_state))
+        return out
+
+    def _refilter_reexaminable(self, prior, nodes, sources) -> list[dict]:
+        """Re-verify ONLY the already-flagged items against the current canon (the term-overlap re-scan
+        is gated on do_full/source-moved). Drops a prior flag whose item was DELETED or has LEFT
+        ``{failed, rejected}`` (i.e. was re-grounded) — self-clearing, mirroring _refilter_stale. A flag,
+        once raised, persists (regardless of later term overlap) until the item is re-grounded; new flags
+        can only come from a source change (which moves source_hash → the full re-scan branch), so this
+        loses nothing. Empty when no source is configured."""
+        if not prior or not sources:
+            return []
+        node_state = {n.id: n.epistemic_state for n in nodes}
+        edge_state = {e.id: e.epistemic_state for n in nodes for e in n.edges}
+        out: list[dict] = []
+        for entry in prior:
+            item_id, kind = entry.get("item_id"), entry.get("kind")
+            state = node_state.get(item_id) if kind == "node" else edge_state.get(item_id)
+            if state in _REEXAMINABLE_STATES:
+                out.append(self._reexaminable_entry(item_id, kind, state))
+        return out
+
     def _save_meta(self, con, head, hashes, gate_on=0, source_hash="", stale_verdicts=None, topo_sig="",
-                   stats=None):
+                   stats=None, reexaminable_verdicts=None, source_file_sigs=None):
         con.execute("INSERT OR REPLACE INTO meta VALUES ('built_from_commit', ?)", (head,))
         con.execute("INSERT OR REPLACE INTO meta VALUES ('file_hashes', ?)", (json.dumps(hashes),))
         # the per-file stat map the review-r6 incremental parse gates on: {name: [size, mtime_ns, id]}.
@@ -844,6 +1008,12 @@ class Projector:
         con.execute("INSERT OR REPLACE INTO meta VALUES ('source_hash', ?)", (source_hash or "",))
         con.execute("INSERT OR REPLACE INTO meta VALUES ('stale_verdicts', ?)",
                     (json.dumps(stale_verdicts or []),))
+        # R3-mirror re-examinable-verdicts advisory: the flagged failed/rejected items (nodes + edges)
+        # and the per-source-file signature baseline the term-overlap filter diffs to find changed text.
+        con.execute("INSERT OR REPLACE INTO meta VALUES ('reexaminable_verdicts', ?)",
+                    (json.dumps(reexaminable_verdicts or []),))
+        con.execute("INSERT OR REPLACE INTO meta VALUES ('source_file_sigs', ?)",
+                    (json.dumps(source_file_sigs or {}, sort_keys=True),))
 
     def _read_meta(self) -> dict:
         try:
@@ -877,6 +1047,20 @@ class Projector:
             out["stale_verdicts"] = json.loads(rows.get("stale_verdicts", "[]"))
         except (ValueError, TypeError):
             out["stale_verdicts"] = []
+        try:
+            out["reexaminable_verdicts"] = json.loads(rows.get("reexaminable_verdicts", "[]"))
+        except (ValueError, TypeError):
+            out["reexaminable_verdicts"] = []
+        # source_file_sigs is read ABSENT-PRESERVING (not defaulted like the keys above): a pre-feature
+        # index has no such row, and _changed_source_text keys the "no baseline → flag nothing" cold-
+        # start rule on the KEY being missing. Defaulting it to {} would make a pre-feature index look
+        # like "a real prior baseline of zero files", diffing the whole current source as newly-added
+        # and flagging every failed/rejected item on the first post-upgrade projection.
+        if "source_file_sigs" in rows:
+            try:
+                out["source_file_sigs"] = json.loads(rows["source_file_sigs"])
+            except (ValueError, TypeError):
+                out["source_file_sigs"] = {}
         return out
 
     def _read_prior_betweenness(self) -> dict | None:
@@ -1418,6 +1602,20 @@ class DerivedReader:
         return stale_verdicts[:_STALE_VERDICTS_CAP], len(stale_verdicts)
 
     @staticmethod
+    def _read_reexaminable_advisory(con) -> "tuple[list, int]":
+        """The R3-MIRROR re-examinable-verdicts advisory list (capped) + its true total. Failed/rejected
+        items (nodes and edges, span-less included) judged against a source set that has since changed —
+        READ-ONLY; the verdict stays untouched until /kg-ground re-runs. Capped at ``_REEXAMINABLE_CAP``
+        (parallel to the stale-verdict cap) so it can't bypass the token budget; the true total is
+        surfaced separately so truncation stays visible."""
+        rrow = con.execute("SELECT value FROM meta WHERE key='reexaminable_verdicts'").fetchone()
+        try:
+            reexaminable = json.loads(rrow[0]) if rrow and rrow[0] else []
+        except (ValueError, TypeError):
+            reexaminable = []
+        return reexaminable[:_REEXAMINABLE_CAP], len(reexaminable)
+
+    @staticmethod
     def _bridge_metric_block(con) -> dict:
         """The completed bridge metric (PLAN Stage 2): read the gate verdict for this projection and rank
         the top nodes gate-aware (gate_ranking) — spec_betweenness (the confound-corrected metric) when the
@@ -1513,6 +1711,7 @@ class DerivedReader:
                 f"ORDER BY degree DESC, id ASC LIMIT {BRIDGE_LIMIT}")]
             bridge_metric = self._bridge_metric_block(con)
             stale_verdicts, stale_total = self._read_stale_advisory(con)
+            reexaminable, reexaminable_total = self._read_reexaminable_advisory(con)
             return {
                 "items": items,
                 "hypotheses": hypotheses,   # the SEPARATE hypothesized lane — proposals, NOT grounded content
@@ -1521,7 +1720,11 @@ class DerivedReader:
                 "falsification_counters": counters,
                 "advisory": {"signal": "structural-bridge", "note": "advisory heuristic, not a guarantee",
                              "nodes": bridges, "bridge_metric": bridge_metric,
-                             "stale_verdicts": stale_verdicts, "stale_verdicts_total": stale_total},
+                             "stale_verdicts": stale_verdicts, "stale_verdicts_total": stale_total,
+                             # R3-mirror: failed/rejected items whose source set changed since judged —
+                             # a re-look candidate, never a verdict change (read-only).
+                             "reexaminable_verdicts": reexaminable,
+                             "reexaminable_verdicts_total": reexaminable_total},
             }
         finally:
             con.close()

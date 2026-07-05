@@ -52,8 +52,11 @@ def _load_render_model(engine) -> dict:
     gate state and the R3 stale-verdict list — never touches the canon or the prose source."""
     nodes, edges = engine.projector._agenda_reader()
     gate_on = int(next((n.get("gate_on") for n in nodes if n.get("gate_on") is not None), 0) or 0)
-    stale = engine.projector._read_meta().get("stale_verdicts", []) or []
-    return {"nodes": nodes, "edges": edges, "gate_on": gate_on, "stale_verdicts": stale}
+    meta = engine.projector._read_meta()
+    stale = meta.get("stale_verdicts", []) or []
+    reexaminable = meta.get("reexaminable_verdicts", []) or []
+    return {"nodes": nodes, "edges": edges, "gate_on": gate_on,
+            "stale_verdicts": stale, "reexaminable_verdicts": reexaminable}
 
 
 def _bridge_set(nodes: list, gate_on: int) -> set:
@@ -251,6 +254,23 @@ def _stale_lines(stale: list) -> list:
     return lines
 
 
+def _reexaminable_lines(items: list) -> list:
+    """The ``## Re-examinable verdicts`` section (R3-mirror — source set changed since judged). Lists
+    failed/rejected items (nodes AND edges, span-less included) worth a grounder re-look; READ-ONLY —
+    the verdict is never mutated here, re-grounding stays a `/kg-ground` decision."""
+    lines: list = []
+    lines.append("")
+    lines.append("## Re-examinable verdicts (R3-mirror — source set changed since judged): "
+                 f"{len(items)}")
+    if items:
+        for r in items[:_LIST_CAP]:
+            lines.append(f"- `{_escape_md(r.get('item_id'))}` ({_escape_md(r.get('kind'))}) — "
+                         f"`{_escape_md(r.get('state'))}` — `{_escape_md(r.get('reason'))}`")
+    else:
+        lines.append("_(none)_")
+    return lines
+
+
 def _source_file_lines(edges: list) -> list:
     """The ``## Source files`` section (R4 — edges per declared source_file)."""
     by_file = Counter(e.get("source_file") or _UNATTRIBUTED for e in edges)
@@ -266,17 +286,20 @@ def _source_file_lines(edges: list) -> list:
     return lines
 
 
-def _report_md(metrics: dict, nodes: list, edges: list, stale: list, gate_on: int) -> str:
+def _report_md(metrics: dict, nodes: list, edges: list, stale: list, gate_on: int,
+               reexaminable: "list | None" = None) -> str:
     """The GRAPH_REPORT.md body. Headline counts come from ``kg_metrics`` (so they cannot drift from the
-    canon); the per-community axis breakdowns, falsification list, R3 stale verdicts and R4 per-file edge
-    counts come from the derived rows. Pure string build — a short concatenation of per-section helpers,
-    each testable in isolation."""
+    canon); the per-community axis breakdowns, falsification list, R3 stale verdicts, the R3-mirror
+    re-examinable verdicts, and R4 per-file edge counts come from the derived rows/meta. Pure string
+    build — a short concatenation of per-section helpers, each testable in isolation. ``reexaminable``
+    defaults to an empty section so a caller that predates the R3-mirror keeps rendering."""
     lines: list = []
     lines += _summary_lines(metrics)
     lines += _legend_lines(_ranked_by(gate_on), gate_on)
     lines += _community_lines(nodes, edges)
     lines += _falsification_lines(edges)
     lines += _stale_lines(stale)
+    lines += _reexaminable_lines(reexaminable or [])
     lines += _source_file_lines(edges)
     return "\n".join(lines)
 
@@ -309,7 +332,7 @@ def build_report(engine) -> Path:
     """Render GRAPH_REPORT.md and atomically write it under the derived dir. Returns its path."""
     model = _load_render_model(engine)
     md = _report_md(engine.kg_metrics(), model["nodes"], model["edges"],
-                    model["stale_verdicts"], model["gate_on"])
+                    model["stale_verdicts"], model["gate_on"], model["reexaminable_verdicts"])
     out = engine.projector.derived / "GRAPH_REPORT.md"
     _atomic_write(out, md)
     return out

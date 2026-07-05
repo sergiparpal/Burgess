@@ -141,5 +141,14 @@ it verbatim and wait; convergence tools are unaffected by design (I9).
   FALSIFIED (`failed`) does the next `kg_diverge_init`/`recall` fold it into this brief's
   **permanent** discards (unified negative memory, I8) and tell you. When a source is already
   configured, `kg_diverge_materialize` returns an `advisory` note that says exactly this.
+- **Re-examinable discards (non-monotonic evidence).** The brief's negative memory is permanent
+  on purpose — but evidence changes. When the **source set changes** after a pin was falsified,
+  `kg_diverge_init`/`kg_diverge_recall` surface those `failed`-fated candidates under a
+  `reexaminable_discards` list (`{candidate, fate:"failed", reason:"source-set-changed-since-judged"}`)
+  — the divergence mirror of /kg-ground's re-examinable advisory. This is **surface-only**: it does
+  NOT auto-un-seal anything. If the user decides a discarded idea deserves a second chance against the
+  new source, call `kg_diverge_recall(project, reexamine=[candidate_ids])` — the **explicit** un-seal
+  lever: it drops those candidates from the discards and clears their failure fate so they return to the
+  proposal pool to be re-materialized / re-grounded. It never changes a graph verdict.
 - Everything the engine computes is **advisory ordering** — embeddings measure dispersion,
   never truth (FUSION invariant I5).

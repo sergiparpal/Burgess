@@ -152,7 +152,19 @@ defeating replay. State cache: `<project>/.kg-reconcile-state.json` (fails open)
   betweenness, `spec_betweenness`, `specificity`, `gate_on`), `edges` (id PK, endpoints, relation,
   axes, span, `source_file`, confidence, and **`owner`** — the canon note the edge is persisted
   in, so incremental diffs key on the owning file, not on `source`), and a `meta` table
-  (cheap signature, per-file stats/hashes).
+  (cheap signature, per-file stats/hashes, and the two read-only source-change advisories below).
+
+Two **read-only** source-change advisories ride in `meta`, computed off the hot path and gated on a
+source-payload hash so they refresh whenever the source set moves — neither ever mutates a verdict or
+re-queues anything (re-grounding stays a `kg_ground` decision):
+- **R3 stale verdicts** (`stale_verdicts`) — a `grounded`/`failed` **span-present** edge whose stored
+  span no longer verifies against its source file (the evidence *shrank*).
+- **R3-mirror re-examinable verdicts** (`reexaminable_verdicts`) — a `failed`/`rejected` item (nodes and
+  **span-less** items included) that was judged against a source set which has since **grown or changed**
+  (non-monotonic evidence), filtered to items whose text overlaps the changed source (`source_file_sigs`
+  tracks the per-file baseline). Self-clearing on re-ground; surfaced in `kg_context.advisory` and the
+  `GRAPH_REPORT`. The divergence side mirrors it: `failed`-fated brief discards are surfaced as
+  `reexaminable_discards` on a source change with an explicit un-seal lever (never auto-un-sealed).
 
 Staleness (`is_stale()`) is content-driven, independent of git state: a cheap canon-dir
 `(count, newest-mtime)` pre-gate, then an authoritative per-file content-hash comparison that is
