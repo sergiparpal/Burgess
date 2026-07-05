@@ -40,6 +40,13 @@ def split_sections(text: str, *, include_heading: bool = False,
     behavior of every prior copy); an empty heading (``## `` alone) also falls back to
     ``preamble_title``. A section left open at EOF is always emitted.
     """
+    # Strip a single leading UTF-8 BOM (U+FEFF): a Windows/Notepad-authored .md is read with
+    # encoding="utf-8" (SourceSet/harness/backend), which PRESERVES a leading BOM, and it would then
+    # keep the first line `﻿## Heading` from matching `_SECTION_HEAD_RE` — folding the first
+    # section into the preamble and losing its title. Fixed here (the single section-splitting home) so
+    # every reader is covered; span verification is already BOM-immune via normalize_text (review-r8-8).
+    if text.startswith("﻿"):
+        text = text[1:]
     sections: "list[tuple[str, str]]" = []
     title, buf = None, []  # title=None -> still in the preamble
     for line in text.splitlines():

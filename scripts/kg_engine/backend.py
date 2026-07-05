@@ -346,8 +346,13 @@ class BackendExtractor:
         contract — so one section's failure can't abort the run."""
         try:
             # §1.9 egress scrub before the text reaches the model; kg_write restores spans for the canon.
+            # BOTH body AND title are scrubbed: extract_section interpolates the title verbatim into the
+            # user prompt, so a heading like `## Notes from <person>` / `## key sk-...` would otherwise
+            # egress a secret/PII the body's own copy of that line already redacts (review-r8-7). The
+            # title is display-only framing (never written back), so it needs no restore.
             scrubbed = self.engine.kg_scrub(body)["scrubbed"]
-            raw = self.extract_section(scrubbed, title)
+            scrubbed_title = self.engine.kg_scrub(title)["scrubbed"] if title else title
+            raw = self.extract_section(scrubbed, scrubbed_title)
             result = self.engine.kg_write(self._stamp(raw, source_file=fname),
                                           message=f"backend:{fname}:{title or 'preamble'}",
                                           existing_nodes=list(baseline.values()))

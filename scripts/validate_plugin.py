@@ -169,7 +169,10 @@ def _check_engine_versions(version: str | None, errors: list[str]) -> None:
         # anywhere in the file), so a [tool.*]/[build-system] version line can't shadow it.
         ("pyproject.toml", _grep_project_version, "pyproject.toml"),
         ("scripts/kg_engine/__init__.py",
-         lambda rel, errs: _grep_version(rel, r'''__version__\s*=\s*["']([^"']+)["']''', errs),
+         # `^`-anchored (re.M is applied in _grep_version) to a module-level assignment, symmetric with
+         # the table-anchored pyproject reader: a stray/commented/example `__version__ = "..."` line
+         # before the real one can't be validated in its place (review-r8-22).
+         lambda rel, errs: _grep_version(rel, r'''^__version__\s*=\s*["']([^"']+)["']''', errs),
          "kg_engine.__version__"),
     ):
         found = getter(rel, errors)

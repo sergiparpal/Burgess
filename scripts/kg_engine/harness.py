@@ -253,6 +253,10 @@ def absorption(graph_data: dict, history: dict, *, now=None, absorb_growth: int 
         except (TypeError, ValueError):
             return default
 
+    # Coerce a non-dict `history` (e.g. a hand-corrupted generations.json shaped {"tracked": [...]})
+    # to {} so the guard below degrades to "no records" instead of crashing on `.items()` — matching
+    # this function's documented malformed-input tolerance (review-r8-17).
+    history = history if isinstance(history, dict) else {}
     history = {k: v for k, v in history.items() if isinstance(v, dict)}
     if now is None:
         ats = [_as_int(r.get("introduced_at", 0)) for r in history.values()]
@@ -300,6 +304,14 @@ def _ngrams(text: str, n=3) -> set:
 
 
 def _score_condition(outputs: list[str], source_text: str) -> dict:
+    # A condition's value must be a LIST of idea strings. A bare string would otherwise iterate
+    # CHARACTER-by-character below (`for o in outputs`), scoring `n=len(string)` with 0 diversity/novelty
+    # — a plausible-looking but meaningless result rather than an error (review-r8-18). Wrap a lone string
+    # as one idea; coerce any other non-list (dict / number / None) to no outputs.
+    if isinstance(outputs, str):
+        outputs = [outputs]
+    elif not isinstance(outputs, list):
+        outputs = []
     if not outputs:
         return {"n": 0, "diversity": 0.0, "novelty": 0.0, "utility": 0.0, "unsupported_rate": 0.0}
     all_ng: Counter = Counter()

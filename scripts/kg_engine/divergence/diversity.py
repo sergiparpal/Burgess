@@ -181,6 +181,13 @@ def select_diverse(
     ``quality_weight``) before entering the kernel, so the slate is
     quality-*weighted* diversity: geometry still owns spread and the judge's
     fitness can only nudge the ordering, never collapse diversity.
+
+    ``seed`` is accepted for API symmetry with the rest of the pipeline but does
+    NOT vary the result: the greedy-DPP MAP path is fully deterministic and the
+    farthest-point fallback always starts at index 0. This is REQUIRED, not a
+    gap — the I5 advisory-ceiling invariant pins grounding output bit-identical
+    regardless of geometry, so selection must be reproducible. Do not expect
+    passing a different ``seed`` to produce a different slate (review-r8-19).
     """
     vecs = np.asarray(vecs, dtype=np.float64)
     n = vecs.shape[0]

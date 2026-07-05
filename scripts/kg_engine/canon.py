@@ -797,17 +797,25 @@ class Canon:
                     and e.epistemic_state == EpistemicState.UNVERIFIED):
                 # Preserve not just the verdict state but the evidence it rests on. The reachable path
                 # is a kg_propose re-proposal of an already-grounded edge (the hypothesized lane skips
-                # the verdict_ids check, boundary.py), whose bare incoming object would otherwise revert
+                # the verdict_ids check, boundary.py — grounded structure is deduped, not quarantined, so
+                # only FAILURE_STATES bind generation), whose bare incoming object would otherwise revert
                 # a PROMOTED hypothesis's provenance (e.g. back to `hypothesized`), blank its support
                 # span, and drop the verdict notes — the citation / falsification rationale §1.7 must
-                # survive forever. Carry prev's verdict-associated fields so the stored edge stays a
-                # consistent grounded/rejected/failed object, not a verdict floating over empty support.
+                # survive forever. Carry ALL of prev's verdict-associated fields — state, attribution,
+                # provenance, span, notes, AND the source_file / confidence / confidence_score /
+                # authored_by that the grounding rests on — so the stored edge stays a consistent
+                # grounded/rejected/failed object, not a verdict floating over blanked evidence: dropping
+                # source_file in particular breaks re-grounding in multi-file (R4) setups (review-r8-2).
                 e.epistemic_state = prev.epistemic_state
                 e.verdict_by = prev.verdict_by
                 e.verdict_at = prev.verdict_at
                 e.provenance = prev.provenance
                 e.span = prev.span
                 e.notes = prev.notes
+                e.source_file = prev.source_file
+                e.confidence = prev.confidence
+                e.confidence_score = prev.confidence_score
+                e.authored_by = prev.authored_by
             by_id[e.id] = e  # incoming wins (already validated)
         cur.edges = list(by_id.values())
         if node.body:

@@ -45,6 +45,7 @@ from pathlib import Path
 # (review-r5) — a stdlib leaf, so this isolated module still never imports the MCP server stack.
 from .envconfig import DERIVED_DIRNAME
 from .envconfig import clean_env as _clean_env
+from .envconfig import plugin_option
 from .envconfig import resolve_data_dir as _resolve_data_dir
 from .envconfig import resolve_project as _resolve_project
 
@@ -123,7 +124,14 @@ async def _answer_async(prompts: list[str], source_path: Path, working_dir: Path
     from lightrag.llm.openai import gpt_4o_mini_complete, openai_embed
 
     working_dir.mkdir(parents=True, exist_ok=True)
-    text = source_path.read_text(encoding="utf-8")
+    # §1.9 egress scrub: LightRAG's ainsert() ships the corpus to OpenAI for entity/embedding
+    # extraction, so the raw source must be scrubbed first — matching the boundary's own contract and
+    # backend.py's per-section scrub, rather than being the one egress point that bypasses it
+    # (review-r8-9). No restore is needed (this arm never writes back to the canon); on the intended
+    # public examples/source.md the scrub is a no-op, so experiment results are unchanged.
+    from .scrub import Scrubber
+    raw = source_path.read_text(encoding="utf-8")
+    text = Scrubber(plugin_option("SENSITIVITY", "medium")).scrub(raw)[0]
     mode = query_mode()
 
     rag = LightRAG(working_dir=str(working_dir),

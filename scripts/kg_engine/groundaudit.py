@@ -169,11 +169,16 @@ class GroundAuditLog:
             # attempt() threw instead of returning a failure signal: truncate the just-appended records
             # the same way as the failure path so a thrown write never leaves orphan records that would
             # inflate the reconciler's consumed tally and let a later replay defeat forge detection (§1.8).
-            self._compensate_or_orphan(offset, "write raised")
+            # `if records`: with nothing appended there is no orphan to drop — and truncating an audit
+            # log that this call never created (empty records + no prior verdicts) would raise a SPURIOUS
+            # OrphanAuditError over a clean rollback, e.g. renaming a not-yet-grounded node (review-r8-4).
+            if records:
+                self._compensate_or_orphan(offset, "write raised")
             raise
-        if not ok:
+        if not ok and records:
             # the write signalled failure: drop the just-appended record(s) (or raise — the caller must
-            # never report a clean rollback over a surviving orphan, §1.8).
+            # never report a clean rollback over a surviving orphan, §1.8). Guarded by `records` for the
+            # same reason as the raise path above: no append → no orphan → nothing to truncate.
             self._compensate_or_orphan(offset, "write failed")
         return payload
 

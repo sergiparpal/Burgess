@@ -121,7 +121,12 @@ _REEXAMINABLE_STATES = (EpistemicState.FAILED, EpistemicState.REJECTED)
 # so the class is lowercase-only; it deliberately splits on '-'/'_' (unlike harness._WORD, which keeps
 # them) so a slug endpoint id like `generality-confound` matches prose "generality confound" across the
 # item↔source boundary. >=3 chars mirrors the kg_context query-term floor.
-_OVERLAP_WORD = re.compile(r"[a-z][a-z0-9]{2,}")
+# Unicode-letter-aware (not `[a-z]`): normalize_text casefolds but does NOT transliterate, so an
+# ASCII-only `[a-z][a-z0-9]{2,}` yielded ZERO terms on a non-Latin-script source — making the whole
+# re-examinable advisory silently empty there (a recall gap, never a false positive). `[^\W\d_]` is a
+# unicode letter; `[^\W_]` is a letter-or-digit (both exclude underscore), so this keeps the exact old
+# ASCII semantics — a letter followed by >=2 letters/digits — extended to every script (review-r8-13).
+_OVERLAP_WORD = re.compile(r"[^\W\d_][^\W_]{2,}")
 # Non-content terms dropped before the overlap test so a shared "with"/"that"/"from" can never make an
 # unrelated changed source flag an item. Small, generic, English-only by design — the filter only needs
 # to remove obviously-uninformative overlaps, not to be a full stoplist (sub-3-char words like a/is/of/
@@ -318,6 +323,34 @@ class Projector:
         # idempotent-write detection, whose agreement with this gate is load-bearing (review-r5).
         return node_content_hash(node)
 
+    @staticmethod
+    def _owner_rank(edge, owner: str) -> tuple:
+        """Precedence for the single-canonical-edge rule (§1.4) when two notes declare the same edge id
+        under different owners: the NATURAL owner (owner == edge.source) outranks any FOREIGN owner, and
+        foreign owners tie-break by lexicographically-smallest id. Lower tuple wins."""
+        return (0 if owner == edge.source else 1, owner)
+
+    @classmethod
+    def _canonical_edges(cls, nodes) -> list:
+        """The deduplicated ``(edge, owner)`` list realizing single-canonical-edge (§1.4) DETERMINISTICALLY.
+        A cross-owner id collision — only reachable by hand-editing a foreign-source edge that duplicates an
+        existing natural edge — resolves by ``_owner_rank`` (natural owner wins, else smallest owner) instead
+        of last-writer-in-node-order, so a full rebuild, graph.json, and the edges table always agree
+        regardless of node iteration order (review-r8-10). FIRST-SEEN id order is preserved, so a graph with
+        no collision (the universal case) yields the exact prior edge sequence — graph.json bytes and every
+        snapshot are unchanged."""
+        chosen: dict = {}   # id -> (edge, owner)
+        order: list = []    # first-seen id order (stable output)
+        for n in nodes:
+            for e in n.edges:
+                prior = chosen.get(e.id)
+                if prior is None:
+                    chosen[e.id] = (e, n.id)
+                    order.append(e.id)
+                elif cls._owner_rank(e, n.id) < cls._owner_rank(prior[0], prior[1]):
+                    chosen[e.id] = (e, n.id)  # higher-ranked owner wins; keep first-seen position
+        return [chosen[i] for i in order]
+
     def _build_graph(self, nodes):
         import networkx as nx  # deferred — see the TYPE_CHECKING note (review-r6: hook-import-tax)
         # MultiDiGraph (not DiGraph): two canon edges can share (source, target) but differ in
@@ -329,14 +362,15 @@ class Projector:
             G.add_node(n.id, label=n.label, node_type=n.node_type, file_type=n.file_type,
                        provenance=n.provenance.value, authored_by=n.authored_by.value,
                        epistemic_state=n.epistemic_state.value)
-        for n in nodes:
-            for e in n.edges:
-                # derived contains nothing the canon doesn't; failure memory is kept, not pruned
-                G.add_edge(e.source, e.target, key=e.id, id=e.id, relation=e.relation,
-                           provenance=e.provenance.value, authored_by=e.authored_by.value,
-                           epistemic_state=e.epistemic_state.value, span=e.span,
-                           source_file=e.source_file, confidence=e.confidence.value,
-                           confidence_score=e.confidence_score)
+        for e, _owner in self._canonical_edges(nodes):
+            # derived contains nothing the canon doesn't; failure memory is kept, not pruned. Cross-owner
+            # id collisions resolve deterministically via _canonical_edges (§1.4) so add_edge's last-writer
+            # -wins can't make graph.json depend on node order.
+            G.add_edge(e.source, e.target, key=e.id, id=e.id, relation=e.relation,
+                       provenance=e.provenance.value, authored_by=e.authored_by.value,
+                       epistemic_state=e.epistemic_state.value, span=e.span,
+                       source_file=e.source_file, confidence=e.confidence.value,
+                       confidence_score=e.confidence_score)
         return G
 
     @staticmethod
@@ -480,7 +514,17 @@ class Projector:
                 self._connect().close()
             if not self.graph_path.exists():
                 import networkx as nx  # deferred — see the TYPE_CHECKING note (review-r6)
-                _atomic_write(self.graph_path, json.dumps(node_link_data(nx.MultiDiGraph())))
+                # EXCLUSIVE create ("x"), not _atomic_write's replace: the lease-holder can finish a full
+                # projection and write the REAL graph.json in the window between the existence check above
+                # and this write, and an unconditional replace would clobber it with this empty placeholder
+                # — leaving an empty graph.json shadowing a populated index until the next canon edit
+                # (review-r8-15). "x" fails closed if the file now exists, so we only ever FILL an absent
+                # file; the lease-holder's real graph always wins.
+                try:
+                    with open(self.graph_path, "x", encoding="utf-8") as f:
+                        f.write(json.dumps(node_link_data(nx.MultiDiGraph())))
+                except FileExistsError:
+                    pass  # the lease-holder already wrote a real graph — keep it
             return ProjectReport(up_to_date=self.db_path.exists() and self.graph_path.exists(),
                                  contended=True)
         try:
@@ -753,10 +797,10 @@ class Projector:
             con.executemany(
                 self._NODES_INSERT,
                 [self._node_values(self._node_row(n, ranks)) for n in nodes])
-            erows = [self._edge_row(e, n.id) for n in nodes for e in n.edges]
-            con.executemany(self._EDGES_INSERT, erows)
+            canon_edges = self._canonical_edges(nodes)  # §1.4 deterministic cross-owner dedup (review-r8-10)
+            con.executemany(self._EDGES_INSERT, [self._edge_row(e, owner) for e, owner in canon_edges])
             report.touched_nodes = [n.id for n in nodes]
-            report.touched_edges = [e.id for n in nodes for e in n.edges]
+            report.touched_edges = [e.id for e, _ in canon_edges]
             self._save_meta(con, head, hashes, ranks.gate_on, source_hash, stale, ranks.topo_sig,
                             stats, reexaminable, source_file_sigs)
             con.commit()
@@ -778,11 +822,24 @@ class Projector:
                 report.touched_nodes.append(n.id)
                 # diff this note's edges against the DB; upsert only changed rows, delete vanished
                 cur = {r[0]: r for r in con.execute(self._EDGES_SELECT_BY_OWNER, (n.id,))}
-                new = {e.id: self._edge_row(e, n.id) for e in n.edges}
-                for eid, row in new.items():
-                    if cur.get(eid) != row:
-                        con.execute(self._EDGES_INSERT, row)
-                        report.touched_edges.append(eid)
+                new = {}
+                for e in n.edges:
+                    row = self._edge_row(e, n.id)
+                    new[e.id] = row  # every id recorded so the vanished-edge sweep below keeps this note's set
+                    if cur.get(e.id) == row:
+                        continue
+                    # §1.4 single-canonical-edge: a FOREIGN edge (its source names ANOTHER node) must not
+                    # overwrite an existing NATURAL row (owner == source) for the same id — natural wins,
+                    # matching the full build's _canonical_edges resolution so full/incremental agree
+                    # (review-r8-10). A natural edge (source == this note) always wins over any foreign row.
+                    if e.source != n.id:
+                        clash = con.execute(
+                            "SELECT owner, source FROM edges WHERE id=? AND owner<>?",
+                            (e.id, n.id)).fetchone()
+                        if clash and clash[0] == clash[1]:
+                            continue  # an existing natural-owned row outranks this foreign edge
+                    con.execute(self._EDGES_INSERT, row)
+                    report.touched_edges.append(e.id)
                 for eid in cur:
                     if eid not in new:
                         con.execute("DELETE FROM edges WHERE id=?", (eid,))
@@ -895,21 +952,24 @@ class Projector:
         return {name: hashlib.sha256((t or "").encode()).hexdigest() for name, t in texts.items()}
 
     def _changed_source_text(self, sources, prior) -> str:
-        """The concatenated text of source files whose per-file signature MOVED (edited) or that are
-        NEWLY ADDED since the prior projection — the "what changed" the term-overlap filter (§Stage 6)
-        tests each failed/rejected item against. Returns ``""`` (→ no item is re-examinable) when there
-        is no source OR no prior signature baseline (a cold first projection, or the one-projection lag
-        on a pre-feature index whose meta lacks ``source_file_sigs`` — mirroring R3's Q3 lag). Removed
-        source files contribute nothing: a deleted source can't newly SUPPORT a failed idea."""
+        """The concatenated text of source files whose CONTENT was not already in the prior corpus — the
+        "what changed" the term-overlap filter (§Stage 6) tests each failed/rejected item against. Keyed
+        on the SET of prior content hashes, not the per-basename signature, so a file that was merely
+        RENAMED (identical bytes under a new basename) is NOT mistaken for newly-added evidence and does
+        not spuriously flag every overlapping item (review-r8-12) — only text whose content is genuinely
+        new to the corpus counts. Returns ``""`` (→ no item is re-examinable) when there is no source OR
+        no prior signature baseline (a cold first projection, or the one-projection lag on a pre-feature
+        index whose meta lacks ``source_file_sigs`` — mirroring R3's Q3 lag). Removed source files
+        contribute nothing: a deleted source can't newly SUPPORT a failed idea."""
         if not sources or "source_file_sigs" not in prior:
             return ""
-        prior_sigs = prior.get("source_file_sigs") or {}
+        prior_hashes = set((prior.get("source_file_sigs") or {}).values())
         try:
             texts = sources.texts
         except Exception:  # noqa: BLE001 — degrade to "no changed text" rather than crash the projection
             return ""
-        changed = [t for name, t in texts.items()
-                   if hashlib.sha256((t or "").encode()).hexdigest() != prior_sigs.get(name)]
+        changed = [t for _, t in texts.items()
+                   if hashlib.sha256((t or "").encode()).hexdigest() not in prior_hashes]
         return "\n".join(changed)
 
     @staticmethod
@@ -947,6 +1007,20 @@ class Projector:
                 "state": state.value if isinstance(state, EpistemicState) else state,
                 "reason": "source-set-changed-since-judged"}
 
+    def _full_note_for_terms(self, n):
+        """Re-read a candidate note from canon so the term-overlap filter sees the FULL body + edge
+        notes. This scan runs on a SOURCE-only change, whose projection takes the stat-gated incremental
+        arm (canon file stats are unchanged) — which hydrates every node as a derived SHELL that omits
+        the body and edge notes. Filtering a shell would silently narrow the overlap basis to
+        label/span/relation/endpoint terms, so a pin whose substance lives in its body (materialize
+        truncates the label to 80 chars and puts the full idea in the body) could never re-surface
+        (review-r8-5). Re-reading is cheap — only failed/rejected candidates reach here — and degrades to
+        the shell on any read fault, matching the projector's fail-to-degraded posture."""
+        try:
+            return self.canon.read_node(n.id)
+        except Exception:  # noqa: BLE001 — a read hiccup degrades to the shell (label/endpoint terms only)
+            return n
+
     def _reexaminable_verdicts(self, nodes, sources, changed_text="") -> list[dict]:
         """R3-MIRROR (READ-ONLY): failed/rejected items — nodes AND edges, span-present AND span-less —
         that were judged against a source set which has since changed, so they deserve a grounder re-look.
@@ -954,8 +1028,10 @@ class Projector:
         the motivating case — a falsified divergence pin — is a span-less node. It NEVER mutates a verdict
         (re-grounding stays a kg_ground decision) and never re-queues anything. Empty when no source is
         configured (mirror _stale_verdicts). The term-overlap filter (§Stage 6) keeps only items the
-        CHANGED source text actually bears on; an empty ``changed_text`` (no detectable change) flags
-        nothing — the filter carries the relevance load so the source-hash pre-gate need not."""
+        CHANGED source text actually bears on — over the FULL node body + edge notes (re-read from canon
+        for the small candidate set, not the body-less incremental shells); an empty ``changed_text`` (no
+        detectable change) flags nothing — the filter carries the relevance load so the source-hash
+        pre-gate need not."""
         if not sources:
             return []
         changed_terms = self._content_terms(changed_text)
@@ -964,9 +1040,14 @@ class Projector:
         by_id = {n.id: n for n in nodes}
         out: list[dict] = []
         for n in nodes:
-            if n.epistemic_state in _REEXAMINABLE_STATES and (self._node_terms(n) & changed_terms):
+            node_is_candidate = n.epistemic_state in _REEXAMINABLE_STATES
+            edge_candidate = any(e.epistemic_state in _REEXAMINABLE_STATES for e in n.edges)
+            if not node_is_candidate and not edge_candidate:
+                continue  # most nodes: skip the canon re-read entirely
+            full = self._full_note_for_terms(n)  # recover body + edge notes from canon (shell has neither)
+            if node_is_candidate and (self._node_terms(full) & changed_terms):
                 out.append(self._reexaminable_entry(n.id, "node", n.epistemic_state))
-            for e in n.edges:
+            for e in full.edges:
                 if e.epistemic_state in _REEXAMINABLE_STATES and (self._edge_terms(e, by_id) & changed_terms):
                     out.append(self._reexaminable_entry(e.id, "edge", e.epistemic_state))
         return out

@@ -347,9 +347,17 @@ def node_content_hash(node: Node) -> str:
     metadata, not content: a hand-authored note that omits them gets a fresh ``utcnow()`` on every
     parse (``Node.__post_init__``), which would churn the hash — forcing redundant reprojection on
     every read, or an updated_at bump on a no-op re-write (review-low: timestamp staleness churn).
-    A real edge/axis/verdict change still moves the hash."""
+    A real edge/axis/verdict change still moves the hash.
+
+    The body is hashed as ``strip("\\n")`` — the SAME leading/trailing-newline fold the disk round-trip
+    applies (``node_to_markdown`` rstrips, ``node_from_markdown`` strips). Hashing the raw ``node.body``
+    instead made an in-memory node carrying a trailing ``\\n`` (normal in an LLM's kg_write JSON) hash
+    differently from its own on-disk form, so canon's idempotent-no-op guard (``_write_batch``) never
+    matched — every idempotent /kg-build re-run rewrote the note with a fresh ``updated_at`` (redundant
+    write, forced reprojection, a timestamp-only commit), the exact churn this hash exists to prevent
+    (review-r8-3). ``strip("\\n")`` only — NOT a broader strip — so first/last-line spaces stay content."""
     fm = {k: v for k, v in node.frontmatter().items() if k not in ("created_at", "updated_at")}
-    return hashlib.sha256((json.dumps(fm, sort_keys=True) + node.body).encode()).hexdigest()
+    return hashlib.sha256((json.dumps(fm, sort_keys=True) + node.body.strip("\n")).encode()).hexdigest()
 
 
 def node_from_markdown(text: str, *, fallback_id: str | None = None) -> Node:

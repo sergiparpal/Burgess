@@ -1055,7 +1055,10 @@ def metrics(project: str, home: Optional[Path] = None) -> Dict[str, Any]:
     # The mean-pairwise-cosine snapshot is O(E²·d); cap the vectors it runs on to the
     # most-novel ``novelty_ref_cap`` elites so a large archive stays cheap. Entropy and
     # coverage still use the FULL niche occupancy (cheap counts) and ``n`` still reports
-    # the true elite count, so at/below the cap this is identical to before.
+    # the true elite count. At/below the cap this is identical to a full computation; ABOVE
+    # it, ``mean_cosine`` is over the most-novel subsample (which skews it toward "more
+    # diverse"), so ``mean_cosine_n`` below reports the actual sample size — measurement-only,
+    # it never gates selection, the monitor, or a verdict (review-r8-20).
     cap = int(eng.get("novelty_ref_cap", NOVELTY_REF_CAP))
     cos_ids = _novelty_reference_ids(arc, stored_emb, cap=cap)
     # dim only matters in the empty case (the resulting (0, dim) array is never used in
@@ -1086,6 +1089,7 @@ def metrics(project: str, home: Optional[Path] = None) -> Dict[str, Any]:
     result = {
         "entropy": mon["entropy"],
         "mean_cosine": mon["mean_cosine"],
+        "mean_cosine_n": len(cos_ids),   # elites mean_cosine ran on (< n above the cap: see comment)
         "coverage": mon["coverage"],
         "n": len(elite_ids),
         "mechanism_spread": mech_spread,

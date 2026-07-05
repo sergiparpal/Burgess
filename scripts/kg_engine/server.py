@@ -703,7 +703,7 @@ class KGEngine:
             n = n or {}
             nid = n.get("id") or n.get("label") or ""
             content = {k: n.get(k) for k in
-                       ("label", "body", "node_type", "provenance", "authored_by",
+                       ("label", "body", "node_type", "file_type", "provenance", "authored_by",
                         "epistemic_state", "confidence") if k in n}
             items.append("node:" + slug(str(nid)) + "|"
                          + json.dumps(content, sort_keys=True, ensure_ascii=True, default=str))
@@ -1102,6 +1102,7 @@ class KGEngine:
                 _, mig = self._rewrite_endpoints(e, old, new)
                 if mig:
                     migrations.append(mig)
+            node.edges = self._dedup_rename_edges(node.edges)
             touched = [node]
             for other in self.canon.all_nodes():
                 if other.id == old:
@@ -1113,6 +1114,7 @@ class KGEngine:
                     if mig:
                         migrations.append(mig)
                 if node_changed:
+                    other.edges = self._dedup_rename_edges(other.edges)
                     touched.append(other)
             # Emit the migrating audit records (compensated by truncation if the batch rolls back, like
             # kg_ground), then write the corrected nodes VERBATIM (merge=False): merging would
@@ -1178,6 +1180,24 @@ class KGEngine:
                     span=span, source_file=hi.source_file or lo.source_file,
                     confidence=hi.confidence, confidence_score=hi.confidence_score,
                     verdict_by=verdict_by, verdict_at=verdict_at, notes=(hi.notes or lo.notes))
+
+    def _dedup_rename_edges(self, edges: "list[Edge]") -> "list[Edge]":
+        """Coalesce edges that collide on ONE canonical id AFTER a rename rewrote their endpoints —
+        the dedup half of kg_rename, mirroring `_rewrite_dedup_edges` (which serves kg_merge) but on
+        edges whose ids were ALREADY recomputed by `_rewrite_endpoints`. Two edges can only collide on
+        an id iff they share a source, and a note holds only its own source's edges, so a collision is
+        always within ONE note — this dedup is per-note. Collisions coalesce via the negative-info-
+        sticky, never-forging `_merge_edge_pair`, so a grounding verdict / §1.7 failure memory survives a
+        rename instead of being silently dropped by the downstream `{e.id: e}` collapse (review-r8-1).
+
+        UNLIKE kg_merge's `_rewrite_dedup_edges`, self-loops are NOT dropped: a rename that yields
+        `new→new` (from a pre-rename `old→old` self-relation, or an `old→new`/`new→old` edge) is a
+        legitimate distinct edge, not the merge artifact of collapsing two nodes into one."""
+        survivors: "dict[str, Edge]" = {}
+        for e in edges:
+            prev = survivors.get(e.id)
+            survivors[e.id] = e if prev is None else self._merge_edge_pair(prev, e)
+        return list(survivors.values())
 
     def _rewrite_dedup_edges(self, edges: "list[Edge]", frm: str, into: str, report: dict):
         """Rewrite every `frm`→`into` endpoint on a node's edge list, recompute each deterministic id,
@@ -1745,6 +1765,15 @@ class KGEngine:
             if cid in ("_edges", "_source_sig"):
                 continue  # reserved ledger keys (extra edges / brief-level marker): no candidate to discard
             if entry.get("fate") in FAILURE_STATE_VALUES:
+                # Already folded. A pre-Stage-5 entry has a `fate` but no `fate_source_sig`; stamp the
+                # CURRENT source as its baseline ONCE so a LATER source change can surface it as
+                # re-examinable — otherwise it stays PERMANENTLY non-re-examinable (review-r8-14).
+                # Mirrors the graph cold-start rule (establish a baseline now, diff against it later): the
+                # sig equals `current` right after backfill, so this never causes a false surface.
+                if (entry.get("fate") == EpistemicState.FAILED.value
+                        and "fate_source_sig" not in entry and current_source_sig):
+                    entry["fate_source_sig"] = current_source_sig
+                    changed = True
                 continue  # already folded into discards
             # An entry the user EXPLICITLY un-sealed against the CURRENT source stays out of discards
             # until the source changes again (or they re-ground the still-`failed` graph item) — otherwise
@@ -1789,8 +1818,9 @@ class KGEngine:
         permanent negative memory (I8) deserves a re-look. SURFACE-ONLY — it removes nothing and clears
         no fate (that is the explicit un-seal lever); the discard stays sealed until the user un-seals it.
         Empty when no source is configured. An entry fated before this feature (no `fate_source_sig`) is
-        NOT surfaced — there is no baseline source to diff against, mirroring the graph side's cold-start
-        rule (a one-projection lag, not a false burst)."""
+        not surfaced on the FIRST post-upgrade sync — there is no baseline source to diff against — but
+        `_sync_materialized_fates` then backfills its baseline to the current source, so a subsequent
+        source change surfaces it normally (a one-projection lag, not a false burst)."""
         from kg_engine.divergence.session import Session as _DSession
 
         sess = _DSession(project, home=self._diverge_home())
@@ -1812,13 +1842,29 @@ class KGEngine:
         return out
 
     def _unseal_discards(self, project: str, candidate_ids: list) -> list:
-        """The EXPLICIT un-seal lever (Stage 5): for each named candidate, drop it from the brief's
-        discards (return it to the proposal pool) and clear its `fate` in materialized.json so it can be
+        """The EXPLICIT un-seal lever (Stage 5): for each named candidate THAT IS CURRENTLY
+        RE-EXAMINABLE (a materialized `fate == "failed"` pin whose source set has changed since it was
+        fated — exactly the set `_reexaminable_discards` surfaces), drop it from the brief's discards
+        (return it to the proposal pool) and clear its `fate` in materialized.json so it can be
         re-materialized / re-grounded against the new source. Records `unsealed_source_sig` so the next
         fate-sync does NOT immediately re-fold the still-`failed` graph item (see _sync_materialized_fates).
-        NEVER auto-invoked and NEVER touches a graph verdict. Returns the candidates actually un-sealed."""
+        NEVER auto-invoked and NEVER touches a graph verdict.
+
+        A requested cid that is NOT currently re-examinable — a genuine user discard, an unknown id, or a
+        failed pin whose source has not changed — is IGNORED, never revived: the brief's permanent negative
+        memory (I8) stays sealed outside the surfaced set, and the return list is the candidates ACTUALLY
+        un-sealed, not merely the ones requested (review-r8-6)."""
         from kg_engine.divergence.session import Session as _DSession
 
+        # coerce a bare string so reexamine="c1" un-seals "c1", not the chars "c"+"1" (review-r8-11)
+        if isinstance(candidate_ids, str):
+            candidate_ids = [candidate_ids]
+        requested = {str(c) for c in (candidate_ids or [])}
+        # gate on the advisory's current re-examinable set — the lever's ONLY licensed inputs.
+        allowed = {d["candidate"] for d in self._reexaminable_discards(project)}
+        targets = requested & allowed
+        if not targets:
+            return []
         sess = _DSession(project, home=self._diverge_home())
         state = sess.state
         try:
@@ -1829,7 +1875,7 @@ class KGEngine:
         ledger = state.read_materialized()
         unsealed: list = []
         changed = False
-        for cid in [str(c) for c in (candidate_ids or [])]:
+        for cid in sorted(targets):
             state.remove_discard(domain, cid)  # return to the proposal pool (locked read-modify-write)
             entry = ledger.get(cid) if isinstance(ledger, dict) else None
             if isinstance(entry, dict):

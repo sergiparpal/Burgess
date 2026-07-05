@@ -215,7 +215,17 @@ function foregroundCatchUp(sysPy, force) {
       /* best-effort */
     }
   }
-  const r = spawnSync(sysPy, [BOOTSTRAP, "--venv", VENV_DIR], { stdio: ["ignore", 2, "inherit"] });
+  // Hard ceiling on the SYNCHRONOUS catch-up so a wedged install (a hung `uv sync`/`pip` behind a
+  // stalled network, or an interpreter that never returns) can't block the launcher — and thus the MCP
+  // client's startup — indefinitely (review-r8-23). Bootstrap self-bounds its LOCK wait to ~1860s (the
+  // long default lets ONE foreground run wait out AND steal a stale lock, so we deliberately do NOT
+  // shorten --wait), but the install subprocess itself is otherwise unbounded. The ceiling is generous
+  // (well above a cold wheel-download build and the full lock wait) so it never aborts a legitimately
+  // slow-but-progressing build; on timeout spawnSync sets r.error and we fall through to the message +
+  // the server's early-failure self-heal, while the DETACHED background worker keeps building unbounded.
+  const FOREGROUND_CATCHUP_TIMEOUT_MS = 40 * 60 * 1000; // > bootstrap's ~31-min lock wait + build margin
+  const r = spawnSync(sysPy, [BOOTSTRAP, "--venv", VENV_DIR],
+    { stdio: ["ignore", 2, "inherit"], timeout: FOREGROUND_CATCHUP_TIMEOUT_MS });
   // Surface a spawn failure (ENOENT) or a non-zero bootstrap exit (bootstrap.py names these:
   // EXIT_STILL_PROVISIONING=2 past the wait deadline; EXIT_BUILD_FAILED=1; EXIT_PY_TOO_OLD=3)
   // instead of silently launching against a possibly-unready venv. The server's early-failure

@@ -382,9 +382,12 @@ def _durability_quarantine(edge, canonical_id, rev, failure_ids, verdict_ids,
     its reverse (a candidate that re-proposes a refuted claim in either direction is dead), while the
     span-present lane checks ONLY `canonical_id` — a span-present edge has genuine textual support for
     ITS OWN direction, so the reverse edge is a distinct honest claim, not a re-proposal of the refuted
-    one. The span-present lane also guards the POSITIVE half (grounded/obsolete via `verdict_ids`):
-    re-emitting such an edge would otherwise dedup-and-accept, then the canon's "incoming wins" merge
-    resets the verdict to this fresh `unverified` edge on a routine idempotent /kg-build re-run.
+    one. The POSITIVE half (grounded/obsolete via `verdict_ids`) is guarded ONLY on the span-present lane
+    (`not check_reverse`): a hypothesized re-proposal of a GROUNDED edge must NOT be quarantined — only
+    FAILURE_STATES bind generation, a grounded edge is live structure to dedup against, not a refutation
+    (test_hypothesized_not_blocked_by_grounded_neighbour). The metadata that the "incoming wins" merge
+    would otherwise drop from that grounded edge is preserved in canon._merge_into_existing, not by
+    quarantining here (review-r8-2).
     """
     if canonical_id in failure_ids or (check_reverse and rev in failure_ids):
         return _result("edge", edge, Disposition.QUARANTINED, "collapses-into-known-failure", False, canonical_id)

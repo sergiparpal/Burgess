@@ -37,7 +37,12 @@ try {
     // Prepend uv's usual install dir (~/.local/bin on POSIX, %USERPROFILE%\.local\bin on Windows)
     // BEFORE the probe, so both a standalone-installed uv (bootstrap's shutil.which('uv') fast
     // path) and a user-local Python not yet on the inherited PATH are found. Harmless if absent.
-    process.env.PATH = [join(homedir(), ".local", "bin"), process.env.PATH || ""].join(delimiter);
+    // Filter out an empty inherited PATH before joining: an unset/empty PATH would otherwise leave a
+    // trailing `<...>/.local/bin:` whose empty element POSIX resolves as the CWD, putting a possibly
+    // attacker-controlled `python3` in the session's working directory on the probe's search path
+    // (review-r8-21).
+    const localBin = join(homedir(), ".local", "bin");
+    process.env.PATH = [localBin, process.env.PATH].filter(Boolean).join(delimiter);
     const py = systemPython(); // >= 3.10, each candidate probe bounded by PROBE_TIMEOUT_MS
     if (py) {
       // stdio ignored so bootstrap never writes to the hook log (it logs to provision.log).

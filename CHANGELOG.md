@@ -2,6 +2,60 @@
 
 ## Unreleased
 
+### Fixed
+
+- **2026-07-05 exhaustive review (review-r8) — 23 findings across the engine, all
+  landed with mutation-caught regression pins in `tests/test_review_r8.py`.**
+  - **`kg_rename` silently dropped a grounding verdict** (high): an endpoint
+    rewrite that collapsed two of a node's edges onto one canonical id persisted a
+    duplicate id (no dedup, unlike `kg_merge`), and the downstream `{e.id: e}`
+    collapse kept the wrong edge. It now coalesces collisions via `_merge_edge_pair`
+    (negative-info-sticky, verdict-preserving) while keeping legitimate `new→new`
+    self-loops.
+  - **Re-proposing a grounded edge dropped its provenance metadata**: the
+    hypothesized-lane dedup is correct (only `FAILURE_STATES` bind generation — a
+    grounded edge is live structure, not a refutation), but `canon._merge_into_existing`
+    preserved only state/span, blanking `source_file`/`confidence`/`confidence_score`/
+    `authored_by`. It now carries all of the grounded edge's evidence.
+  - **`node_content_hash` churn**: a body with a trailing `\n` (normal LLM output)
+    hashed differently from its own disk round-trip, defeating canon's idempotent-
+    no-op write guard so every re-run rewrote the note. The hash now folds the body
+    the same way the disk round-trip does.
+  - **`groundaudit` spurious `OrphanAuditError`**: an empty-records rollback against
+    a not-yet-created audit log raised a false §1.8 durability breach (nothing was
+    appended → no orphan). Compensation is now guarded on `records`.
+  - **Re-examinable-verdicts term filter read body-less shells**: a source-only
+    change projects via the incremental (shell) arm, so the filter saw no node
+    body / edge notes and a body-only distinguishing term never re-surfaced a
+    falsified item. It now re-reads the full note from canon for the small
+    candidate set. The overlap tokenizer is also unicode-aware (was ASCII-only, so
+    the whole advisory went silent on a non-Latin source), and a renamed
+    identical-content source file is no longer mistaken for newly-added evidence.
+  - **`kg_diverge_recall(reexamine=...)` un-sealed too much**: it revived ANY named
+    cid — a genuine user discard, an unknown id, or a still-valid failure — and a
+    bare-string argument iterated character-by-character. It now un-seals only the
+    currently re-examinable set and reports only what was actually un-sealed;
+    pre-feature `failed` ledger entries get a backfilled baseline so a later source
+    change can surface them.
+  - **Egress-scrub gaps**: the backend scrubbed only the section body, egressing the
+    raw `## heading` (PII/secret) in the prompt; the optional `lightrag` arm shipped
+    the raw source to OpenAI unscrubbed. Both now scrub before egress.
+  - **Deterministic derived layer**: a cross-owner `edge_id` collision (hand-edited
+    foreign-source edge duplicating a natural one) resolved by node iteration order,
+    so full vs incremental projection disagreed; resolution is now deterministic
+    (natural owner wins). A leading UTF-8 BOM no longer folds the first `##` section
+    into the preamble, and a contended cold-start projection can no longer clobber a
+    real `graph.json` with an empty placeholder (exclusive create).
+  - **Smaller hardening**: `_payload_receipt` now includes `file_type` (a
+    file_type-only change no longer replays as a no-op); `harness.absorption`
+    tolerates a non-dict history and `_score_condition` no longer character-scores a
+    bare-string condition value; `provision.mjs` no longer leaves an empty PATH
+    element (CWD on the probe search path); `validate_plugin` anchors the
+    `__version__` scan; `select_diverse(seed=)` is documented as a deterministic
+    no-op; `kg_diverge_metrics` reports `mean_cosine_n` (the subsample size above the
+    novelty cap); and the launcher's synchronous cold-start catch-up has a hard
+    ceiling so a wedged install can't block session startup indefinitely.
+
 ### Added
 
 - **Re-examinable-verdicts advisory (R3-mirror) for non-monotonic evidence.**
