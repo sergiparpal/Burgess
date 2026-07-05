@@ -66,8 +66,9 @@ Prefer it in plain language, nothing assumed? The full walkthrough is [`TUTORIAL
       │                    epistemic_state=unverified, lineage in the body; no source? they wait
       ▼
 /kg-ground                 the ONLY verdict path: promotion needs support (a verbatim span or
-      │                    citation); failures become PERMANENT negative memory — and flow back
-      │                    into the brief's discards, so failed ideas are never re-proposed
+      │                    citation); failures are PERMANENT negative memory. A FALSIFIED pin
+      │                    flows back into the brief's discards; a merely-unsupported novel pin
+      │                    waits in the lane, recoverable, until you add sources
       ▼
 /kg-generate               seven structural mechanisms propose from the graph itself; with
                            divergence.dpp on, the same slate is presented in advisory-DPP order
@@ -120,7 +121,7 @@ In the spirit of both donors, honestly:
 ## Tests
 
 <!-- test-count:begin -->
-The suite currently reports: **1066 passed, 2 skipped** (`uv run --extra dev pytest tests/`).
+The suite currently reports: **1071 passed, 2 skipped** (`uv run --extra dev pytest tests/`).
 <!-- test-count:end -->
 
 This line is generated from pytest output, never hand-written. Run it yourself:

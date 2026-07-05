@@ -134,8 +134,12 @@ it verbatim and wait; convergence tools are unaffected by design (I9).
   reported `skipped`; re-ingest it first). No source in the project? The ideas simply WAIT
   in the lane. Optional `edges` link materialized ideas to existing nodes (same boundary:
   forged verdicts stripped, text claims refused). Materialized pins may be ground FIRST by
-  /kg-ground (priority is ordering only — verdict-neutral by test). If grounding later FAILS
-  a materialized idea, the next `kg_diverge_init`/`recall` folds it into this brief's
-  discards automatically (unified negative memory, I8) and tells you.
+  /kg-ground (priority is ordering only — verdict-neutral by test). Grounding a materialized
+  pin against an existing source will (correctly) leave it `unverified` — a novel idea has no
+  in-source span yet — so it WAITS in the lane, recoverable, until you add supporting sources;
+  a merely-unsupported (`rejected`) pin is **never** auto-discarded. Only when a pin is actively
+  FALSIFIED (`failed`) does the next `kg_diverge_init`/`recall` fold it into this brief's
+  **permanent** discards (unified negative memory, I8) and tell you. When a source is already
+  configured, `kg_diverge_materialize` returns an `advisory` note that says exactly this.
 - Everything the engine computes is **advisory ordering** — embeddings measure dispersion,
   never truth (FUSION invariant I5).

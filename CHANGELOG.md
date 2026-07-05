@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Grounding no longer permanently buries novel `/kg-diverge` pins.**
+  `_sync_materialized_fates` folded a materialized pin into its brief's
+  **permanent** discards whenever its canon item reached the global
+  `FAILURE_STATES` (`{rejected, failed}`) — so grounding a genuinely novel pin
+  against the original source (which yields `rejected`: no in-source span, the
+  *expected* state of novelty) discarded it **for being novel**. A new, narrower
+  `server.MATERIALIZED_DISCARD_STATES = {failed}` now keys the fold: only an
+  actively **falsified** pin discards; a merely **unsupported** pin stays
+  recoverable in the lane until sources are added. Verdict neutrality is
+  preserved (the change is in the diverge-brief-local *consequence*, not the
+  verdict); the global `FAILURE_STATES` and the write-boundary durability
+  quarantine backing `/kg-generate` negative memory are untouched. The
+  `kg-grounder` prompt now leaves unsupported `[diverge]`-lineage edges
+  `unverified` (triage), and `kg_diverge_materialize` returns an advisory-only
+  note when a source is already configured. Pinned in
+  `tests/fusion/test_materialization.py` (5 new tests, mutation-verified).
+
 ## 0.1.2 — 2026-07-04
 
 Hardening release: the full 2026-07 review trilogy — maintainability

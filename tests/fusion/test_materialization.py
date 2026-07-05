@@ -311,3 +311,141 @@ def test_e2e_diverge_pin_materialize_ground_failure_feeds_back(rig):
     # idempotent: a second sync doesn't re-discard or flip anything
     again = t["kg_diverge_recall"](project="brief")
     assert not again.get("materialized_failures_discarded")
+
+
+# --------------------------------------------------------------------------- #
+# Only FALSIFICATION (`failed`) folds a materialized pin into the brief's permanent
+# discards. A merely-UNSUPPORTED pin (`rejected` — no in-source span, the expected state
+# of a genuinely novel idea awaiting sources) stays recoverable. The verdict a pin receives
+# is unchanged and provenance-neutral; only the diverge-brief-local discard CONSEQUENCE was
+# narrowed (server.MATERIALIZED_DISCARD_STATES, distinct from the global model.FAILURE_STATES).
+# --------------------------------------------------------------------------- #
+
+
+def test_materialize_rejected_node_pin_is_not_discarded(rig):
+    """A materialized pin (node) that grounding merely REJECTS (no support — what grounding a
+    novel idea against the original source yields) must NOT fold into the brief's permanent
+    discards; it stays recoverable as a pin. Only FALSIFICATION discards."""
+    engine, t, _ = rig
+    out = t["kg_diverge_materialize"](project="brief", candidate_ids=["c0"])
+    assert out["materialized"] == 1, out["results"]
+    nid = _node_id("brief", "c0")
+
+    res = engine.kg_ground(nid, "rejected", kind="node")   # merely unsupported, no support
+    assert res.get("ok"), res
+    assert engine.canon.read_node(nid).epistemic_state is EpistemicState.REJECTED
+
+    resumed = t["kg_diverge_init"](project="brief", axes="generic", session="s1", seed=5)
+    assert not resumed.get("materialized_failures_discarded"), resumed
+
+    from kg_engine.divergence.state import State
+    st = State("brief", home=Path(engine.project_dir) / ".kg" / "diverge")
+    assert "c0" not in st.read_discards("generic")           # not buried for being novel
+    assert "c0" in st.read_pins("generic")                   # still recoverable as a pin
+    assert st.read_materialized()["c0"].get("fate") is None  # no failure fate stamped
+
+
+def test_materialize_rejected_edge_is_not_discarded(rig):
+    """The edge path mirrors the node path: a materialized pin whose optional hypothesized
+    EDGE is grounded REJECTED (no support) must not fold its owning candidate into discards."""
+    engine, t, _ = rig
+    t["kg_diverge_materialize"](project="brief", candidate_ids=["c0", "c1"])
+    a, b = _node_id("brief", "c0"), _node_id("brief", "c1")
+    out = t["kg_diverge_materialize"](project="brief", candidate_ids=[],
+                                      edges=[{"source": a, "target": b, "relation": "bridges",
+                                              "candidate_id": "c0"}])
+    d = next(dd for dd in out["propose"]["details"] if dd["kind"] == "edge")
+    assert d["disposition"] in ("ACCEPTED", "DEMOTED"), d   # landed hypothesized under c0
+    eid = edge_id(a, "bridges", b)
+    assert engine.kg_ground(eid, "rejected", kind="edge").get("ok")   # no support
+    e = next(e for e in engine.canon.read_node(a).edges if e.id == eid)
+    assert e.epistemic_state is EpistemicState.REJECTED
+
+    resumed = t["kg_diverge_init"](project="brief", axes="generic", session="s1", seed=5)
+    assert not resumed.get("materialized_failures_discarded"), resumed
+    from kg_engine.divergence.state import State
+    st = State("brief", home=Path(engine.project_dir) / ".kg" / "diverge")
+    assert "c0" not in st.read_discards("generic")
+    assert st.read_materialized()["c0"].get("fate") is None
+
+
+def test_materialize_failed_edge_still_discards(rig):
+    """Regression parity for the EDGE path: a materialized pin whose hypothesized edge is
+    FALSIFIED (`failed`) still folds its candidate into the brief's discards. (The e2e above
+    covers the node+failed case; this locks the edge+failed case so the whole
+    {node,edge} × {rejected→keep, failed→discard} matrix is executable.)"""
+    engine, t, _ = rig
+    t["kg_diverge_materialize"](project="brief", candidate_ids=["c0", "c1"])
+    a, b = _node_id("brief", "c0"), _node_id("brief", "c1")
+    t["kg_diverge_materialize"](project="brief", candidate_ids=[],
+                                edges=[{"source": a, "target": b, "relation": "bridges",
+                                        "candidate_id": "c0"}])
+    eid = edge_id(a, "bridges", b)
+    assert engine.kg_ground(eid, "failed", kind="edge", note="falsified").get("ok")
+
+    resumed = t["kg_diverge_init"](project="brief", axes="generic", session="s1", seed=5)
+    fates = resumed.get("materialized_failures_discarded", [])
+    assert {"candidate": "c0", "fate": "failed"} in fates, resumed
+    from kg_engine.divergence.state import State
+    st = State("brief", home=Path(engine.project_dir) / ".kg" / "diverge")
+    assert "c0" in st.read_discards("generic")
+
+
+def test_pin_rejected_verdict_is_provenance_neutral(rig):
+    """We narrowed the CONSEQUENCE (the fate sync), never the VERDICT. A materialized-lineage
+    hypothesized edge and an equivalent plain one, both grounded `rejected` with no support,
+    must land in the SAME EpistemicState.REJECTED — proving the verdict was NOT made
+    provenance-dependent (the §4 rejected approach we deliberately did not take). This is the
+    rejected-verdict analogue of test_pin_priority_is_verdict_neutral (grounded/failed)."""
+    engine, t, _ = rig
+    engine.kg_write({"nodes": [
+        {"id": "px", "label": "Px", "node_type": "claim"},
+        {"id": "py", "label": "Py", "node_type": "claim"},
+        {"id": "qx", "label": "Qx", "node_type": "claim"},
+        {"id": "qy", "label": "Qy", "node_type": "claim"}]})
+    engine.kg_propose({"edges": [
+        {"source": "px", "target": "py", "relation": "bridges",
+         "notes": "[diverge] pinned candidate=c0 brief=brief session=s1"},
+        {"source": "qx", "target": "qy", "relation": "bridges"}]})
+    pinned_id = edge_id("px", "bridges", "py")
+    plain_id = edge_id("qx", "bridges", "qy")
+    r1 = engine.kg_ground(pinned_id, "rejected")   # no support
+    r2 = engine.kg_ground(plain_id, "rejected")
+    assert r1.get("ok") and r2.get("ok"), (r1, r2)
+
+    e_pinned = next(e for e in engine.canon.read_node("px").edges if e.id == pinned_id)
+    e_plain = next(e for e in engine.canon.read_node("qx").edges if e.id == plain_id)
+    assert e_pinned.epistemic_state is EpistemicState.REJECTED
+    assert e_plain.epistemic_state is EpistemicState.REJECTED
+
+
+def test_materialize_advisory_present_when_source_exists(rig):
+    """Part C: the advisory is gated on BOTH conjuncts of `source_path is not None and
+    materialized_count` — present only when a source is configured AND >=1 pin materialized;
+    absent when either conjunct is false. Advisory only — never a disposition, verdict, or
+    ledger write (the ledger/materialized count is unchanged)."""
+    engine, t, _ = rig
+    assert engine.source_path is not None                # the rig configures a real source
+
+    # source present + >=1 materialized → advisory present
+    out = t["kg_diverge_materialize"](project="brief", candidate_ids=["c0"])
+    assert out["materialized"] == 1
+    assert "advisory" in out and "unverified" in out["advisory"]
+
+    # source present but a NON-empty payload that fully REJECTS at the boundary (unknown field →
+    # extra="forbid") → the code REACHES the advisory block with materialized_count == 0, so the
+    # advisory must still be absent. Guards the SECOND conjunct of the AND: dropping
+    # `and materialized_count` would emit a "grounding these pins" advisory here, naming no pins.
+    # (A refused/all-skipped batch instead short-circuits on the empty-payload early return and
+    # never reaches this block, so it would NOT catch that regression — this path does.)
+    zero = t["kg_diverge_materialize"](project="brief", candidate_ids=["c0"],
+                                       edges=[{"source": "x", "target": "y", "relation": "bridges",
+                                               "embedding": [0.1, 0.2, 0.3]}])
+    assert zero["materialized"] == 0
+    assert "advisory" not in zero
+
+    # no source configured + >=1 materialized → advisory absent (first conjunct false)
+    engine.source_path = None
+    out2 = t["kg_diverge_materialize"](project="brief", candidate_ids=["c1"])
+    assert out2["materialized"] == 1
+    assert "advisory" not in out2

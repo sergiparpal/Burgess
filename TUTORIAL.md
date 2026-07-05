@@ -142,9 +142,12 @@ note in its body recording that it came from this brainstorm. Two things to expe
 
 - If you don't have a source document/graph yet, that's fine — the ideas simply **wait** as
   hypotheses until you give them something to be checked against.
-- Later, if you check a materialized idea and it *fails*, Burgess automatically folds it back into
-  that brainstorm's discards — so it won't be re-suggested. Your brainstorming and your fact-checking
-  share one memory.
+- Later, when you *check* a materialized idea against your sources, there are two outcomes. If it's
+  simply **not supported yet** — a brand-new idea usually won't have a quote waiting in your existing
+  sources — it just **stays in the graph as a hypothesis**, recoverable; add sources for the ideas you
+  want to promote. Only if an idea is actively **disproven** does Burgess fold it back into that
+  brainstorm's discards, so it won't be re-suggested. Your brainstorming and your fact-checking share
+  one memory.
 
 ---
 

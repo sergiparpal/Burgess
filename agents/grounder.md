@@ -65,6 +65,29 @@ So a hypothesized edge has exactly three honest fates: **promoted with support**
 grounded), **rejected** (→ failure memory), or **left `unverified`** for a later pass. It is never groundable
 in place without support.
 
+### Two kinds of hypothesized item — triage by the `[diverge]` marker
+
+Not every hypothesized item is a *structural proposal meant to be verified now*. Some carry a
+**`[diverge] pinned …` lineage marker** — in an edge's `notes`, or in a node's body. Those are ideas a **human
+pinned** in a `/kg-diverge` brief and materialized into the lane as **candidates awaiting sources**, not
+machine proposals from `/kg-generate`. A genuinely novel idea has **no in-source span by construction** — that
+is *what makes it novel* — so grounding it against the current source will "find no support" for the expected,
+non-failure reason.
+
+- **`[diverge]`-marked item, no support → leave it `unverified`.** Do **not** stamp `rejected`. This is the
+  sanctioned "left `unverified` for a later pass" fate above — you are **choosing not to verdict** (triage),
+  never bending one. Reason: don't spend a rejection on an item that by construction has no in-source span yet;
+  it waits in the lane until the user adds sources for the pins worth promoting. (A `rejected` here would also
+  read semantically as *failed grounding* and, downstream, feed the brief's negative memory — burying the very
+  novelty the user pinned.)
+- **`[diverge]`-marked item, WITH positive support → `grounded`.** If you *do* find a verbatim `support_span`
+  (or an external `support_note`), promote it exactly like any hypothesis — earning grounding is always allowed.
+- **Active falsification is not yours.** If a `[diverge]` idea is genuinely *refuted* (not merely unsupported),
+  that is the **adversarial grounder's** `failed` verdict, not a `rejected` from you.
+- **Items WITHOUT the marker are unchanged.** Ordinary `/kg-generate` proposals have no `[diverge]` lineage;
+  for them, no support still means **`rejected` → failure memory** (§1.7), exactly as above — they *are*
+  structural proposals meant to be checked now, and a false structural bridge should be remembered as a failure.
+
 ## The edge.id format (target_id)
 
 Edge ids are deterministic, derived from the triple by the engine (`model.edge_id`):

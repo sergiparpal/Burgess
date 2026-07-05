@@ -64,6 +64,15 @@ VALID_ACTORS = {a.value for a in AuthoredBy}
 # (like the two sets above) for kg_write's rollback re-bucketing and the materialize ledger, which
 # previously re-typed the two names as raw string literals (review-r5).
 PERSISTED_DISPOSITIONS = (Disposition.ACCEPTED.value, Disposition.DEMOTED.value)
+# A materialized divergence pin becomes PERMANENT negative memory for its brief (folded into the brief's
+# discards by _sync_materialized_fates) ONLY when it is actively FALSIFIED. A pin that is merely REJECTED
+# (no verbatim span in the CURRENT source) is the EXPECTED state of a genuinely novel idea awaiting sources
+# — not a failure — so it must stay recoverable, never auto-discarded. This is a DELIBERATELY NARROWER set
+# than the global model.FAILURE_STATES ({REJECTED, FAILED}, which must NOT be redefined): FAILURE_STATES
+# governs projector pruning and the write-boundary durability quarantine (/kg-generate negative memory) and
+# is untouched here. Verdict neutrality is likewise untouched — the verdict a pin receives is unchanged and
+# identical to a non-pin's; only THIS diverge-brief-local, state-keyed discard CONSEQUENCE is narrowed.
+MATERIALIZED_DISCARD_STATES = {EpistemicState.FAILED}
 # The "not found" read shape, defined once for the engine's degraded-miss and the MCP wrapper's
 # plain-miss (review-r5: the literal lived in two places). Callers copy before mutating.
 _NOT_FOUND = {"error": "not found"}
@@ -1683,12 +1692,26 @@ class KGEngine:
         return base_dir(self.project_dir)
 
     def _sync_materialized_fates(self, project: str) -> list:
-        """Unified negative memory (FUSION Stage 4, I8): grounding failures flow BACK
+        """Unified negative memory (FUSION Stage 4, I8): grounding FALSIFICATIONS flow BACK
         into the brief's discard store. For every materialized pin, read the CURRENT
         epistemic state of its graph items from canon (reads only — verdicts remain
-        kg_ground's monopoly); any candidate whose node/edge landed in a FAILURE state
-        is added to the discards for this brief, so no future slate or parent pool
-        ever re-proposes it. Idempotent; fates are stamped in materialized.json."""
+        kg_ground's monopoly); any candidate whose node/edge was actively FALSIFIED
+        (`failed`, i.e. in MATERIALIZED_DISCARD_STATES) is added to this brief's discards,
+        so no future slate or parent pool ever re-proposes it. Idempotent; fates are
+        stamped in materialized.json.
+
+        A merely UNSUPPORTED pin (`rejected` — no verbatim span in the current source) is
+        the expected state of a genuinely novel idea awaiting sources, NOT a failure, so it
+        is left recoverable and never auto-discarded (that is why the check is against the
+        narrow MATERIALIZED_DISCARD_STATES, not the global FAILURE_STATES). Verdict neutrality
+        is preserved: the verdict a pin receives is unchanged and identical to a non-pin's —
+        only this state-keyed discard consequence was narrowed. Accepted trade-off: a diverge
+        pin rejected specifically for being vague/unfalsifiable (the generality confound, §1.6)
+        also no longer auto-discards, so a similar idea may reappear in a later slate; the user
+        remains the real selector and can discard it in one tap, and burying good novel ideas is
+        the primary risk this guards against. (This sync is diverge-brief-scoped and does NOT
+        touch /kg-generate negative memory — the write-boundary durability quarantine — which
+        still rejects unsupported hypothesized edges into FAILURE_STATES exactly as before.)"""
         from kg_engine.divergence.session import Session as _DSession
 
         sess = _DSession(project, home=self._diverge_home())
@@ -1713,7 +1736,7 @@ class KGEngine:
                     node = self.canon.read_node(node_id)
                 except FileNotFoundError:
                     continue
-                if node and node.epistemic_state in FAILURE_STATES:
+                if node and node.epistemic_state in MATERIALIZED_DISCARD_STATES:
                     failed_state = node.epistemic_state.value
             for ref in entry.get("edges", ()):
                 owner, ref_edge_id = ref.get("owner"), ref.get("id")
@@ -1722,7 +1745,7 @@ class KGEngine:
                 except FileNotFoundError:
                     continue
                 for e in (node.edges if node else ()):
-                    if e.id == ref_edge_id and e.epistemic_state in FAILURE_STATES:
+                    if e.id == ref_edge_id and e.epistemic_state in MATERIALIZED_DISCARD_STATES:
                         failed_state = e.epistemic_state.value
             if failed_state:
                 state.add_discard(domain, cid)
@@ -1822,9 +1845,22 @@ class KGEngine:
                 entry["session"] = session_id
         state.write_materialized(ledger)
 
-        return {"ok": bool(any(out.get("dispositions", {}).get(d, 0) for d in PERSISTED_DISPOSITIONS)),
-                "materialized": sum(1 for r in results if r.get("status") in PERSISTED_DISPOSITIONS),
-                "results": results, "propose": out}
+        materialized_count = sum(1 for r in results if r.get("status") in PERSISTED_DISPOSITIONS)
+        result = {"ok": bool(any(out.get("dispositions", {}).get(d, 0) for d in PERSISTED_DISPOSITIONS)),
+                  "materialized": materialized_count,
+                  "results": results, "propose": out}
+        # Advisory only (never a disposition, a return-field change, or a ledger write): if a source is
+        # already configured, remind the operator that grounding these hypothesized pins against THAT source
+        # will (correctly) leave a genuinely novel idea `unverified` — a novel idea has no in-source span by
+        # construction — until supporting sources are gathered. The intended path is to add sources for the
+        # pins worth promoting, not to read the leftover `unverified` state as a failure. (Part C.)
+        if self.source_path is not None and materialized_count:
+            result["advisory"] = (
+                "A source is already configured. Grounding these pins against it will correctly leave a "
+                "genuinely novel idea `unverified` (novelty has no in-source span yet) — it is NOT falsified "
+                "and stays recoverable in the lane. To promote a pin, gather supporting sources for it, then "
+                "ground; only an actively-falsified pin folds back into this brief's discards.")
+        return result
 
 
 # --------------------------------------------------------------------------- MCP wiring
@@ -2198,7 +2234,10 @@ def _register(mcp, engine: KGEngine) -> None:
         nodes ({source, target, relation[, notes]}); they transit the SAME boundary: claimed
         verdicts are stripped, text-claim provenance is refused, unknown fields are rejected.
         Pinned items may be ORDERED FIRST in the grounding queue; being pinned never changes
-        a grounding VERDICT (verdict neutrality, I5)."""
+        a grounding VERDICT (verdict neutrality, I5). When a source is already configured and at
+        least one pin materialized, the result carries an advisory-only `advisory` string noting
+        that grounding these pins against the existing source will correctly leave a novel idea
+        `unverified` until supporting sources are added (Part C — never a disposition or verdict)."""
         return engine.kg_diverge_materialize(project, candidate_ids=candidate_ids,
                                              node_type=node_type, edges=edges)
 

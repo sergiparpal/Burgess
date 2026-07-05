@@ -181,3 +181,12 @@ these ideas, so they earn the queue's front. This is PURELY an ordering preferen
 the verdict logic is identical for pinned and unpinned items (verdict neutrality is
 test-enforced), a pin never lowers the evidence bar, and promotion still requires
 support (span or citation) like any hypothesis.
+
+Because a materialized pin is a *novel* idea, grounding it against the current source will
+usually find no in-source span — that is the expected outcome, **not** a failure. So the
+grounder **leaves an unsupported `[diverge]`-lineage edge `unverified`** (triage: don't spend a
+rejection on an item that by construction has no span yet) rather than rejecting it. Only a pin
+that is actively **FALSIFIED** (`failed`, the adversarial grounder's verdict) folds back into its
+/kg-diverge brief's **permanent** discards; a merely-unsupported (`rejected`) pin stays recoverable
+in the lane until sources are added. Ordinary `/kg-generate` proposals (no `[diverge]` marker) are
+unchanged: unsupported → `rejected` → failure memory.

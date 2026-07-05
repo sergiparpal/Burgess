@@ -259,9 +259,14 @@ anti-collapse monitor reading every round.
 pinned ideas become nodes via the propose lane exclusively (`provenance=hypothesized`,
 `epistemic_state=unverified`, `authored_by=agent`, full `[diverge]` lineage in the body). A
 `materialized.json` ledger tracks their fate; on the next `init`/`recall`, any materialized pin
-whose canon record landed in `FAILURE_STATES` is folded into the brief's discards — grounding
-failures and human discards are one negative memory, and neither generation path re-proposes from
-it. The sync only reads verdicts; issuing them stays `kg_ground`'s monopoly.
+whose canon record was actively **falsified** (`failed`) is folded into the brief's discards — a
+merely-unsupported (`rejected`) pin, the expected state of a novel idea with no in-source span yet,
+stays recoverable and is never auto-discarded. Grounding **falsifications** and human discards are
+one negative memory, and neither generation path re-proposes from it. The fold keys on a
+deliberately narrower `server.MATERIALIZED_DISCARD_STATES` = {`failed`} — distinct from the global
+`FAILURE_STATES` = {`rejected`, `failed`} (which still governs projector no-prune and the
+write-boundary durability quarantine that backs `/kg-generate` negative memory). The sync only
+reads verdicts; issuing them stays `kg_ground`'s monopoly.
 
 **Advisory DPP over `/kg-generate`** (`advisory_geometry.py`, behind `divergence.dpp`, default
 off): the same candidate set is reordered by a hybrid-descriptor DPP — one semantic axis (batch

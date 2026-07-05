@@ -581,8 +581,10 @@ knowledge graph, not the archive, is the durable store.
 Begin/resume a divergence session for a brief. `axes` resolves by cascade: an inline axes dict → a path or
 shipped template name (`pack/domains/*.yaml`, `pack/domains/examples/*.yaml`) → `None`, which prefers the
 pack's `divergence:` section and falls back to `pack/domains/generic.yaml`. Also syncs materialized fates
-(see §1B.7): any previously materialized pin whose canon node/edge has landed in `FAILURE_STATES`
-(`rejected`/`failed`) is folded into this brief's **discards** (unified negative memory, I8) and reported.
+(see §1B.7): any previously materialized pin whose canon node/edge was actively **falsified** (`failed`) is
+folded into this brief's **discards** (unified negative memory, I8) and reported; a merely-unsupported
+(`rejected`) pin — the expected state of a novel idea with no in-source span yet — stays recoverable in the
+lane and is **not** discarded.
 
 ```json
 {"ok": true, "domain": "generic", "reset": false, "session_id": "sess-…", "new_session": true,
@@ -648,14 +650,19 @@ propose lane** (`kg_propose` → the same boundary as every write):
   materialized pin earns promotion only via `kg_ground` with support, like any hypothesis.
 - Optional `edges` link the new nodes to existing ones and transit the same boundary (text-claim provenance
   refused, forged verdicts stripped).
-- The `materialized.json` ledger maps each candidate to its written nodes/edges; if grounding later FAILS
-  one, the next `init`/`recall` auto-discards it from the brief (I8). The sync only *reads* verdicts —
-  verdicts stay `kg_ground`'s monopoly.
+- The `materialized.json` ledger maps each candidate to its written nodes/edges; only if grounding later
+  **falsifies** one (`failed`) does the next `init`/`recall` auto-discard it from the brief (I8) — a
+  merely-unsupported (`rejected`) pin, the expected state of a novel idea with no in-source span yet, stays
+  recoverable in the lane. The sync only *reads* verdicts — verdicts stay `kg_ground`'s monopoly.
+- When a source is already configured and ≥1 pin materialized, the result carries an advisory-only
+  `advisory` string (grounding these novel pins against the existing source will correctly leave them
+  `unverified` until sources are added) — never a disposition, verdict, or ledger write.
 
 ```json
 {"ok": true, "materialized": 2,
  "results": [{"candidate": "c3", "status": "materialized", "node": "idea-cold-brew-launch-c3"},
              {"candidate": "c9", "status": "skipped", "reason": "no-session-record"}],
+ "advisory": "A source is already configured. Grounding these pins will correctly leave a novel idea unverified…",
  "propose": {"dispositions": {"ACCEPTED": 2}, "…": "…"}}
 ```
 
