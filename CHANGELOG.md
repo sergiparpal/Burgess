@@ -1,6 +1,16 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 — 2026-07-06
+
+Feature + hardening release. Adds the **re-examinable-verdicts advisory** (a
+read-only R3-mirror that flags `failed`/`rejected` items — nodes and span-less
+items included — whose source set has since grown, so old negative memory may now
+be supportable) with its divergence-side mirror and explicit un-seal lever. Also
+lands the 2026-07-05 exhaustive review (review-r8, 23 findings), the
+novel-`/kg-diverge`-pin grounding fix, and a test-import repair so the documented
+`pytest tests/` command reproduces the reported suite count. No breaking API or
+tool-surface changes; the 27-tool surface is unchanged (`kg_diverge_recall` gains
+an optional `reexamine` parameter).
 
 ### Fixed
 
