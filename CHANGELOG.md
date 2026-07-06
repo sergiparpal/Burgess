@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.2.1 — 2026-07-06
+
+Patch release. Fixes a `source_path` configuration bug and adds nothing else — no
+API or tool-surface changes.
+
+### Fixed
+
+- **A quoted `source_path` silently resolved to nothing.** A source path the user
+  wrapped in quotes reached the engine (`KG_SOURCE_PATH`) and the `/kg-build` bash
+  (`CLAUDE_PLUGIN_OPTION_SOURCE_PATH`) with the literal surrounding quotes intact,
+  so `Path('"C:\\dir\\file.md"')` pointed at a nonexistent quote-wrapped path and
+  the engine degraded to an empty source with no error. (The doubled backslashes
+  shown in the settings UI are only Claude Code's JSON rendering of the stored
+  value — the substituted env value carries single backslashes; the quotes were
+  the real breakage.) The canonical env-value cleaner (`envconfig._dequote`,
+  applied in `clean()` — the single home the server, headless backend,
+  `/kg-perturb`, and the PreToolUse hook all route through), its declared JS twin
+  (`_engine_resolve.dequote`), and the `/kg-build` file-enumeration bash now peel
+  matched surrounding quote pairs **repeatedly**, so even a double-wrapped
+  `""path""` collapses to the bare path. Only symmetric pairs peel — an interior or
+  mismatched quote stays part of the path. The `source_path` userConfig description
+  now also asks for the bare path without quotes. Pinned by
+  `tests/test_fix_source_path_quotes.py`.
+
 ## 0.2.0 — 2026-07-06
 
 Feature + hardening release. Adds the **re-examinable-verdicts advisory** (a
