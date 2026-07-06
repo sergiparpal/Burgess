@@ -24,6 +24,9 @@ You do **not** call `kg_write` yourself, and you **never** assert a verdict — 
   SOURCE="${1:-${CLAUDE_PLUGIN_OPTION_SOURCE_PATH:-examples/source.md}}"
   ```
 
+  then strip a matched surrounding quote-pair from `$SOURCE` (Step 0 shows the exact `case`) — a
+  path the user wrapped in quotes must not carry literal quotes into the file enumeration below.
+
 - `$2` — **optional inline wave size**: how many section-extractor subagents to launch CONCURRENTLY per
   wave (bounded parallelism). **Precedence: explicit `$2` > user_config > default.** When `$2` is omitted
   it falls back to `${CLAUDE_PLUGIN_OPTION_EXTRACT_WAVE_SIZE}`, then to `6`. The value is parsed to an
@@ -40,6 +43,18 @@ file list, then iterate the sections **within each file**, carrying that file's 
 
 ```bash
 SOURCE="${1:-${CLAUDE_PLUGIN_OPTION_SOURCE_PATH:-examples/source.md}}"
+# Dequote: a user who wrapped the path in quotes — or a host that handed us a JSON-quoted userConfig
+# value — would otherwise leave literal quotes in $SOURCE and every ls/find below would miss. Peel
+# matched surrounding pairs REPEATEDLY (so a double-wrapped ""path"" collapses to the bare path),
+# mirroring kg_engine.envconfig.clean (the engine dequotes its own KG_SOURCE_PATH read; this bash
+# enumerates files before the engine sees the path, so it repeats it).
+while :; do
+  case "$SOURCE" in
+    \"*\") SOURCE="${SOURCE#\"}"; SOURCE="${SOURCE%\"}" ;;
+    \'*\') SOURCE="${SOURCE#\'}"; SOURCE="${SOURCE%\'}" ;;
+    *) break ;;
+  esac
+done
 # Resolve the extraction WAVE SIZE: inline override ($2) > user_config > default 6; integer; clamp 1..10.
 # (This pure-Bash resolution mirrors kg_engine.waves.resolve_wave_size, the unit-tested reference — no
 # venv/PYTHONPATH dependency here. A present-but-invalid value falls straight to the default 6, not the

@@ -19,11 +19,23 @@ export const PTR_NAME = "engine-python.txt"; // cross-platform interpreter point
 export const STAMP_NAME = "install.stamp"; // content hash of pyproject (readiness gate)
 
 // Drop empty / whitespace / unsubstituted ${...} / bare-sentinel env values so an unset var never
-// sends us to a bogus path. (Mirror of bootstrap._clean.)
+// sends us to a bogus path. (Mirror of kg_engine.envconfig.clean.)
 export function clean(value) {
   if (!value) return "";
-  const v = value.trim();
+  const v = dequote(value.trim());
   if (!v || v.startsWith("${") || v === "/.venv" || v === "/venv") return "";
+  return v;
+}
+
+// Strip surrounding matched quote pairs ("..." or '...'), the way a shell would — a user who wraps a
+// path option in quotes, or a host that hands us a JSON-quoted userConfig value, would otherwise
+// leave literal quote characters inside the path. Peel REPEATEDLY so a double-wrapped value (""x"")
+// collapses to the bare path; each pass drops >=2 chars so it terminates. Mirror of
+// kg_engine.envconfig._dequote; keep the two in lockstep.
+function dequote(v) {
+  while (v.length >= 2 && v[0] === v[v.length - 1] && (v[0] === "'" || v[0] === '"')) {
+    v = v.slice(1, -1).trim();
+  }
   return v;
 }
 

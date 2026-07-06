@@ -30,15 +30,32 @@ INDEX_DB_NAME = "index.sqlite"
 
 
 def clean(value: "str | None") -> str:
-    """Canonical env-value cleaner: drop empty / whitespace-only values, unsubstituted ``${...}``
-    placeholders (Claude Code passes ``${user_config.*}`` through literally when the user never set
-    the option), and the bare sentinels left by substituting an empty var into a ``${VAR}/.venv``
-    template. Mirrored by ``clean()`` in scripts/_engine_resolve.mjs; keep the two in lockstep."""
+    """Canonical env-value cleaner: drop empty / whitespace-only values, strip a matched pair of
+    surrounding quotes (below), drop unsubstituted ``${...}`` placeholders (Claude Code passes
+    ``${user_config.*}`` through literally when the user never set the option), and the bare
+    sentinels left by substituting an empty var into a ``${VAR}/.venv`` template. Mirrored by
+    ``clean()`` in scripts/_engine_resolve.mjs; keep the two in lockstep."""
     if not value:
         return ""
-    v = value.strip()
+    v = _dequote(value.strip())
     if not v or v.startswith("${") or v in ("/.venv", "/venv"):
         return ""
+    return v
+
+
+def _dequote(v: str) -> str:
+    """Strip surrounding matched quote pairs (``"..."`` or ``'...'``), the way a shell would. A user
+    who wraps ``source_path`` (or any path option) in quotes — or a host that hands us a JSON-quoted
+    userConfig value — would otherwise leave literal quote characters *inside* the path, so
+    ``Path('"C:\\\\x"')`` points nowhere and the engine silently degrades to an empty source. The
+    settings UI's doubled backslashes are only a JSON-display artifact (the substituted env value
+    carries single backslashes) — the quotes are the real breakage. We peel **repeatedly** so a
+    double-wrapped value (``""C:\\\\x""``) collapses to the bare path, not a still-quoted ``"C:\\\\x"``;
+    each pass drops ≥2 chars so it always terminates. Only symmetric pairs peel (a lone/interior/
+    mismatched quote is left as part of the path). Mirrored by ``dequote()`` in
+    scripts/_engine_resolve.mjs; keep the two in lockstep."""
+    while len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+        v = v[1:-1].strip()
     return v
 
 
