@@ -55,6 +55,15 @@
     no-op; `kg_diverge_metrics` reports `mean_cosine_n` (the subsample size above the
     novelty cap); and the launcher's synchronous cold-start catch-up has a hard
     ceiling so a wedged install can't block session startup indefinitely.
+- **The review-r8 backend-scrub pin made the suite red under the *documented*
+  command.** `test_r8_7_backend_scrubs_section_title` used `from tests.test_backend
+  import _FakeClient` — the only `from tests.` import in the whole suite. It resolves
+  only when the repo root is on `sys.path`, which `python -m pytest` adds (cwd) but the
+  console-script `uv run pytest tests/` that the README/CLAUDE.md document does **not**;
+  pytest puts `tests/` on the path, not the repo root, so the run failed with
+  `ModuleNotFoundError: No module named 'tests'`. It now imports the sibling module
+  top-level (`from test_backend import _FakeClient`), matching every other test, so the
+  documented command reproduces the documented `1101 passed, 2 skipped`.
 
 ### Added
 

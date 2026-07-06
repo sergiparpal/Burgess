@@ -628,11 +628,15 @@ discards NEVER. Returns `{"parents": [{id, text, coords, niche_id, novelty, pinn
 Archive health: `{entropy, mean_cosine, coverage, n, mechanism_spread, mechanism_n, open_axis}` (+
 `gap_log` when the gap probe is on).
 
-### 1B.6 `kg_diverge_recall(project, k=10)`
+### 1B.6 `kg_diverge_recall(project, k=10, reexamine=None)`
 
 The brief's preference memory, for injection into generation: `{domain, preferences, pins, discards,
 summary: {n_comparisons, win_counts, preferred_values}}`. Like `init`, it first syncs materialized fates
-(I8) — generate AWAY from `discards`, FROM `pins`.
+(I8) — generate AWAY from `discards`, FROM `pins`. On a source change it also surfaces `failed`-fated
+discards under `reexaminable_discards` (the divergence mirror of the graph R3-mirror; SURFACE-ONLY, never
+auto-un-sealed). Pass `reexamine=[candidate_ids]` to EXPLICITLY un-seal those candidates — each drops from
+`discards` and has its failure fate cleared, returning to the proposal pool (reported under
+`reexamined_unsealed`); un-sealing never changes a graph verdict.
 
 ### 1B.7 `kg_diverge_materialize(project, candidate_ids=None, node_type="claim", edges=None)`
 

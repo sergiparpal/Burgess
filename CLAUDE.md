@@ -10,7 +10,7 @@ Burgess is a Claude Code **plugin** fusing two engines around one trust boundary
 
 ```bash
 uv sync --extra dev                  # install (or: pip install -e ".[dev]"; CI uses ".[dev,backend]")
-uv run pytest tests/                 # full suite (pyproject sets -q; ~1000 tests, no network needed)
+uv run pytest tests/                 # full suite (pyproject sets -q; ~1100 tests, no network needed)
 uv run pytest tests/test_grounding.py::test_name   # single test
 uv run pytest -m "not selftest"      # faster loop (skips divergence selftest e2e) — run the FULL suite before committing
 ```
@@ -25,7 +25,7 @@ claude plugin validate ./ --strict   # real plugin validator (best-effort in CI)
 python scripts/check_donors_clean.py # donor pin gate — see "Donors" below; installed as local pre-commit hook
 ```
 
-Dev extras: `python -m kg_engine.divergence <init-project|ingest|recall|remember|parents|metrics|selftest|import-cambrian>` (divergence CLI, no MCP needed); `python -m kg_engine.backend` (headless API extraction; needs the `backend` extra). Run the plugin live with `claude --plugin-dir /path/to/Burgess` — the MCP server refuses to start until the required `source_path` userConfig is set.
+Dev extras: `python -m kg_engine.divergence <init-project|paths|ingest|recall|remember|parents|metrics|selftest|import-cambrian>` (divergence CLI, no MCP needed); `python -m kg_engine.backend` (headless API extraction; needs the `backend` extra). Run the plugin live with `claude --plugin-dir /path/to/Burgess` — the MCP server refuses to start until the required `source_path` userConfig is set.
 
 Notes:
 - **No linter/formatter is configured.** pytest is the only gate.

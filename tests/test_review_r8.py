@@ -217,7 +217,7 @@ def test_r8_6_unseal_bare_string_does_not_iterate_chars(vault):
 def test_r8_7_backend_scrubs_section_title(vault):
     """The backend must scrub the section TITLE before it reaches the API prompt, not only the body —
     a heading carrying PII/a secret would otherwise egress verbatim."""
-    from tests.test_backend import _FakeClient
+    from test_backend import _FakeClient  # sibling test module (pytest puts tests/ on sys.path)
 
     src = vault / "source.md"
     src.write_text("## Notes from jane@example.com\nHeat flows from hot to cold.\n", encoding="utf-8")
