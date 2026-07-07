@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.2.6 — 2026-07-07
+
+Patch release. A broad correctness/robustness sweep from an exhaustive codebase review — two
+higher-severity fixes plus a batch of edge-case hardening. No API or tool-surface change (the
+27-tool surface is unchanged); every change is a bug fix with a pinned regression test
+(`tests/test_review_r9.py`). Suite: 1160 passed, 2 skipped.
+
+### Fixed
+
+- **The canon git merge driver silently destroyed legitimate, locally-audited verdicts.** Its
+  edge/node `epistemic_state` resolution demoted to `unverified` on ANY disagreement, base-unaware —
+  so a routine same-note merge in which only one side carried an audited `grounded`/`failed` verdict
+  (the other unchanged from the merge base) erased it, including never-pruned §1.7 failure memory. It
+  is now a base-aware 3-way like the scalar fields beside it: a one-sided verdict is kept, and only a
+  genuine two-sided conflict demotes. Forge-safety is unchanged — a verdict with no local audit record
+  is still re-quarantined by the reconciler's full sweep.
+
+- **Provisioning could delete a user-owned venv.** The venv-reclaim branch treated "a stranded owner
+  sentinel beside a populated, markerless dir" as proof of ownership and `rmtree`'d it — so a token
+  left behind past its husk (a hard kill mid-cleanup, or a `rm -rf .venv` followed by the documented
+  `uv sync`) could delete a brand-new working venv. Reclaim now refuses any dir whose interpreter
+  imports the core deps: a functional venv is never our incomplete husk (the never-delete-a-user-venv
+  invariant).
+
+- **Egress path-leak holes (§1.9).** Absolute filesystem paths could cross the boundary back to the
+  session: the path-redaction regex stopped at the first space (leaking the tail of
+  `C:\Users\John Smith\…` and `/home/john doe/…`), and the projection-degraded reason and a
+  `kg_generate` note were not scrubbed at all. All three are closed.
+
+- **Windows line endings corrupted canon notes.** A hand-edited note saved CRLF injected stray `\r`
+  into stored bodies (and defeated the idempotent-no-op content hash, churning git); a CR-only note
+  vanished from every read entirely. Line endings are now normalized at the single parse chokepoint.
+
+- **A source-only edit never refreshed the derived advisories.** The staleness gate was canon-only, so
+  editing the source document while the canon stayed byte-identical never reprojected — freezing the R3
+  stale-verdict / re-examinable advisories and specificity ranks in their own edit-then-query workflow.
+  A cheap source signature now triggers the reproject.
+
+- **Edge-case hardening batch:** the DPP ideation slate no longer duplicates a candidate on a
+  non-finite score; the ideation harness tolerates malformed (non-string) inputs instead of crashing;
+  the `kg_context` query tokenizer is Unicode-aware (non-Latin queries keep multi-word matching); the
+  cross-process venv lock closes an info-less-window steal race, never `rmtree`s a re-validated live
+  holder, and fails cleanly on a read-only filesystem; the Windows PID-liveness probe fails safe; the
+  SessionStart hook and the launcher resolve a relative `KG_ENGINE_VENV` identically; the supervisor's
+  self-heal is bounded so it can't block session teardown; and several defensive guards land
+  (absorption divide-by-zero, corrupt-ledger / corrupt-owner-note tolerance, a clear scikit-learn
+  import error, incremental cross-owner edge agreement, a warm baseline cache that detects concurrent
+  foreign writers, and consistent `n_edges` reporting).
+
 ## 0.2.5 — 2026-07-07
 
 Patch release. One provisioning fix from a crash report; no API or tool-surface change
