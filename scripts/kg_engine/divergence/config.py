@@ -41,6 +41,25 @@ class ConfigError(ValueError):
     """Raised when an axes spec is malformed. Message is user-facing."""
 
 
+def require_sklearn(what: str) -> None:
+    """Raise an actionable ``ConfigError`` (mirroring ``StaticEmbedder``'s model2vec guard, I9) when
+    scikit-learn — the peer hard-dep behind the ``hash`` embedder's ``HashingVectorizer`` and the
+    open-axis nicher's ``KMeans`` — is absent, instead of leaking a raw ``ModuleNotFoundError``. ONE home
+    for the message so the two call sites (``embed.HashingEmbedder``, ``archive.FrozenVoronoiNicher.fit``)
+    can't drift. The caller imports the specific submodule after this returns; convergence (``kg_*``)
+    tools import no sklearn, so the graceful-degradation invariant is untouched — this only upgrades a
+    divergence-side message. Deliberately does NOT suggest ``KG_DIVERGE_EMBEDDER=hash``: the hash embedder
+    itself needs sklearn, so re-provisioning is the only real remedy."""
+    try:
+        import sklearn  # noqa: F401 — presence probe; the caller imports the specific submodule next
+    except ImportError as exc:
+        raise ConfigError(
+            f"divergence {what} unavailable: the 'scikit-learn' package is not installed in the engine "
+            f"venv. Re-run provisioning (the SessionStart hook, or `python scripts/bootstrap.py`). "
+            f"Convergence (kg_*) tools are unaffected."
+        ) from exc
+
+
 def debug_enabled() -> bool:
     """Whether ``KG_DIVERGE_DEBUG`` requests full tracebacks instead of clean errors.
 

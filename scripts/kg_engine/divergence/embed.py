@@ -35,7 +35,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .config import ConfigError
+from .config import ConfigError, require_sklearn
 
 ENV_VAR = "KG_DIVERGE_EMBEDDER"
 DEFAULT_PROVIDER = "static"
@@ -112,6 +112,7 @@ class HashingEmbedder(Embedder):
     name = "hash"
 
     def __init__(self, dim: int = HASH_DIM):
+        require_sklearn("hash embedder")  # actionable ConfigError instead of a raw ModuleNotFoundError
         from sklearn.feature_extraction.text import HashingVectorizer
 
         self.dim = dim

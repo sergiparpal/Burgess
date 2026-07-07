@@ -346,6 +346,30 @@ def verify_imports(py: Path) -> None:
     run([str(py), "-c", _VERIFY_IMPORTS], env=_engine_env())
 
 
+def _is_functional_venv(venv_dir: Path) -> bool:
+    """True when ``venv_dir`` has a working interpreter that imports the MANDATORY deps — a COMPLETE,
+    usable environment (a user's ``uv sync`` / ``python -m venv`` result), NOT an interrupted husk.
+
+    Used to REFUSE reclaiming (and rmtree-ing) a functional foreign venv even when a stranded owner
+    sentinel sits beside it. The sibling sentinel OUTLIVES the venv (crash-report v0.2.4 hole B), so a
+    token stranded past its husk — a hard kill mid-clear, a swallowed ``_clear_owner_sentinel``, or a
+    user who ``rm -rf``'d the husk and rebuilt with the documented ``uv sync`` — must not by ITSELF
+    authorise deleting whatever now occupies the path. An interrupted build of ours is never usable (a
+    partial dependency graph), so a dir whose interpreter imports the core set is positive proof it is
+    NOT our husk: never delete it (the never-delete-a-user-venv invariant, regressed 3x). A quiet,
+    non-raising probe (not ``verify_imports``, which prints + raises); a missing interpreter or ANY
+    import failure ⇒ genuinely-incomplete husk ⇒ reclaimable."""
+    py = venv_python(venv_dir)
+    if not py.exists():
+        return False
+    try:
+        out = subprocess.run([str(py), "-c", _VERIFY_IMPORTS], capture_output=True,
+                             env=_engine_env(), timeout=60)
+        return out.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def _soft_probe(py: Path, snippet: str, parent_fail_msg: str) -> None:
     """Run an ADVISORY in-venv import probe that must never abort provisioning (review-r5: the
     two probes were structural copy-paste). A NON-checking subprocess (never ``run()``, which is
@@ -546,7 +570,16 @@ def do_install(venv_dir: Path) -> Path:
     # rather than layering a fresh install over a partial dependency graph. This is the wedge fix: without a
     # surviving token such a dir was foreign forever. (A dir WITH a completion marker but a stale stamp is a
     # legit prior build — left untouched here so install_with_uv updates it in place, exactly as before.)
-    if (not empty_or_absent) and _has_owner_sentinel(venv_dir) and not _has_engine_marker(venv_dir):
+    # ...UNLESS the dir is a FUNCTIONAL venv (interpreter imports the mandatory deps): a stranded sibling
+    # sentinel (hole B: the token outlives the venv, so a hard kill mid-clear, a swallowed clear, or a
+    # user `rm -rf .venv` + `uv sync` rebuild can leave the token beside a brand-new foreign venv) must
+    # NOT rmtree a working environment. Our own interrupted build is never functional (partial deps), so
+    # a functional dir is either foreign or an already-usable prior build — either way, fall through and
+    # let install_with_uv update it IN PLACE (non-destructive), exactly as a completion-marker-bearing
+    # venv is handled, rather than deleting it (review: reclaim rmtrees a user venv — the never-delete
+    # invariant that regressed 3x).
+    if ((not empty_or_absent) and _has_owner_sentinel(venv_dir)
+            and not _has_engine_marker(venv_dir) and not _is_functional_venv(venv_dir)):
         print(f"[bootstrap] Reclaiming an interrupted prior build at {venv_dir}", flush=True)
         shutil.rmtree(venv_dir, ignore_errors=True)
         empty_or_absent = True

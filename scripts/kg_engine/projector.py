@@ -564,7 +564,11 @@ class Projector:
                 and prior.get("source_hash", "") == cur_source_hash:
             report.up_to_date = True
             report.n_nodes = len(nodes)
-            report.n_edges = sum(len(n.edges) for n in nodes)
+            # Count the DEDUPED canonical edges, exactly as a real projection does (G.number_of_edges()
+            # below), not the raw per-note sum — the two disagree when a hand-edited cross-owner duplicate
+            # id exists, making n_edges flip by one between an up-to-date no-op and any reproject on a
+            # byte-identical canon (review-low: up_to_date n_edges mismatch).
+            report.n_edges = len(self._canonical_edges(nodes))
             return report
 
         # R3: stale-verdict advisory (READ-ONLY). On a full rebuild OR a source change, re-scan ALL
@@ -812,6 +816,7 @@ class Projector:
         con = self._connect()
         try:
             changed_ids = {c.id for c in changed}  # hoisted out of the per-node loop below
+            vanished_ids: set = set()  # edge ids dropped by their owner this sweep — re-derived below
             # removed nodes: drop node + every edge its FILE contributed (owner, not source — a
             # hand-edited note can persist an edge whose source names another node; see _EDGE_COLUMNS)
             for nid in removed:
@@ -842,8 +847,25 @@ class Projector:
                     report.touched_edges.append(e.id)
                 for eid in cur:
                     if eid not in new:
-                        con.execute("DELETE FROM edges WHERE id=?", (eid,))
+                        # Delete only OUR (owner==n.id) row for this vanished id, and remember the id: an
+                        # UNCHANGED note may still declare the same edge FOREIGN (source names this note),
+                        # in which case a full rebuild re-keys it to that surviving owner. Owner-scoping the
+                        # delete + the re-derivation pass below keep incremental and full builds in
+                        # agreement (review-low: cross-owner vanished-edge drop).
+                        con.execute("DELETE FROM edges WHERE id=? AND owner=?", (eid, n.id))
                         report.touched_edges.append(eid)
+                        vanished_ids.add(eid)
+            # §1.4 cross-owner re-materialization: an edge that vanished from its owner above may still be
+            # declared foreign by an UNCHANGED note. The incremental sweep can't see that (the shell it
+            # hydrated for the unchanged note carries only MATERIALIZED edges, and the deduped-away foreign
+            # row was never stored), so re-derive JUST the vanished ids from a full canon parse and upsert
+            # any survivor with its winning owner (_canonical_edges). Paid ONLY when an edge actually
+            # vanished (rare) — the common incremental path (no removals) never parses the full canon.
+            if vanished_ids:
+                for e, owner in self._canonical_edges(self.canon.all_nodes()):
+                    if e.id in vanished_ids:
+                        con.execute(self._EDGES_INSERT, self._edge_row(e, owner))
+                        report.touched_edges.append(e.id)
             # refresh ranks for unchanged nodes only when a rank value actually moved. Betweenness/
             # spec_betweenness/specificity are GLOBAL — one new edge shifts them for distant nodes — so
             # they are diffed and refreshed here too, not just degree/community/bridge. Read every node's
@@ -870,25 +892,60 @@ class Projector:
         finally:
             con.close()
 
+    def _cheap_stat_map(self) -> "dict[str, tuple[int, int]]":
+        """Per-note ``{name: (size, mtime_ns)}`` map — the GRANULAR form of ``_cheap_sig`` (same stat
+        sweep, NO YAML parse / git fork), so a caller can detect WHICH notes moved rather than only THAT
+        something did. Used by the kg_write baseline cache to re-read exactly the changed notes (ours OR
+        a concurrent foreign writer's) instead of caching a stale baseline as fresh (review-low).
+        ``note_paths()`` is already sorted, so ``.items()`` iteration order is stable."""
+        out: "dict[str, tuple[int, int]]" = {}
+        for p in self.canon.note_paths():
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            out[p.name] = (st.st_size, st.st_mtime_ns)
+        return out
+
+    @staticmethod
+    def _sig_of_stat_map(stat_map: "dict[str, tuple[int, int]]") -> str:
+        """The ``_cheap_sig`` digest of an already-computed stat map — one home for the hash so the sig
+        and the map a caller diffs against can never drift, and both come from a SINGLE stat sweep."""
+        h = hashlib.sha256()
+        for name, (size, mtime_ns) in stat_map.items():
+            h.update(f"{name}\x00{size}\x00{mtime_ns}\x00".encode())
+        return h.hexdigest()
+
     def _cheap_sig(self) -> str:
         """A cheap signature of the canon dir — a digest over each note's (name, size, mtime) —
         computed with NO YAML parse and NO git fork. The fast staleness pre-gate (projector-2);
         per-node content hashing is the authoritative confirmation, run only when this signal moves.
         Digesting EVERY file's (size, mtime), not just the count + newest mtime, catches an in-place
         edit of a non-newest note (which would not move a max-mtime) and a same-mtime size change."""
-        h = hashlib.sha256()
-        for p in self.canon.note_paths():  # already sorted, so the digest is order-stable
-            try:
-                st = p.stat()
-            except OSError:
-                continue
-            h.update(f"{p.name}\x00{st.st_size}\x00{st.st_mtime_ns}\x00".encode())
-        return h.hexdigest()
+        return self._sig_of_stat_map(self._cheap_stat_map())
+
+    def _source_stat_sig(self) -> list:
+        """A cheap ``[[basename, size, mtime_ns], …]`` signature of the source file(s) — NO content read
+        — so is_stale() can catch a SOURCE-only edit (canon byte-identical) and still reproject, which is
+        what refreshes the R3 stale-verdict / re-examinable advisories and the specificity ranks against
+        the new source (review: source-blind staleness — _project_locked already handles a source_hash
+        move, but only once a projection RUNS; without this gate a source-only edit never triggers one).
+        Mirrors ``SourceSet.signature`` (same stat fields as _cheap_sig); ``[]`` when no source or on any
+        hiccup, so a bare-source install simply never trips the gate."""
+        try:
+            if self._source_set is None:
+                return []
+            from .sources import SourceSet
+            # list-of-lists so it round-trips through json identically to the stored value (tuples would
+            # compare unequal to the json-decoded lists in is_stale).
+            return [list(x) for x in SourceSet.signature(self._source_set().path)]
+        except Exception:  # noqa: BLE001 — a source-stat hiccup degrades to "no signature", never crashes a read
+            return []
 
     def _source_hash(self) -> str:
         """sha256 of the source payload (the SourceSet concat); '' when no source. R3's stale-verdict
         recompute pre-gate — moves on any add/remove/edit of any source file. Computed only inside a
-        projection (off the hot path); is_stale is left source-blind (Q3 one-projection-lag)."""
+        projection (off the hot path); is_stale gates a source-only edit on the cheap _source_stat_sig."""
         try:
             sources = self._source_set() if self._source_set else None
             payload = sources.concat if sources is not None else self._src_text()
@@ -1079,6 +1136,11 @@ class Projector:
         con.execute("INSERT OR REPLACE INTO meta VALUES ('file_stats', ?)",
                     (json.dumps(stats or {}, sort_keys=True),))
         con.execute("INSERT OR REPLACE INTO meta VALUES ('cheap_sig', ?)", (json.dumps(self._cheap_sig()),))
+        # cheap (name,size,mtime) source signature — the SOURCE-side twin of cheap_sig, so is_stale() can
+        # detect a source-only edit (canon byte-identical) and still reproject (review: source-blind
+        # staleness). Self-computed here, like cheap_sig, so it needs no threading through the callers.
+        con.execute("INSERT OR REPLACE INTO meta VALUES ('source_stat_sig', ?)",
+                    (json.dumps(self._source_stat_sig()),))
         # the live-topology signature these ranks were computed over (projector-1): lets the next
         # projection reuse betweenness when the topology is unchanged.
         con.execute("INSERT OR REPLACE INTO meta VALUES ('topo_sig', ?)", (topo_sig or "",))
@@ -1123,6 +1185,17 @@ class Projector:
         except (ValueError, TypeError):
             out["cheap_sig"] = None
         out["source_hash"] = rows.get("source_hash", "")  # R3 stale-verdict recompute pre-gate
+        # source_stat_sig is read ABSENT-PRESERVING (None when the row is missing, like source_file_sigs):
+        # a pre-feature index has no such row, and is_stale's source gate keys "skip until next projection"
+        # on the value being None — so a missing row must NOT default to [] (which would read as "a real
+        # prior of zero source files" and force a spurious reproject on every read of a bare-source graph).
+        if "source_stat_sig" in rows:
+            try:
+                out["source_stat_sig"] = json.loads(rows["source_stat_sig"])
+            except (ValueError, TypeError):
+                out["source_stat_sig"] = None
+        else:
+            out["source_stat_sig"] = None
         out["topo_sig"] = rows.get("topo_sig", "")         # projector-1 betweenness-reuse signature
         try:
             out["stale_verdicts"] = json.loads(rows.get("stale_verdicts", "[]"))
@@ -1308,6 +1381,16 @@ class Projector:
         if self._schema_outdated():
             return True
         prior = self._read_meta()
+        # source pre-gate (review: source-blind staleness): a source-only edit leaves the canon
+        # byte-identical, so the canon cheap_sig below would return "not stale" and the R3 stale-verdict /
+        # re-examinable advisories and specificity ranks would freeze — never recomputing in their own
+        # edit-source-then-query workflow. A cheap (name,size,mtime) source signature (no content read)
+        # catches it and forces the reproject, where _project_locked's source_hash compare does the
+        # authoritative recompute. Absent on a pre-feature index (source_stat_sig is None) → gate skipped,
+        # mirroring the R3 Q3 one-projection-lag until the next projection writes the key.
+        prior_source_stat = prior.get("source_stat_sig")
+        if prior_source_stat is not None and prior_source_stat != self._source_stat_sig():
+            return True
         # cheap pre-gate (projector-2): if the canon dir's (count, newest mtime) is unchanged since the
         # last projection, nothing on disk changed -> not stale, WITHOUT a git fork or a full YAML
         # parse. This fronts EVERY read, so it must stay O(dir-listing), not O(N parse).
@@ -1656,7 +1739,13 @@ class DerivedReader:
         if not query:
             return "", []
         seen: set = set()
-        terms = [t for t in re.findall(r"[A-Za-z0-9_-]{3,}", query.lower())
+        # Unicode-aware term extraction: an ASCII-only class ([A-Za-z0-9_-]) yields ZERO terms on a
+        # Cyrillic/CJK/Greek query, collapsing to a single whole-string LIKE that only matches a verbatim
+        # substring — the exact multi-word miss the per-term OR-clause exists to fix, and the same defect
+        # review-r8-13 already fixed for the re-examinable advisory's _OVERLAP_WORD. `[^\W_]{3,}` keeps the
+        # >=3-char floor while matching word runs in any script (digits included; splits on `-`/`_`, which
+        # only broadens the OR-match). re.UNICODE is the str default, spelled out here for intent.
+        terms = [t for t in re.findall(r"[^\W_]{3,}", query.lower(), re.UNICODE)
                  if not (t in seen or seen.add(t))][:_QUERY_TERM_CAP]
         clause = ("(source LIKE ? ESCAPE '\\' OR target LIKE ? ESCAPE '\\' "
                   "OR relation LIKE ? ESCAPE '\\' OR span LIKE ? ESCAPE '\\')")

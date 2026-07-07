@@ -2,21 +2,24 @@
 
 A canon note is YAML frontmatter (the three axes + an ``edges:`` block) plus free body text. When two
 branches/machines edit the *same* node, a line-based merge mangles the `edges:` list and — worse — can
-silently keep one side's grounding verdict. This driver mirrors the **edge-union + cross-branch-verdict-
-demote intent** of ``Canon._merge_into_existing`` (canon.py) — NOT its exact resolution logic: it unions
-edges by the deterministic ``edge_id`` (model.edge_id) and, for an edge present on both sides at a
-**different** ``epistemic_state``, resolves the merged edge to ``unverified`` — never to either side's
-verdict, with ``verdict_by``/``verdict_at`` cleared (the same demotion the reconciler applies to an
-out-of-band verdict change, §1.8). The git driver's edge rule is **symmetric** (any disagreement demotes),
-whereas ``_merge_into_existing`` is asymmetric incoming-wins with a re-promote special-case — each is safe
-only in its own context. This driver ADDS beyond ``_merge_into_existing``: a node-level demote-on-
-disagreement and a scalar-frontmatter 3-way. The in-process path instead polices a forged node verdict
-later, in the reconciler's audit-aware sweep (§1.8), not at merge time.
+silently keep one side's grounding verdict. This driver mirrors the **edge-union + base-aware-verdict**
+intent of ``Canon._merge_into_existing`` (canon.py) — NOT its exact resolution logic: it unions edges by
+the deterministic ``edge_id`` (model.edge_id) and, for an edge present on both sides at a **different**
+``epistemic_state``, resolves it with a **base-aware 3-way** (like the scalar frontmatter below): when
+only ONE side changed the state from the merge base (git's %O), that side's verdict is kept (with
+``verdict_by``/``verdict_at``/span) — a one-sided, locally-audited grounding or §1.7 failure must survive
+a routine same-note merge, not be silently destroyed. Only a genuine **two-sided** conflict (both sides
+diverged from base, or no base at all) demotes to ``unverified`` with the verdict fields cleared (the
+demotion the reconciler applies to an out-of-band verdict change, §1.8). ``_merge_into_existing`` is
+instead asymmetric incoming-wins with a re-promote special-case — each is safe only in its own context.
+This driver ADDS beyond ``_merge_into_existing``: the base-aware node-level verdict resolution and a
+scalar-frontmatter 3-way.
 
-It is **structurally incapable of forging a verdict**: the only ``epistemic_state`` it can ever *write*
-on a conflict is ``unverified``. A grounding verdict that survives a clean (non-conflicting) merge has
-no audit record on the merging machine and is re-quarantined by the reconciler's full sweep — so the
-deferred cross-machine verdict-sharing half is unnecessary for safety here (see CHANGELOG).
+Forge-safety does NOT rely on always writing ``unverified``: a one-sided verdict this driver keeps has,
+on any machine that did not author it, no matching audit record, so the reconciler's full audit-aware
+sweep re-quarantines it — exactly as it already does for a verdict that survives a clean (non-conflicting)
+merge. So the driver preserves a legitimate one-sided verdict without ever letting a forged one stand, and
+the deferred cross-machine verdict-sharing half remains unnecessary for safety here (see CHANGELOG).
 
 Wired as a git merge driver via ``.gitattributes`` (``canon/*.md merge=kgcanon``) plus a one-time
 ``git config merge.kgcanon.driver`` pointing at ``scripts/canon_merge_driver.mjs`` (which runs this
@@ -40,8 +43,9 @@ from .model import EpistemicState, Node, node_from_markdown, node_to_markdown
 __all__ = ["merge_nodes", "merge_note_files", "main"]
 
 # Scalar frontmatter fields merged with a base-aware 3-way rule (label/type), keeping ours on a true
-# divergence — minor metadata, never a hard conflict. epistemic_state is handled separately (demoted on
-# divergence, like an edge verdict — never-forge-a-verdict, invariant 3); the immutable id is never merged.
+# divergence — minor metadata, never a hard conflict. epistemic_state is handled separately (its OWN
+# base-aware 3-way — one-sided change kept, two-sided conflict demoted; never-forge-a-verdict, invariant
+# 3); the immutable id is never merged.
 _SCALAR_FIELDS = ("label", "node_type", "file_type")
 
 # git merge-file returns -1 (255) on internal error; a positive return is the conflict-hunk count.
@@ -96,32 +100,48 @@ def merge_nodes(base: Node | None, ours: Node, theirs: Node) -> tuple[Node, list
       single-canonical-edge rule + never-prune-failure-memory §1.7). An edge on both sides at the SAME
       ``epistemic_state`` takes THEIRS (incoming-wins, matching ``_merge_into_existing``'s
       ``by_id[e.id] = e`` — so a theirs-side span/notes/confidence correction is not silently dropped;
-      no verdict is forged because the state is identical on both sides); at a DIFFERENT state it
-      demotes to ``unverified`` with ``verdict_by``/``verdict_at`` cleared — never resolving to either
-      verdict (never-forge-a-verdict).
+      no verdict is forged because the state is identical on both sides); at a DIFFERENT state it is a
+      **base-aware 3-way** — the side that changed the state from ``base`` keeps its verdict (and
+      ``verdict_by``/``verdict_at``); only a two-sided conflict (both diverged, or no base) demotes to
+      ``unverified`` with those fields cleared (forge-safe via the reconciler backstop, see the header).
     - **Scalar frontmatter** (label/type): base-aware 3-way, keeping ours on a true divergence.
-    - **Node ``epistemic_state``:** demoted to ``unverified`` when the two sides disagree (forge-proof,
-      same intent as the edge rule); ``base`` is consulted only for the scalar 3-way. This node-level
-      demote is ADDED here beyond ``_merge_into_existing`` (which leaves node verdicts to the reconciler's
-      audit-aware sweep, §1.8).
+    - **Node ``epistemic_state``:** the SAME base-aware 3-way as the edge rule — the one side that changed
+      it from ``base`` wins; a two-sided conflict (or no base) demotes to ``unverified``. This node-level
+      resolution is ADDED here beyond ``_merge_into_existing`` (which leaves node verdicts to the
+      reconciler's audit-aware sweep, §1.8).
 
     Returns ``(merged_node, demotions)`` where ``demotions`` lists the auto-demotions (informational — a
     verdict demotion is a CLEAN resolution, not a merge conflict, so it never sets the exit code)."""
     demotions: list[str] = []
     merged = copy.deepcopy(ours)  # start from ours: preserves ours' frontmatter, timestamps, body
 
+    base_by_id = {e.id: e for e in base.edges} if base is not None else {}
     by_id = {e.id: e for e in merged.edges}
     for e in theirs.edges:
         existing = by_id.get(e.id)
         if existing is None:
             by_id[e.id] = copy.deepcopy(e)  # theirs-only edge -> union it in
         elif existing.epistemic_state != e.epistemic_state:
-            demoted = copy.deepcopy(existing)
-            demoted.epistemic_state = EpistemicState.UNVERIFIED
-            demoted.verdict_by = None
-            demoted.verdict_at = None
-            by_id[e.id] = demoted
-            demotions.append(_demotion_note(e.id, existing.epistemic_state, e.epistemic_state))
+            # Base-aware verdict resolution (mirrors the scalar 3-way below, NOT a blind demote): when
+            # only ONE side changed the state from the merge base, keep THAT side's verdict — a
+            # one-sided, locally-audited grounding or §1.7 failure must not be destroyed by a routine
+            # same-note merge (review). Demote to unverified ONLY on a genuine two-sided conflict (both
+            # diverged from base, or no base). Forge-safe: a one-sided verdict with no audit record on
+            # the merging machine is re-quarantined by the reconciler's full sweep, exactly as a verdict
+            # surviving a clean non-conflicting merge already is (see the module header).
+            base_edge = base_by_id.get(e.id)
+            base_state = base_edge.epistemic_state if base_edge is not None else None
+            if base_state is not None and existing.epistemic_state == base_state:
+                by_id[e.id] = copy.deepcopy(e)   # only THEIRS changed the verdict -> take theirs (+ its fields)
+            elif base_state is not None and e.epistemic_state == base_state:
+                pass                             # only OURS changed -> keep ours (already in by_id via merged)
+            else:
+                demoted = copy.deepcopy(existing)  # two-sided conflict (or no base) -> never forge a verdict
+                demoted.epistemic_state = EpistemicState.UNVERIFIED
+                demoted.verdict_by = None
+                demoted.verdict_at = None
+                by_id[e.id] = demoted
+                demotions.append(_demotion_note(e.id, existing.epistemic_state, e.epistemic_state))
         else:
             # equal epistemic_state on both sides -> take THEIRS (incoming-wins, like
             # _merge_into_existing): the state is identical so no verdict is forged, but a theirs-side
@@ -140,13 +160,21 @@ def merge_nodes(base: Node | None, ours: Node, theirs: Node) -> tuple[Node, list
             setattr(merged, field, theirs_val)  # only theirs changed it
         # else: only ours changed, or both diverged / no base -> keep ours (minor field, no hard conflict)
 
-    # node-level epistemic_state: demote on disagreement (forge-proof, same intent as the edge rule).
-    # Node carries no verdict_by/verdict_at (those live only on Edge), so there is nothing extra to clear.
+    # node-level epistemic_state: the SAME base-aware 3-way as the edge rule — the one side that changed
+    # it from base wins; a two-sided conflict (or no base) demotes to unverified (forge-safe via the
+    # reconciler backstop). Node carries no verdict_by/verdict_at (those live only on Edge), so there is
+    # nothing extra to clear on a demote.
     if ours.epistemic_state != theirs.epistemic_state:
-        if merged.epistemic_state != EpistemicState.UNVERIFIED:
-            demotions.append(
-                _demotion_note(f"node:{merged.id}", ours.epistemic_state, theirs.epistemic_state))
-        merged.epistemic_state = EpistemicState.UNVERIFIED
+        base_state = base.epistemic_state if base is not None else None
+        if base_state is not None and ours.epistemic_state == base_state:
+            merged.epistemic_state = theirs.epistemic_state    # only THEIRS changed -> take theirs
+        elif base_state is not None and theirs.epistemic_state == base_state:
+            pass                                               # only OURS changed -> keep ours (in merged)
+        else:
+            if merged.epistemic_state != EpistemicState.UNVERIFIED:  # two-sided conflict (or no base) -> demote
+                demotions.append(
+                    _demotion_note(f"node:{merged.id}", ours.epistemic_state, theirs.epistemic_state))
+            merged.epistemic_state = EpistemicState.UNVERIFIED
 
     return merged, demotions
 

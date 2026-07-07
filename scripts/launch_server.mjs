@@ -45,6 +45,17 @@ const SCRIPTS = join(ROOT, "scripts");
 const BOOTSTRAP = join(SCRIPTS, "bootstrap.py");
 const VENV_DIR = venvDir(ROOT);  // the resolved engine venv (review-r5: was `dir`)
 
+// Synchronous foreground-catch-up ceilings. The INITIAL cold/stale catch-up (main(), BEFORE the signal
+// handlers are installed) uses the generous ceiling so it never aborts a slow-but-progressing cold build
+// — a SIGINT there falls through to Node's default terminate. The HEAL retry runs from inside onChildExit
+// AFTER the handlers are installed, where a synchronous spawnSync blocks the loop so SIGINT/SIGTERM
+// (markShutdown) can't fire until it returns — a session teardown could hang for the whole ceiling
+// (review-low). Cap the heal far tighter: an interactive Ctrl-C already lands on the child (same
+// foreground group) and unblocks promptly, and a longer rebuild is covered by the DETACHED background
+// worker; on timeout we fall through to the message + the server's early-failure relaunch.
+const FOREGROUND_CATCHUP_TIMEOUT_MS = 40 * 60 * 1000; // > bootstrap's ~31-min lock wait + build margin
+const HEAL_CATCHUP_TIMEOUT_MS = 5 * 60 * 1000;        // teardown-responsiveness backstop for the heal path
+
 // A server that exits within this window of starting WITHOUT having written its readiness marker is
 // treated as a startup failure (an import error against a half-built / just-updated venv) and triggers
 // the one self-heal retry. The AUTHORITATIVE signal is the engine's readiness marker (servedInit,
@@ -203,7 +214,7 @@ function serverLog(msg) {
 // uv/pip output to ITS stdout; the MCP server (below) owns this process's stdout for JSON-RPC, so we
 // route the child's stdout OFF that channel. stdio = [ignore, 2, inherit] sends child stdout -> our
 // fd 2 (stderr) and child stderr -> our stderr, so the server's first frame is never preceded by noise.
-function foregroundCatchUp(sysPy, force) {
+function foregroundCatchUp(sysPy, force, timeoutMs = FOREGROUND_CATCHUP_TIMEOUT_MS) {
   // `force` removes the install.stamp first so bootstrap's is_ready() fast-path cannot short-circuit:
   // needed for the self-heal retry below, where the stamp MATCHES but the deps are actually broken
   // (a stamp-fresh venv that still fails to import) — without this, provision would do nothing and the
@@ -223,9 +234,8 @@ function foregroundCatchUp(sysPy, force) {
   // (well above a cold wheel-download build and the full lock wait) so it never aborts a legitimately
   // slow-but-progressing build; on timeout spawnSync sets r.error and we fall through to the message +
   // the server's early-failure self-heal, while the DETACHED background worker keeps building unbounded.
-  const FOREGROUND_CATCHUP_TIMEOUT_MS = 40 * 60 * 1000; // > bootstrap's ~31-min lock wait + build margin
   const r = spawnSync(sysPy, [BOOTSTRAP, "--venv", VENV_DIR],
-    { stdio: ["ignore", 2, "inherit"], timeout: FOREGROUND_CATCHUP_TIMEOUT_MS });
+    { stdio: ["ignore", 2, "inherit"], timeout: timeoutMs });
   // Surface a spawn failure (ENOENT) or a non-zero bootstrap exit (bootstrap.py names these:
   // EXIT_STILL_PROVISIONING=2 past the wait deadline; EXIT_BUILD_FAILED=1; EXIT_PY_TOO_OLD=3)
   // instead of silently launching against a possibly-unready venv. The server's early-failure
@@ -408,7 +418,9 @@ function main() {
     spawnEngine: () => spawn(py, ["-m", "kg_engine.server"], { stdio: "inherit", env }),
     heal: () => {
       if (sysPy) {
-        foregroundCatchUp(sysPy, true);
+        // Tighter ceiling than the initial catch-up: this runs after the signal handlers are installed,
+        // so a synchronous spawnSync here blocks shutdown until it returns (review-low).
+        foregroundCatchUp(sysPy, true, HEAL_CATCHUP_TIMEOUT_MS);
         const fixed = enginePython(VENV_DIR);
         if (fixed) py = fixed;
       }

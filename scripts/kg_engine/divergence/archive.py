@@ -85,6 +85,8 @@ class FrozenVoronoiNicher:
         """
         import warnings
 
+        from .config import require_sklearn
+        require_sklearn("open-axis nicher")  # actionable ConfigError instead of a raw ModuleNotFoundError
         from sklearn.cluster import KMeans
         from sklearn.exceptions import ConvergenceWarning
 

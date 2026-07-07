@@ -26,7 +26,7 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { PROBE_TIMEOUT_MS, clean, systemPython } from "../scripts/_engine_resolve.mjs";
+import { PROBE_TIMEOUT_MS, clean, systemPython, venvDir } from "../scripts/_engine_resolve.mjs";
 
 try {
   const hooksDir = dirname(fileURLToPath(import.meta.url));
@@ -45,10 +45,16 @@ try {
     process.env.PATH = [localBin, process.env.PATH].filter(Boolean).join(delimiter);
     const py = systemPython(); // >= 3.10, each candidate probe bounded by PROBE_TIMEOUT_MS
     if (py) {
+      // Pass the SAME resolved venv dir the launcher uses (`venvDir(root)`) as `--venv`, instead of
+      // letting bootstrap self-resolve. Without this the background worker resolves a RELATIVE
+      // KG_ENGINE_VENV against its process CWD while the launcher/precontext resolve it against `root`
+      // (expandResolve), so the two build/look at different dirs — a double build or a never-found venv
+      // (review-low: relative KG_ENGINE_VENV base mismatch). Absolute/default paths are unaffected.
+      const venv = venvDir(root);
       // stdio ignored so bootstrap never writes to the hook log (it logs to provision.log).
       // Defensive timeout: `--background` returns in ms after spawning the detached worker, but a
       // wedged interpreter must not block this synchronous spawn forever.
-      spawnSync(py, [boot, "--background"], {
+      spawnSync(py, [boot, "--background", "--venv", venv], {
         stdio: "ignore",
         timeout: PROBE_TIMEOUT_MS,
         killSignal: "SIGKILL",

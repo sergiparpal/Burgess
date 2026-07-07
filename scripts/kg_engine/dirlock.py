@@ -38,6 +38,14 @@ from pathlib import Path
 _OWNED_TOKENS: dict[str, str] = {}
 _HOST = socket.gethostname()
 
+# Grace window protecting the brief just-mkdir'd, info-less window of a healthy acquirer: between
+# ``lock.mkdir()`` and the ``info`` write in ``try_acquire`` the dir has no ``info`` record, so
+# ``parse_info`` -> {} -> ``pid_probe`` reads pid=0 -> "dead" -> stealable, and a racer would steal a
+# perfectly-healthy lock a peer just claimed (two concurrent venv builds). An info-less lock younger
+# than this is treated as a mid-acquire holder (NOT stealable); only past the grace is it a genuine
+# crash-orphan that never got its info written and may be reclaimed (review: info-less-window steal).
+_INFO_GRACE_SECS = 5.0
+
 
 def _new_token() -> str:
     return uuid.uuid4().hex
@@ -88,15 +96,18 @@ def _win_pid_alive(pid: int) -> bool:
 
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
         STILL_ACTIVE = 259
-        ERROR_ACCESS_DENIED = 5
+        ERROR_INVALID_PARAMETER = 87
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel32.OpenProcess.restype = wintypes.HANDLE
         kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
         handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
         if not handle:
-            # No handle: ERROR_INVALID_PARAMETER (87) == no such process → dead; ERROR_ACCESS_DENIED
-            # (5) == the process exists but is owned by another account → alive (mirrors POSIX EPERM).
-            return ctypes.get_last_error() == ERROR_ACCESS_DENIED
+            # No handle. ONLY ERROR_INVALID_PARAMETER (87) definitively means "no such process" → dead.
+            # Every other failure fails SAFE to alive: ERROR_ACCESS_DENIED (5) is a live process owned by
+            # another account (POSIX EPERM), and a transient error (e.g. ERROR_NOT_ENOUGH_MEMORY) against a
+            # genuinely-live provisioner PID must NOT be read as dead and let its lock be stolen — the
+            # module's "never over-steal a lock we cannot PROVE is dead" invariant (review-low).
+            return ctypes.get_last_error() != ERROR_INVALID_PARAMETER
         try:
             code = wintypes.DWORD()
             if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
@@ -170,7 +181,14 @@ def is_stealable(lock: Path, stale_secs: float) -> bool:
     ``is_stealable_sidelined``)."""
     if lock_age(lock) > stale_secs:
         return True
-    return not pid_probe(parse_info(lock))
+    rec = parse_info(lock)
+    if not rec:
+        # No info record yet: either a healthy acquirer mid-``try_acquire`` (between ``lock.mkdir()`` and
+        # the info write) or a crash-orphan that never wrote one. Protect the acquire window — only an
+        # info-less lock older than the grace is stealable, so a racer can't steal a lock a peer just
+        # claimed (review: info-less-window steal). Past the grace it is a genuine orphan, reclaim it.
+        return lock_age(lock) > _INFO_GRACE_SECS
+    return not pid_probe(rec)
 
 
 def is_stealable_sidelined(lock: Path, stale_secs: float) -> bool:
@@ -188,7 +206,13 @@ def is_stealable_sidelined(lock: Path, stale_secs: float) -> bool:
             return True  # vanished under us — nothing live to protect
     if age > stale_secs:
         return True
-    return not pid_probe(parse_info(lock))
+    rec = parse_info(lock)
+    if not rec:
+        # Same info-less grace as is_stealable: a lock sidelined mid-acquire (its info not yet written)
+        # keeps its fresh mtime through os.replace, so a young info-less sideline is a live mid-acquire
+        # holder to RESTORE, not a stale orphan to reclaim (review: info-less-window steal).
+        return age > _INFO_GRACE_SECS
+    return not pid_probe(rec)
 
 
 def heartbeat(lock: Path) -> None:
@@ -256,7 +280,12 @@ def _steal(lock: Path, stale_secs: float) -> bool:
         try:
             os.replace(sidelined, lock)
         except OSError:
-            shutil.rmtree(sidelined, ignore_errors=True)
+            # A third racer created ``lock`` in the gap, so the restore failed. The dir we hold was JUST
+            # re-validated as a LIVE holder — never rmtree it (that destroys a live holder's lock mid-job,
+            # review-low). Leave it as a ``.stale-*`` sideline: ``_reap_stale_orphans`` collects it only
+            # once it genuinely ages past ``stale_secs`` (a live holder's heartbeat lands in ``lock``,
+            # now the racer's dir, so the sideline ages and is reaped harmlessly). Abandon our steal.
+            pass
         return False
     shutil.rmtree(sidelined, ignore_errors=True)
     return True
@@ -269,7 +298,11 @@ def try_acquire(lock: Path, stale_secs: float) -> bool:
     seeded heartbeat, and ``release`` becomes able to prove ownership. On any contention or
     hiccup, False — the caller re-loops/waits.
     """
-    lock.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        lock.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return False  # unwritable/read-only FS: degrade to a clean "not ready" (caller re-loops/exits),
+                      # never a raw PermissionError traceback out of provisioning (review-low).
     token = _new_token()
     try:
         lock.mkdir()
@@ -282,6 +315,9 @@ def try_acquire(lock: Path, stale_secs: float) -> bool:
             lock.mkdir()
         except OSError:
             return False
+    except OSError:
+        return False  # a non-FileExistsError mkdir failure (read-only/permission-denied FS) is a clean
+                      # "not ready", not a crash — mirror the parent.mkdir guard above (review-low).
     try:
         (lock / "info").write_text(_info_record(token), "utf-8")
         _OWNED_TOKENS[str(lock)] = token

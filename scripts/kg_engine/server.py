@@ -82,8 +82,18 @@ _NOT_FOUND = {"error": "not found"}
 # leak a vault path. A bare "/" or a single-segment "/x" or a mid-word "and/or" is deliberately NOT
 # matched (over-redaction of prose), only path-shaped runs.
 _ABS_PATH_RE = re.compile(
-    r"(?:[A-Za-z]:[\\/]|\\\\)[^\s\"'`]*"        # C:\... / C:/... drive path, or \\server\share UNC
-    r"|/(?:[^\s\"'`/]+/)+[^\s\"'`/]*")            # POSIX absolute path (>=2 segments)
+    # Windows drive path (C:\… / C:/…) or \\server\share UNC. The `X:[\/]` / `\\` anchor is strong
+    # enough that it essentially never opens a prose run, so consume the whole line-bounded tail —
+    # SPACES AND ALL (`C:\Users\John Smith\vault\x.md`) — rather than stopping at the first space and
+    # leaking the rest of the path. A username with a space is the common Windows case, and this
+    # plugin targets Windows; over-redacting a few trailing words on the same line is the safe
+    # direction for an egress scrubber (review: spaced-Windows-path egress leak). Bounded by EOL/quote.
+    r"(?:[A-Za-z]:[\\/]|\\\\)[^\r\n\"'`]*"
+    # POSIX absolute path (>=2 segments). A directory segment may contain internal spaces
+    # (`/home/john doe/…`) — absorbed ONLY while the segment is still closed by a `/`, so the (sensitive)
+    # username dir is redacted rather than left dangling, while the leading-`/`-plus-separator shape
+    # still keeps bare prose ("and/or", a lone "/x") out.
+    r"|/(?:[^\s\"'`/]+(?: [^\s\"'`/]+)*/)+[^\s\"'`/]*")
 
 
 def _scrub_error_text(msg, *, sensitivity: str = "medium") -> str:
@@ -491,6 +501,12 @@ def _load_pack_or_none(pack_path):
         return None
 
 
+class EdgeOwnerUnreadable(Exception):
+    """Raised by `_owner_of_edge` when no PARSEABLE note owns an edge id but a CORRUPT note textually
+    references it — so `kg_ground` can report "node unreadable" (surfacing the corruption to the
+    operator) instead of a misleading "edge not found" (review-low). Carries the offending note path."""
+
+
 class KGEngine:
     """Stateful facade over canon + boundary + projector + reconciler + scrubber."""
 
@@ -541,7 +557,10 @@ class KGEngine:
         # out-of-band writer — another process, kg_ground/kg_rename/kg_merge, a hand edit — moves the
         # cheap signature and the next call re-parses in full: the same invalidation primitive the
         # projector itself trusts (review-r4: kg_write-reparses-canon-per-call).
-        self._baseline_cache: "tuple[str, dict[str, Node]] | None" = None
+        # (cheap-sig, {id: Node}, {note_name: (size, mtime_ns)}) — the stat map lets _refresh_baseline
+        # re-read exactly the notes that moved (ours OR a concurrent foreign writer's) so the cached
+        # nodes always match the stored signature (review-low: partial-refresh stale-as-fresh).
+        self._baseline_cache: "tuple[str, dict[str, Node], dict[str, tuple[int, int]]] | None" = None
 
     # ---- source set (for span verification) — delegate to the shared resolver
     def source_set(self) -> SourceSet:
@@ -691,28 +710,41 @@ class KGEngine:
         cheap dir signature. The signature is computed BEFORE the parse: if a foreign writer lands
         mid-parse, the stored signature is already stale and the next call re-parses — the failure
         direction is always a redundant re-parse, never a stale baseline served as fresh."""
-        sig = self.projector._cheap_sig()
+        stat_map = self.projector._cheap_stat_map()          # one stat sweep feeds both the sig and the map
+        sig = self.projector._sig_of_stat_map(stat_map)
         cache = self._baseline_cache
         if cache is not None and cache[0] == sig:
             return cache[1]
         nodes = {n.id: n for n in self.canon.all_nodes()}
-        self._baseline_cache = (sig, nodes)
+        self._baseline_cache = (sig, nodes, stat_map)
         return nodes
 
     def _refresh_baseline(self, written_ids) -> None:
-        """Refresh ONLY the notes a successful write touched (read back in their exact post-merge
-        state) and re-stamp the signature, so the next kg_write reuses the cache instead of re-parsing
-        the whole canon — mirroring backend._refresh_baseline. Signature first (same stale-safe
-        ordering as _canon_baseline); any hiccup drops the cache, since correctness never depends on
-        it (the next call falls back to a full parse)."""
-        if self._baseline_cache is None:
+        """Keep the canon-baseline cache warm after a write WITHOUT re-parsing the whole canon — and
+        WITHOUT the previous stale-as-fresh hazard. The old version re-read only the ids WE wrote and
+        stored a fresh aggregate signature, so a CONCURRENT foreign writer landing in the window since
+        write_nodes released the lease (its note not in `written_ids`) got folded into the signature but
+        NOT into `nodes`, and the next _canon_baseline then served that stale cache as fresh (review-low).
+        Diff the per-note stat map instead: re-read EVERY note whose (size, mtime) moved since the cache
+        was built (ours OR foreign), drop vanished notes — so the cached nodes always match the stored
+        signature. `written_ids` is now only an unused hint (the stat diff subsumes it). Any hiccup drops
+        the cache; correctness never depends on it (the next call falls back to a full parse)."""
+        cache = self._baseline_cache
+        if cache is None:
             return
         try:
-            sig = self.projector._cheap_sig()
-            nodes = self._baseline_cache[1]
-            for nid in written_ids:
-                nodes[nid] = self.canon.read_node(nid)
-            self._baseline_cache = (sig, nodes)
+            _old_sig, nodes, old_map = cache
+            new_map = self.projector._cheap_stat_map()
+            if new_map == old_map:
+                return                                   # nothing moved (e.g. a true no-op write)
+            _nid = lambda name: name[:-3] if name.endswith(".md") else name  # noqa: E731 — note file is <id>.md
+            for name, st in new_map.items():
+                if old_map.get(name) != st:              # changed or newly-appeared note -> re-read it
+                    nid = _nid(name)
+                    nodes[nid] = self.canon.read_node(nid)
+            for name in old_map.keys() - new_map.keys():  # a note that vanished -> drop it
+                nodes.pop(_nid(name), None)
+            self._baseline_cache = (self.projector._sig_of_stat_map(new_map), nodes, new_map)
         except Exception:  # noqa: BLE001 — cache maintenance must never fail a write
             self._baseline_cache = None
 
@@ -953,7 +985,10 @@ class KGEngine:
                 node.epistemic_state = state
                 key = f"node:{node.id}"
             else:
-                node = self._owner_of_edge(target_id)
+                try:
+                    node = self._owner_of_edge(target_id)
+                except EdgeOwnerUnreadable as e:
+                    return {"ok": False, "error": self._scrub_error(f"node unreadable: {e}")}
                 if node is None:
                     return {"ok": False, "error": "edge not found"}
                 edge = next(e for e in node.edges if e.id == target_id)
@@ -1077,9 +1112,26 @@ class KGEngine:
                     return node
         except Exception as e:  # noqa: BLE001 — index trouble must never break grounding; fall back
             logger.debug("edge-owner index lookup failed (%s); falling back to full canon scan", e)
-        for n in self.canon.all_nodes():
+        # Scan by note path (not all_nodes(), which silently DROPS a note that fails to parse): a
+        # corrupt note owning this edge would otherwise make us return None and report a misleading
+        # "edge not found", masking the real corruption. Remember an unreadable note that textually
+        # references the id and, if the edge is found nowhere parseable, surface it as unreadable
+        # (mirrors the node branch's "node unreadable"; review-low).
+        unreadable: "Path | None" = None
+        for p in self.canon.note_paths():
+            try:
+                n = self.canon.read_node(p.stem)
+            except Exception:  # noqa: BLE001 — a corrupt note must not blind the scan to the rest
+                try:
+                    if edge_id in p.read_text(encoding="utf-8", errors="replace"):
+                        unreadable = unreadable or p
+                except OSError:
+                    pass
+                continue
             if any(e.id == edge_id for e in n.edges):
                 return n
+        if unreadable is not None:
+            raise EdgeOwnerUnreadable(str(unreadable))
         return None
 
     def _audit_path(self) -> Path:
@@ -1521,7 +1573,10 @@ class KGEngine:
             try:
                 G2 = self._second_graph(second_graph)
             except Exception as e:  # noqa: BLE001 — a bad second graph degrades, never crashes
-                note = f"second_graph could not be loaded ({e}); ensemble degraded to regroup"
+                # Scrub the exception: it can carry the caller-supplied `second_graph` path, and `note`
+                # is an _EGRESS_TEXT_KEYS field whose _scrub_egress pass does secrets/PII only, NOT path
+                # redaction — so route it through _scrub_error to strip an absolute path (§1.9).
+                note = f"second_graph could not be loaded ({self._scrub_error(e)}); ensemble degraded to regroup"
         if not note and G2 is None and mechanism in ("ensemble", "all"):
             note = "no second construction supplied; ensemble degraded to regroup (run /kg-perturb to supply one)"
         cands = run_generators(G, mechanism, pack=self.pack, corpus=corpus, failures=failures,
@@ -1645,7 +1700,12 @@ class KGEngine:
             else:
                 self._projection_degraded = None
         except Exception as e:  # noqa: BLE001 — a projection failure degrades the read, never crashes it
-            self._projection_degraded = f"{type(e).__name__}: {e}"
+            # Scrub the reason before it is stored: _with_degraded splices this string into ~10 read
+            # tools' return dicts, and a projection error frequently carries an absolute vault/data path
+            # (e.g. sqlite `unable to open database file: …/derived/index.sqlite`). Route it through the
+            # same §1.9 egress path-redaction the tool-envelope uses so it can't leak across the boundary
+            # (review: _projection_degraded path leak — the class review-r7 fixed for info.error).
+            self._projection_degraded = f"{type(e).__name__}: {self._scrub_error(e)}"
             logger.warning("projection failed (%s); serving degraded derived layer", e, exc_info=True)
             self._ensure_degraded_db()
 
@@ -1767,6 +1827,12 @@ class KGEngine:
         the canon and never `_atomic_write`s graph.json/index.sqlite."""
         self._ensure_projected()
         from . import export as _export
+        # DELIBERATE, justified path egress (like `_source_info`'s echo of the user's own config): the
+        # returned `html_path`/`report_path` are absolute so /kg-view can tell the user WHERE to open the
+        # self-contained graph.html — the artifact is unusable without its path, and it lives under the
+        # user's own CLAUDE_PLUGIN_DATA. So this is intentionally NOT run through _scrub_error's
+        # path-redaction (contrast _projection_degraded / kg_generate notes, which are error text a user
+        # never needs). Kept explicit so it isn't mistaken for the §1.9 leak class.
         return self._with_degraded(_export.export(self, kind=kind))
 
     # ---- divergence surface (FUSION Stages 3-4) --------------------------
@@ -1824,8 +1890,10 @@ class KGEngine:
         newly_discarded: list = []
         changed = False
         for cid, entry in ledger.items():
-            if cid in ("_edges", "_source_sig"):
-                continue  # reserved ledger keys (extra edges / brief-level marker): no candidate to discard
+            if cid in ("_edges", "_source_sig") or not isinstance(entry, dict):
+                continue  # reserved ledger keys, OR a non-dict value from a corrupt/older ledger — skip
+                          # it rather than AttributeError on entry.get() and fail the whole call (the
+                          # read-only siblings _reexaminable_discards/_unseal_discards already guard this).
             if entry.get("fate") in FAILURE_STATE_VALUES:
                 # Already folded. A pre-Stage-5 entry has a `fate` but no `fate_source_sig`; stamp the
                 # CURRENT source as its baseline ONCE so a LATER source change can surface it as

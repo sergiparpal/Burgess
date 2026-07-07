@@ -25,18 +25,36 @@ def _edgeless(state: EpistemicState) -> str:
     return node_to_markdown(Node(id="n1", label="n1", body="prose", edges=[], epistemic_state=state))
 
 
-def test_edgeless_node_one_sided_verdict_demoted_to_unverified():
-    """An edgeless (but parseable) canon node with a one-sided grounded state must be demoted to
-    unverified by merge_note_files — it must NOT be kept grounded via a raw text merge fallback."""
+def test_edgeless_node_one_sided_verdict_preserved():
+    """A ONE-SIDED verdict on an edgeless node is now PRESERVED, not demoted (base-aware merge, review
+    H1): ours grounded it while theirs left it at the base's unverified, so only ours changed → the merge
+    keeps ours' GROUNDED. A legitimate one-sided, locally-audited verdict must survive a routine same-note
+    merge (a forged one is re-quarantined by the reconciler). This intentionally inverts the old
+    demote-on-any-disagreement behavior that destroyed §1.7 negative memory."""
     ours = _edgeless(EpistemicState.GROUNDED)
     theirs = _edgeless(EpistemicState.UNVERIFIED)
     base = _edgeless(EpistemicState.UNVERIFIED)
     merged_text, _conflicts, ok = merge_note_files(base, ours, theirs)
     merged = node_from_markdown(merged_text)
     assert merged is not None
-    # The buggy fallback path would have produced a clean git text merge keeping ours' GROUNDED state.
+    assert merged.epistemic_state is EpistemicState.GROUNDED
+    assert ok
+
+
+def test_edgeless_node_two_sided_conflict_demoted_via_semantic_merge():
+    """a10's routing guarantee, re-pinned for the base-aware merge: an edgeless-but-parseable node with a
+    TWO-SIDED verdict conflict (each side changed the base to a DIFFERENT state) demotes to unverified — a
+    clean resolution ONLY merge_nodes can produce (a raw git text merge would conflict or keep a side), so
+    this still proves edgeless nodes route through the SEMANTIC merge, not the raw text fallback."""
+    ours = _edgeless(EpistemicState.GROUNDED)
+    theirs = _edgeless(EpistemicState.FAILED)
+    base = _edgeless(EpistemicState.UNVERIFIED)
+    merged_text, _conflicts, ok = merge_note_files(base, ours, theirs)
+    merged = node_from_markdown(merged_text)
+    assert merged is not None
+    # both sides diverged from base -> never forge -> unverified, cleanly (a demote is not a hard conflict)
     assert merged.epistemic_state is EpistemicState.UNVERIFIED
-    assert ok  # a verdict demotion is a CLEAN resolution, not a hard conflict
+    assert ok
 
 
 def test_edgeless_node_agreeing_state_preserved():

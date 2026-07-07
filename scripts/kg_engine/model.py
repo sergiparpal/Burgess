@@ -369,6 +369,16 @@ def node_from_markdown(text: str, *, fallback_id: str | None = None) -> Node:
     # (canon, reconciler, canonmerge) at once; engine writes never emit a BOM, so this is a no-op on
     # engine-authored notes and the note is re-serialized BOM-less on its next write.
     text = text.lstrip("\ufeff")  # escape-spelled: the BOM is invisible as a literal (review-r5)
+    # Normalize line endings at the single parse chokepoint (sibling of the BOM strip above). A note
+    # hand-edited on Windows commonly saves CRLF; without this the `\r`s (a) survive `body.strip("\n")`
+    # and get written back verbatim, permanently corrupting the body with mixed endings AND breaking the
+    # idempotent-no-op guard (node_content_hash differs between the CRLF-on-disk and LF forms, so every
+    # re-save rewrites the note with a fresh updated_at and the reconciler flags it changed every time),
+    # and (b) a CR-ONLY note fails _FRONTMATTER_RE entirely -> ValueError -> all_nodes() swallows it and
+    # the whole node, incl. its \u00a71.7 failed/rejected counter-edges, silently vanishes from every read.
+    # One normalization here fixes canon/reconciler/canonmerge at once; engine writes always emit LF, so
+    # this is a no-op on engine-authored notes (review: CRLF/CR line endings).
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     m = _FRONTMATTER_RE.match(text)
     if not m:
         raise ValueError("note has no YAML frontmatter")

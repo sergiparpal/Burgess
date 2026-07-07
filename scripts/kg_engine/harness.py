@@ -271,7 +271,11 @@ def absorption(graph_data: dict, history: dict, *, now=None, absorb_growth: int 
         if d1 <= 0:
             status, half_life = "isolated", None                # stayed disconnected — infertile
         elif growth >= absorb_growth:
-            status, half_life = "absorbed", round(t / growth, 3)  # densified fast — renormalised, trivial now
+            # `growth > 0` guard mirrors the fertile branch: the absorbed branch relies on the implicit
+            # absorb_growth>=1 invariant to keep growth>=1, but a caller passing absorb_growth<=0 with a
+            # present-but-non-densifying node (growth==0) would divide by zero here (review-low).
+            status = "absorbed"
+            half_life = round(t / growth, 3) if growth > 0 else None  # densified fast — renormalised now
         else:
             status = "fertile"                                  # the productive middle
             # an unbounded half-life is None, NOT float('inf'): this dict is returned verbatim by the
@@ -312,6 +316,13 @@ def _score_condition(outputs: list[str], source_text: str) -> dict:
         outputs = [outputs]
     elif not isinstance(outputs, list):
         outputs = []
+    # Coerce the ELEMENTS too, not just the container: a non-string idea (a number/dict/None from
+    # malformed JSON) reaches _ngrams(o)/o.lower() below and raises TypeError/AttributeError, which is
+    # NOT caught by _main's `except (_LoadError, ValueError)` — so the CLI dies with a raw traceback
+    # instead of the intended clean usage exit. Drop non-strings; coerce a non-string source likewise
+    # (review: harness ideation crashes on non-string outputs/source).
+    outputs = [o for o in outputs if isinstance(o, str)]
+    source_text = source_text if isinstance(source_text, str) else ""
     if not outputs:
         return {"n": 0, "diversity": 0.0, "novelty": 0.0, "utility": 0.0, "unsupported_rate": 0.0}
     all_ng: Counter = Counter()
