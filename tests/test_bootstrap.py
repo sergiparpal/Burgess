@@ -348,6 +348,54 @@ def test_do_install_reclaims_own_hard_killed_build(tmp_path, monkeypatch):
     assert (venv_dir / bootstrap.STAMP_NAME).exists()
 
 
+def test_do_install_claims_owner_sentinel_on_in_place_upgrade(tmp_path, monkeypatch):
+    # Crash-report 2026-07-07 (the wedge's in-place-upgrade twin): a plugin update that changes dependencies
+    # moves the install stamp, so do_install UPGRADES the existing, completion-marker-bearing venv IN PLACE —
+    # install_with_uv must UNINSTALL the old wheels before reinstalling the new ones. Before the fix the OWNER
+    # sentinel was claimed ONLY on the fresh-build path (ours_to_clean), so a hard kill mid-swap left a
+    # populated, markerless, OWNERLESS dir that every later run REFUSED forever (the wedge) — meanwhile the
+    # half-swapped venv was missing a transitive dep (e.g. `anyio`) and the MCP server crash-looped on
+    # ImportError. The fix claims the sentinel before ANY mutation, so an interrupted in-place upgrade is
+    # reclaimable next run (via test_do_install_reclaims_own_hard_killed_build) instead of wedging.
+    pp = tmp_path / "pyproject.toml"
+    pp.write_text("[project]\n", encoding="utf-8")
+    monkeypatch.setattr(bootstrap, "PYPROJECT", pp)
+    venv_dir = tmp_path / "data" / ".venv"
+
+    # A legit PRIOR build: populated (pyvenv.cfg + interpreter) AND carrying a completion marker, but with a
+    # now-stale stamp (a deps change moved it) — the in-place-upgrade case, NOT a fresh build and NOT the
+    # hard-killed-fresh-build reclaim case. Crucially it has NO owner sentinel yet: it was sealed by a build
+    # that predates this fix (a completed build never needed one), which is exactly the pre-fix gap.
+    venv_dir.mkdir(parents=True)
+    (venv_dir / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+    (venv_dir / bootstrap.PTR_NAME).write_text("old-python\n", encoding="utf-8")
+    (venv_dir / bootstrap.STAMP_NAME).write_text("STALE-STAMP\n", encoding="utf-8")
+    py = bootstrap.venv_python(venv_dir)
+    py.parent.mkdir(parents=True, exist_ok=True)
+    py.write_text("#!stub\n", encoding="utf-8")
+    assert bootstrap._has_engine_marker(venv_dir)          # a prior build -> in-place upgrade, not fresh
+    assert not bootstrap._has_owner_sentinel(venv_dir)     # and NOT yet owned (the pre-fix gap)
+
+    seen = {}
+
+    def install(vd, *a, **k):
+        # The regression pin: the sentinel must ALREADY be claimed when the in-place upgrade — which
+        # uninstalls the old wheels first — begins, so a kill here leaves a RECLAIMABLE dir, not a wedged one.
+        seen["sentinel_present_during_install"] = bootstrap._has_owner_sentinel(vd)
+        _fake_install_real_venv(vd, *a, **k)
+
+    monkeypatch.setattr(bootstrap, "install_with_uv", install)
+    monkeypatch.setattr(bootstrap, "install_with_pip", install)
+    monkeypatch.setattr(bootstrap, "verify_imports", lambda py: None)
+    monkeypatch.setattr(bootstrap, "probe_leidenalg", lambda py: None)
+    monkeypatch.setattr(bootstrap, "probe_divergence", lambda py: None)
+
+    bootstrap.do_install(venv_dir)
+    assert seen["sentinel_present_during_install"] is True   # claimed BEFORE the in-place upgrade ran
+    assert bootstrap._has_owner_sentinel(venv_dir) is True   # persists in the upgraded venv
+    assert (venv_dir / bootstrap.PTR_NAME).exists()          # upgraded + re-sealed
+
+
 def test_do_install_still_refuses_foreign_dir_without_sentinel(tmp_path, monkeypatch):
     # The FALLO 1 fix must NOT widen the reclaim to a user's foreign venv: a populated dir with a bare
     # pyvenv.cfg (every venv has one) but NEITHER a completion marker NOR our OWNER sentinel is still

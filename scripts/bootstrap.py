@@ -514,12 +514,25 @@ def do_install(venv_dir: Path) -> Path:
         print(f"[bootstrap] Reclaiming an interrupted prior build at {venv_dir}", flush=True)
         shutil.rmtree(venv_dir, ignore_errors=True)
         empty_or_absent = True
-    # WE are (re)populating this dir THIS run iff it is now empty/absent; such a dir is safe to rmtree on
-    # failure even before any marker exists. Claim ownership FIRST (before bin/lib) so a kill mid-build is
-    # reclaimable next run via the branch above.
+    # WE are (re)populating this dir FROM SCRATCH this run iff it is now empty/absent; such a dir is safe to
+    # rmtree on failure even before any marker exists.
     ours_to_clean = empty_or_absent
-    if ours_to_clean:
-        _claim_owner_sentinel(venv_dir)
+    # Claim ownership FIRST — before any bin/lib is mutated — on BOTH build paths (crash-report 2026-07-07):
+    #   * a fresh/reclaimed build (empty_or_absent): a kill mid-build leaves a dir the reclaim branch above
+    #     recognises as ours next run; AND
+    #   * an IN-PLACE UPGRADE of a completion-marker-bearing venv whose stamp went stale because a plugin
+    #     update changed dependencies (the 0.2.2->0.2.3 deps-changed case). install_with_uv upgrades that
+    #     existing venv IN PLACE, which must UNINSTALL the old wheels before reinstalling; a hard kill during
+    #     that swap — or during this function's except-cleanup rmtree — can strip the completion markers and
+    #     leave a populated, markerless dir. WITHOUT this sentinel that leftover is indistinguishable from a
+    #     user's foreign venv, so every later run REFUSES it (preexisting_foreign) and the venv path wedges
+    #     until a human deletes it — meanwhile the half-swapped venv is missing a transitive dep (e.g. `anyio`
+    #     uninstalled-but-not-reinstalled) and the MCP server crash-loops on ImportError.
+    # Claiming here is safe on both paths: any genuinely foreign dir was already refused above, so at this
+    # point the dir is unambiguously ours to write into. WITH the sentinel, an interrupted upgrade lands in
+    # the reclaim branch on the next provision and is rebuilt clean instead of wedging (FALLO 1 net, now
+    # extended to cover the in-place-upgrade path too).
+    _claim_owner_sentinel(venv_dir)
 
     with _heartbeat_pulse(venv_dir):
         try:
@@ -539,14 +552,16 @@ def do_install(venv_dir: Path) -> Path:
             # A failed/interrupted install leaves a venv with an interpreter but a partial
             # dependency graph that the next run would silently "reuse". Remove it so the next
             # provision rebuilds clean — but ONLY when it is genuinely ours: WE created/reclaimed
-            # the dir THIS run (ours_to_clean, which also means our OWNER sentinel is present) OR it
-            # carries an engine marker from a prior build (engine-python.txt / install.stamp). A
-            # pre-existing populated dir WITHOUT a marker OR our sentinel is foreign and was already
-            # refused above, so we never reach here for one — but the re-check keeps the rmtree from
-            # ever touching such a dir even if that guard changed. A bare pyvenv.cfg never qualifies
-            # (bootstrap-1). The lock lives BESIDE the venv (_lock_dir), so this never deletes the
-            # lock this process still holds. (Even if this cleanup is skipped or a HARD kill preempts
-            # it, the OWNER sentinel we stamped makes the leftover reclaimable next run — FALLO 1.)
+            # the dir THIS run (ours_to_clean) OR it carries an engine marker from a prior build
+            # (engine-python.txt / install.stamp) OR it carries our OWNER sentinel — which, since
+            # _claim_owner_sentinel now runs before this try on BOTH the fresh and in-place-upgrade
+            # paths, is present for every dir that reaches here. A pre-existing populated dir WITHOUT
+            # a marker OR our sentinel is foreign and was already refused above, so we never reach here
+            # for one — but the re-check keeps the rmtree from ever touching such a dir even if that
+            # guard changed. A bare pyvenv.cfg never qualifies (bootstrap-1). The lock lives BESIDE the
+            # venv (_lock_dir), so this never deletes the lock this process still holds. (Even if this
+            # cleanup is skipped or a HARD kill preempts it, the OWNER sentinel we stamped makes the
+            # leftover reclaimable next run — FALLO 1, now covering the in-place-upgrade path too.)
             if ours_to_clean or _has_engine_marker(venv_dir) or _has_owner_sentinel(venv_dir):
                 shutil.rmtree(venv_dir, ignore_errors=True)
             raise
