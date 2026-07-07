@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.2.5 — 2026-07-07
+
+Patch release. One provisioning fix from a crash report; no API or tool-surface change
+(the 27-tool surface is unchanged).
+
+### Fixed
+
+- **An interrupted plugin auto-upgrade could STILL wedge the engine venv, even with the
+  0.2.4 self-heal.** 0.2.4 stamps an ownership sentinel (`.burgess-venv-owner`) before any
+  mutation so an interrupted build is reclaimed rather than refused — but it kept that
+  sentinel **inside** the venv dir, and the failure/interrupt cleanup does
+  `rmtree(venv_dir)` (and an in-place `uv`/`pip` upgrade can recreate the venv wholesale).
+  If that wipe was itself interrupted mid-flight it destroyed the sentinel while leaving a
+  populated, markerless husk behind — exactly the state the sentinel exists to make
+  reclaimable — so the foreign-venv guard refused it forever and the MCP server crash-looped
+  on the missing transitive dep (e.g. `anyio`, `ModuleNotFoundError`). **The reclaim token
+  was stored in the one directory the crash-cleanup wipes** (crash-report v0.2.4 "anyio
+  wedge", hole B). Fixed by moving the ownership sentinel to a **sibling** of the venv
+  (`<venv>.burgess-venv-owner`, beside the lock), so a wipe/recreate of the venv dir can no
+  longer destroy it; the next provision then lands in the existing reclaim branch and
+  rebuilds clean. The sibling token is now **cleared on a verified success or a clean
+  failure** (and kept only while an interrupted build's husk is still present), so a healthy
+  venv — or a user venv later placed at that path — is never mistaken for reclaimable and the
+  never-delete-a-user-venv guard is preserved (`bootstrap.do_install`,
+  `_owner_sentinel` / `_clear_owner_sentinel`).
+
 ## 0.2.4 — 2026-07-07
 
 Patch release. One provisioning fix from a crash report; no API or tool-surface change

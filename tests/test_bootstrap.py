@@ -297,7 +297,9 @@ def _install_ok(monkeypatch):
 def test_do_install_claims_owner_sentinel_before_populating(tmp_path, monkeypatch):
     # FALLO 1: bootstrap stamps the ownership sentinel BEFORE any bin/lib lands, so a kill mid-build
     # leaves a dir the next run recognises as its own. Assert the sentinel is already present when
-    # install_with_* first runs, and survives into the finished venv.
+    # install_with_* first runs, and is CLEARED once the venv is sealed (crash-report v0.2.4, hole B:
+    # a healthy venv must carry NO live reclaim token, else a user venv later placed here could be
+    # reclaimed — the sentinel is now a sibling that outlives the venv dir, so it must not linger).
     pp = tmp_path / "pyproject.toml"
     pp.write_text("[project]\n", encoding="utf-8")
     monkeypatch.setattr(bootstrap, "PYPROJECT", pp)
@@ -317,35 +319,39 @@ def test_do_install_claims_owner_sentinel_before_populating(tmp_path, monkeypatc
 
     bootstrap.do_install(venv_dir)
     assert seen["sentinel_present_during_install"] is True     # claimed BEFORE populating
-    assert bootstrap._has_owner_sentinel(venv_dir) is True     # persists in the finished venv
+    assert bootstrap._has_owner_sentinel(venv_dir) is False    # CLEARED once sealed (no live token)
     assert (venv_dir / bootstrap.PTR_NAME).exists()            # and it built + sealed
 
 
 def test_do_install_reclaims_own_hard_killed_build(tmp_path, monkeypatch):
-    # FALLO 1 (the wedge): a hard-killed provision populated the venv (pyvenv.cfg + interpreter) but
-    # died before _write_markers, and its except-cleanup never ran — so the dir has our OWNER sentinel
-    # but NO completion marker. The next do_install must recognise it as ITS OWN interrupted build and
-    # rebuild clean, instead of raising SystemExit "refusing to provision" (which wedged the venv path
-    # until a human deleted it).
+    # FALLO 1 + crash-report v0.2.4 hole B (the wedge): an interrupted provision left a populated venv
+    # (pyvenv.cfg + interpreter) with NO completion marker AND — because a venv-dir wipe/recreate or an
+    # interrupted rmtree stripped everything inside it — NO in-venv token either. The reclaim token that
+    # survives is the SIBLING sentinel beside the venv. The next do_install must recognise this husk as
+    # ITS OWN interrupted build and rebuild clean, instead of raising SystemExit "refusing to provision"
+    # (which wedged the venv path until a human deleted it).
     pp = tmp_path / "pyproject.toml"
     pp.write_text("[project]\n", encoding="utf-8")
     monkeypatch.setattr(bootstrap, "PYPROJECT", pp)
     venv_dir = tmp_path / "data" / ".venv"
 
-    # Simulate the leftover of a hard kill: populated, OWNER sentinel present, NO completion marker.
+    # Simulate the leftover: populated, sibling OWNER sentinel present, NO completion marker, and NOTHING
+    # inside the venv dir marks it as ours (the crash-report husk — its in-venv contents are a partial graph).
     venv_dir.mkdir(parents=True)
-    (venv_dir / bootstrap.OWNER_NAME).write_text("pid=99999 t=0 building\n", encoding="utf-8")
+    bootstrap._claim_owner_sentinel(venv_dir)                  # stamps the SIBLING token beside the venv
     (venv_dir / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
     py = bootstrap.venv_python(venv_dir)
     py.parent.mkdir(parents=True, exist_ok=True)
     py.write_text("#!stub\n", encoding="utf-8")
     assert not bootstrap._has_engine_marker(venv_dir)          # the wedge precondition
-    assert bootstrap._has_owner_sentinel(venv_dir)
+    assert bootstrap._has_owner_sentinel(venv_dir)             # ...but our token survived, beside the venv
+    assert not (venv_dir / bootstrap.OWNER_NAME).exists()      # and it is NOT inside the venv (hole B)
 
     _install_ok(monkeypatch)
     bootstrap.do_install(venv_dir)                             # must NOT raise "refusing to provision"
     assert (venv_dir / bootstrap.PTR_NAME).exists()            # rebuilt + sealed
     assert (venv_dir / bootstrap.STAMP_NAME).exists()
+    assert bootstrap._has_owner_sentinel(venv_dir) is False    # token cleared once resealed
 
 
 def test_do_install_claims_owner_sentinel_on_in_place_upgrade(tmp_path, monkeypatch):
@@ -392,7 +398,7 @@ def test_do_install_claims_owner_sentinel_on_in_place_upgrade(tmp_path, monkeypa
 
     bootstrap.do_install(venv_dir)
     assert seen["sentinel_present_during_install"] is True   # claimed BEFORE the in-place upgrade ran
-    assert bootstrap._has_owner_sentinel(venv_dir) is True   # persists in the upgraded venv
+    assert bootstrap._has_owner_sentinel(venv_dir) is False  # CLEARED once the upgrade re-sealed the venv
     assert (venv_dir / bootstrap.PTR_NAME).exists()          # upgraded + re-sealed
 
 
@@ -417,8 +423,101 @@ def test_do_install_still_refuses_foreign_dir_without_sentinel(tmp_path, monkeyp
     with pytest.raises(SystemExit):
         bootstrap.do_install(venv_dir)
     assert keep.read_text(encoding="utf-8") == "user data\n"   # survives intact
-    assert not (venv_dir / bootstrap.OWNER_NAME).exists()       # never claimed
+    assert not bootstrap._has_owner_sentinel(venv_dir)          # never claimed (no token beside it)
+    assert not (venv_dir / bootstrap.OWNER_NAME).exists()       # nor inside it
     assert not (venv_dir / bootstrap.PTR_NAME).exists()
+
+
+# --------------------------------------------------------------------------- #
+# crash-report v0.2.4 "anyio wedge", hole B — the reclaim token must live OUTSIDE
+# the venv dir so a wipe/recreate of the venv can't destroy it
+# --------------------------------------------------------------------------- #
+def test_owner_sentinel_lives_outside_the_venv_dir(tmp_path):
+    # Structural pin: the sentinel is a SIBLING of the venv dir, never inside it. If it lived inside,
+    # the failure/interrupt cleanup's rmtree(venv_dir) — or an in-place dependency-manager recreate —
+    # would take the very token the next run needs to reclaim the husk down with the venv (hole B).
+    venv_dir = tmp_path / "data" / ".venv"
+    sentinel = bootstrap._owner_sentinel(venv_dir)
+    assert sentinel.parent == venv_dir.parent          # beside the venv, like the lock dir
+    assert venv_dir not in sentinel.parents            # and NOT under it
+    assert sentinel != venv_dir / bootstrap.OWNER_NAME  # specifically not the old in-venv location
+
+
+def test_owner_sentinel_survives_rmtree_of_venv_dir(tmp_path):
+    # The durability guarantee that closes hole B: once claimed, the token outlives a full wipe of the
+    # venv dir. This is exactly what the failure-cleanup rmtree (or a uv/pip recreate) does to the venv,
+    # and the sentinel MUST still be there afterwards for the next run's reclaim branch to fire.
+    venv_dir = tmp_path / "data" / ".venv"
+    venv_dir.mkdir(parents=True)
+    (venv_dir / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+    bootstrap._claim_owner_sentinel(venv_dir)
+    assert bootstrap._has_owner_sentinel(venv_dir)
+
+    bootstrap.shutil.rmtree(venv_dir)                  # the crash-cleanup / recreate wipes the whole venv
+    assert not venv_dir.exists()
+    assert bootstrap._has_owner_sentinel(venv_dir)     # ...but the reclaim token survives beside it
+
+
+def test_do_install_clears_sentinel_after_clean_failure_so_user_venv_stays_refused(tmp_path, monkeypatch):
+    # After a build that FAILS but whose except-cleanup fully removed our venv, the sibling ownership
+    # token must be dropped too. Otherwise — now that the token outlives the venv dir — a user later
+    # pointing --venv at this same path with their OWN (markerless) venv would have it RECLAIMED and
+    # rmtree'd, since a lingering token would falsely read as "our interrupted build". The clean-failure
+    # clear keeps that path refused, preserving the never-delete-a-user-venv invariant.
+    pp = tmp_path / "pyproject.toml"
+    pp.write_text("[project]\n", encoding="utf-8")
+    monkeypatch.setattr(bootstrap, "PYPROJECT", pp)
+    venv_dir = tmp_path / "data" / ".venv"
+
+    def fail_verify(py):
+        raise subprocess.CalledProcessError(1, ["uv", "sync"])
+
+    monkeypatch.setattr(bootstrap, "install_with_uv", _fake_install_real_venv)
+    monkeypatch.setattr(bootstrap, "install_with_pip", _fake_install_real_venv)
+    monkeypatch.setattr(bootstrap, "verify_imports", fail_verify)
+    with pytest.raises(subprocess.CalledProcessError):
+        bootstrap.do_install(venv_dir)
+    assert not venv_dir.exists()                        # venv cleaned up on the clean failure...
+    assert not bootstrap._has_owner_sentinel(venv_dir)  # ...and the reclaim token dropped with it
+
+    # A user now puts their OWN venv at that exact path: no engine marker, no live token -> do_install
+    # must REFUSE (never reclaim/rmtree it). If the token had lingered this would silently delete it.
+    venv_dir.mkdir(parents=True)
+    (venv_dir / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+    keep = venv_dir / "keep.txt"
+    keep.write_text("user data\n", encoding="utf-8")
+
+    def _boom(*a, **k):  # pragma: no cover - asserts it is never invoked
+        raise AssertionError("must not scaffold into / reclaim a foreign venv")
+
+    monkeypatch.setattr(bootstrap, "install_with_uv", _boom)
+    monkeypatch.setattr(bootstrap, "install_with_pip", _boom)
+    with pytest.raises(SystemExit):
+        bootstrap.do_install(venv_dir)
+    assert keep.read_text(encoding="utf-8") == "user data\n"  # the user's venv survives intact
+
+
+def test_do_install_keeps_sentinel_when_cleanup_leaves_a_husk(tmp_path, monkeypatch):
+    # The asymmetry that makes reclaim work: if the failure-cleanup rmtree can NOT fully remove the venv
+    # (a Windows sharing violation, a HARD kill mid-walk), the populated husk remains — so the token must
+    # be KEPT, not cleared, so the next run reclaims it (hole B). Simulate by stubbing rmtree to a no-op.
+    pp = tmp_path / "pyproject.toml"
+    pp.write_text("[project]\n", encoding="utf-8")
+    monkeypatch.setattr(bootstrap, "PYPROJECT", pp)
+    venv_dir = tmp_path / "data" / ".venv"
+
+    def fail_verify(py):
+        raise subprocess.CalledProcessError(1, ["uv", "sync"])
+
+    monkeypatch.setattr(bootstrap, "install_with_uv", _fake_install_real_venv)
+    monkeypatch.setattr(bootstrap, "install_with_pip", _fake_install_real_venv)
+    monkeypatch.setattr(bootstrap, "verify_imports", fail_verify)
+    # rmtree fails to remove the venv (leaves the husk) — the token must NOT be cleared.
+    monkeypatch.setattr(bootstrap.shutil, "rmtree", lambda *a, **k: None)
+    with pytest.raises(subprocess.CalledProcessError):
+        bootstrap.do_install(venv_dir)
+    assert venv_dir.exists()                            # husk remains (rmtree couldn't clear it)
+    assert bootstrap._has_owner_sentinel(venv_dir)      # ...so the reclaim token is KEPT for next run
 
 
 # --------------------------------------------------------------------------- #

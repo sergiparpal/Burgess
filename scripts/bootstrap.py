@@ -72,7 +72,7 @@ from pathlib import Path
 # so scripts/ is sys.path[0] and ``import kg_engine.atomicio`` resolves. envconfig.clean is the
 # single home of the env-value cleaner (review-r5: five hand-synced copies, two sentinel sets).
 from kg_engine import dirlock
-from kg_engine.atomicio import atomic_write_text
+from kg_engine.atomicio import atomic_write_text, fsync_dir
 from kg_engine.envconfig import clean as _clean
 
 SCRIPT_DIR = Path(__file__).resolve().parent      # <repo>/scripts
@@ -82,12 +82,21 @@ PYPROJECT = REPO_ROOT / "pyproject.toml"          # the dependency source of tru
 MIN_PY = (3, 10)                    # matches pyproject's requires-python = ">=3.10"
 PTR_NAME = "engine-python.txt"      # interpreter pointer, written inside the venv dir
 STAMP_NAME = "install.stamp"        # content hash of the install inputs
-# Ownership sentinel written INSIDE the venv dir BEFORE any bin/lib lands (bootstrap FALLO 1). It
+# Ownership sentinel stamped BESIDE the venv dir BEFORE any bin/lib lands (bootstrap FALLO 1). It
 # marks "THIS provisioner started building here", so a dir populated but carrying NO completion marker
 # (engine-python.txt / install.stamp) can be told apart from a user's foreign venv: sentinel-present →
-# our own HARD-KILLED build (its except-cleanup never ran) → reclaim and rebuild; sentinel-absent →
+# our own interrupted build (its except-cleanup never finished) → reclaim and rebuild; sentinel-absent →
 # genuinely foreign → refuse. Without it, a kill between "venv populated" and "_write_markers" left an
 # unmarked, unowned dir that wedged the venv path until a human deleted it.
+#
+# It lives as a SIBLING of the venv dir (``<venv>.burgess-venv-owner``), NOT inside it — crash-report
+# v0.2.4 "anyio wedge", hole B. The failure/interrupt cleanup does ``rmtree(venv_dir)``, and an in-place
+# ``uv``/``pip`` upgrade can recreate the venv dir wholesale; either op, if interrupted mid-flight, would
+# destroy a sentinel kept INSIDE the venv while leaving a populated husk behind — the exact state that
+# wedges. A sibling token survives any operation on the venv dir's contents, so the next run always
+# recognises the husk as ours and rebuilds clean. Mirrors ``_lock_dir``, beside the venv for the same
+# "a half-built venv can't shadow it" reason. See ``_owner_sentinel`` for the lifecycle (claimed before
+# mutation; cleared on a verified success or a clean failure, so a live token means "interrupted build").
 OWNER_NAME = ".burgess-venv-owner"
 LOCK_NAME = ".kg-provision.lock"    # atomic lock dir, kept beside the venv
 STALE_LOCK_SECS = 30 * 60           # treat a lock older than this as abandoned
@@ -408,20 +417,26 @@ def _has_engine_marker(venv_dir: Path) -> bool:
 
 
 def _owner_sentinel(venv_dir: Path) -> Path:
-    return venv_dir / OWNER_NAME
+    """Path to the ownership sentinel — a SIBLING of the venv dir, never inside it (crash-report
+    v0.2.4, hole B). Keyed by the venv's name so sibling venvs under one parent don't collide, and
+    kept beside the venv (like ``_lock_dir``) so an interrupted ``rmtree(venv_dir)`` or an in-place
+    dependency-manager recreate can't destroy the very token the next run needs to reclaim the husk."""
+    return venv_dir.parent / (venv_dir.name + OWNER_NAME)
 
 
 def _has_owner_sentinel(venv_dir: Path) -> bool:
-    """True when the dir carries OUR ``OWNER_NAME`` sentinel — proof that a bootstrap run began
-    populating this exact dir (written before any bin/lib). Distinguishes a HARD-KILLED build of
-    ours (reclaimable) from a user's foreign venv (never touched); see ``do_install`` (FALLO 1)."""
+    """True when our ``OWNER_NAME`` sentinel exists beside the venv — proof that a bootstrap run began
+    populating it (written before any bin/lib) and has NOT yet reached a terminal state. Distinguishes
+    an interrupted build of ours (reclaimable) from a user's foreign venv (never touched); see
+    ``do_install`` (FALLO 1) and ``_clear_owner_sentinel`` for the lifecycle."""
     return _owner_sentinel(venv_dir).exists()
 
 
 def _claim_owner_sentinel(venv_dir: Path) -> None:
-    """Stamp the ownership sentinel BEFORE populating the venv, so a kill mid-build leaves a dir the
+    """Stamp the ownership sentinel BEFORE populating the venv, so a kill mid-build leaves a token the
     NEXT run recognises as its own interrupted work (do_install reclaims it) rather than wedging on
-    the foreign-venv guard. Durable (fsync_dir) so it survives the crash it exists to be read after."""
+    the foreign-venv guard. Durable (fsync_dir) so it survives the crash it exists to be read after.
+    Written beside the venv (see ``_owner_sentinel``) so a wipe of the venv dir can't take it down."""
     _owner_sentinel(venv_dir).parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(
         _owner_sentinel(venv_dir),
@@ -429,6 +444,24 @@ def _claim_owner_sentinel(venv_dir: Path) -> None:
         mkparents=False,
         fsync_dir=True,
     )
+
+
+def _clear_owner_sentinel(venv_dir: Path) -> None:
+    """Drop the ownership sentinel once the build reaches a TERMINAL state — a verified success (after
+    ``_write_markers``) or a clean failure (after the except-cleanup rmtree'd our venv). A LIVE sentinel
+    then means exactly "a build started here and was interrupted before it could finish or clean up" —
+    the only state ``do_install``'s reclaim branch acts on. Clearing on success is what keeps a healthy
+    venv, or a user venv later placed at this path, from ever being seen as reclaimable now that the
+    token is a sibling that outlives the venv dir (crash-report v0.2.4, hole B). Best-effort + durable
+    (fsync the parent so a power cut can't resurrect the token onto a since-swapped venv)."""
+    sentinel = _owner_sentinel(venv_dir)
+    try:
+        sentinel.unlink()
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+    fsync_dir(sentinel.parent)
 
 
 @contextlib.contextmanager
@@ -504,12 +537,15 @@ def do_install(venv_dir: Path) -> Path:
             f"[bootstrap] refusing to provision into {venv_dir}: it already exists and is not an "
             f"engine venv (no {PTR_NAME} / {STAMP_NAME} / {OWNER_NAME}). Point --venv / "
             f"KG_ENGINE_VENV at a dedicated path.")
-    # A populated dir carrying our OWNER sentinel but NO completion marker is a HARD-KILLED build of ours
-    # (killed between "venv populated" and "_write_markers", so its own except-cleanup never ran — FALLO 1).
-    # It is unambiguously ours and NOT a usable venv: wipe it and rebuild clean rather than layering a fresh
-    # install over a partial dependency graph. This is the wedge fix: without it such a dir was foreign
-    # forever. (A dir WITH a completion marker but a stale stamp is a legit prior build — left untouched here
-    # so install_with_uv updates it in place, exactly as before.)
+    # A populated dir carrying our OWNER sentinel but NO completion marker is an INTERRUPTED build of ours:
+    # either a fresh build killed between "venv populated" and "_write_markers" (its except-cleanup never
+    # ran — FALLO 1), or an in-place upgrade whose venv-dir wipe/recreate was interrupted mid-flight, or an
+    # except-cleanup rmtree preempted part-way — all of which strip the completion markers while the SIBLING
+    # sentinel survives (crash-report v0.2.4, hole B: the token lives beside the venv, so a wipe of the venv
+    # dir can't take it down). It is unambiguously ours and NOT a usable venv: wipe it and rebuild clean
+    # rather than layering a fresh install over a partial dependency graph. This is the wedge fix: without a
+    # surviving token such a dir was foreign forever. (A dir WITH a completion marker but a stale stamp is a
+    # legit prior build — left untouched here so install_with_uv updates it in place, exactly as before.)
     if (not empty_or_absent) and _has_owner_sentinel(venv_dir) and not _has_engine_marker(venv_dir):
         print(f"[bootstrap] Reclaiming an interrupted prior build at {venv_dir}", flush=True)
         shutil.rmtree(venv_dir, ignore_errors=True)
@@ -529,9 +565,11 @@ def do_install(venv_dir: Path) -> Path:
     #     until a human deletes it — meanwhile the half-swapped venv is missing a transitive dep (e.g. `anyio`
     #     uninstalled-but-not-reinstalled) and the MCP server crash-loops on ImportError.
     # Claiming here is safe on both paths: any genuinely foreign dir was already refused above, so at this
-    # point the dir is unambiguously ours to write into. WITH the sentinel, an interrupted upgrade lands in
-    # the reclaim branch on the next provision and is rebuilt clean instead of wedging (FALLO 1 net, now
-    # extended to cover the in-place-upgrade path too).
+    # point the dir is unambiguously ours to write into. WITH the sentinel — stamped BESIDE the venv so a
+    # wipe/recreate of the venv dir can't destroy it (crash-report v0.2.4, hole B) — an interrupted upgrade
+    # lands in the reclaim branch on the next provision and is rebuilt clean instead of wedging (FALLO 1 net,
+    # now covering the in-place-upgrade path too). The success/clean-failure paths clear it (see
+    # _clear_owner_sentinel), so a LIVE token means precisely "an interrupted build is still sitting here".
     _claim_owner_sentinel(venv_dir)
 
     with _heartbeat_pulse(venv_dir):
@@ -564,9 +602,21 @@ def do_install(venv_dir: Path) -> Path:
             # leftover reclaimable next run — FALLO 1, now covering the in-place-upgrade path too.)
             if ours_to_clean or _has_engine_marker(venv_dir) or _has_owner_sentinel(venv_dir):
                 shutil.rmtree(venv_dir, ignore_errors=True)
+                # Drop the reclaim token ONLY once the venv is fully gone. If the rmtree succeeded there is
+                # no husk to reclaim, so a lingering sibling token would be a hazard — it could later
+                # reclaim (and rmtree) a user venv placed at this same path. But if the rmtree was preempted
+                # or left anything behind (Windows sharing violation, a HARD kill mid-walk), the venv dir
+                # still exists as a populated husk: KEEP the token so the next run reclaims it (hole B). The
+                # success path below clears the token unconditionally — a sealed venv is never a husk.
+                if not venv_dir.exists():
+                    _clear_owner_sentinel(venv_dir)
             raise
 
     _write_markers(venv_dir, py)
+    # Verified + sealed: drop the reclaim token so this healthy venv (and any user venv later placed at this
+    # path) is never mistaken for an interrupted build. Now that the token is a sibling that outlives a wipe
+    # of the venv dir, a stale one would otherwise be a live hazard (crash-report v0.2.4, hole B).
+    _clear_owner_sentinel(venv_dir)
     return py
 
 
