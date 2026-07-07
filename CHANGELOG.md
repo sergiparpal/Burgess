@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **`kg_context` (and any lazy-projecting read) could hang for HOURS on Windows/Py3.14
+  instead of failing.** Two chained defects. (1) The projector imports the heavy native
+  deps (`numpy` → OpenBLAS, `igraph`, `leidenalg`) **lazily**, deep inside
+  `projector._leiden`, so on a populated canon the *first* read that projects triggered
+  the very first `import numpy` **from inside an MCP handler** — i.e. on the event-loop
+  thread while anyio worker threads were already alive. That late, cross-thread native
+  load could deadlock the Windows loader lock and never return. (2) When the 300s handler
+  watchdog then tripped, its `os._exit(71)` routed through `ExitProcess`, which needs that
+  **same** loader lock to run DLL-detach teardown — so the force-exit deadlocked too, the
+  process never died, the supervisor never relaunched, and 300s became ~4h of silent hang.
+  Fixed at the root: the server now **pre-loads numpy/networkx/igraph/leidenalg once at
+  startup on the main thread, before the watchdog and serve loop start**
+  (`server._preload_native_deps`), so the projector's later lazy imports are pure
+  `sys.modules` cache hits that take no loader lock — and the watchdog's force-exit is now
+  a **teardown-free hard kill** (`server._hard_exit`: `TerminateProcess` on Windows,
+  `SIGKILL` on POSIX) that can't be blocked by a wedged native import. Both stay
+  best-effort/graceful (a missing native dep still degrades to the pure-Python
+  label-propagation fallback). Pinned by the `#7b`/`#7c` cases in
+  `tests/test_resilience.py`.
+
 ## 0.2.1 — 2026-07-06
 
 Patch release. Fixes a `source_path` configuration bug and adds nothing else — no

@@ -452,6 +452,116 @@ def test_disabled_watchdog_does_not_start():
 
 
 # ---------------------------------------------------------------------------------------------------
+# #7b — the watchdog force-exit is a TEARDOWN-FREE hard kill (BURGESS_BUG_kg_context_hang, fix #2)
+#   A handler wedged inside a native import holds the Windows loader lock; a plain os._exit -> ExitProcess
+#   needs that SAME lock to run DLL teardown, so it deadlocks and the process never dies. The default
+#   on_trip must therefore be _hard_exit (SIGKILL / TerminateProcess), which touches no teardown path.
+# ---------------------------------------------------------------------------------------------------
+def test_default_watchdog_on_trip_is_hard_exit(monkeypatch):
+    """A watchdog constructed WITHOUT an injected on_trip force-exits via _hard_exit(EXIT_WATCHDOG) —
+    not os._exit — so a trip survives a loader-lock deadlock. Assert the wiring without dying."""
+    calls = []
+    monkeypatch.setattr(S, "_hard_exit", lambda code: calls.append(code))
+    # os._exit MUST NOT be the default anymore; make it a canary that fails the test if reached.
+    monkeypatch.setattr(S.os, "_exit", lambda code: calls.append(("os._exit", code)))
+    wd = S._Watchdog(timeout=1.0)  # no on_trip -> the production default
+    wd._on_trip()
+    assert calls == [S.EXIT_WATCHDOG]
+
+
+def test_hard_exit_terminates_process_bypassing_teardown():
+    """_hard_exit really kills the process WITHOUT running atexit/interpreter teardown — the property the
+    fix depends on (a soft exit can deadlock on the loader lock a wedged native import already holds).
+    Driven in a subprocess so it never kills the test runner. POSIX: SIGKILL (returncode == -SIGKILL);
+    Windows: TerminateProcess with the given code (returncode == the code)."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    import kg_engine
+
+    scripts_dir = str(Path(kg_engine.__file__).resolve().parent.parent)  # <repo>/scripts
+    prog = (
+        "import atexit, sys\n"
+        "atexit.register(lambda: sys.stderr.write('ATEXIT_RAN'))\n"
+        "import kg_engine.server as S\n"
+        "sys.stderr.write('BEFORE'); sys.stderr.flush()\n"
+        "S._hard_exit(71)\n"
+        "sys.stderr.write('AFTER')\n"  # unreachable — the kill is immediate
+    )
+    env = {**os.environ, "PYTHONPATH": scripts_dir + os.pathsep + os.environ.get("PYTHONPATH", "")}
+    r = subprocess.run([sys.executable, "-c", prog], capture_output=True, text=True, env=env, timeout=30)
+    assert "BEFORE" in r.stderr
+    assert "ATEXIT_RAN" not in r.stderr, "atexit ran — teardown was NOT bypassed"
+    assert "AFTER" not in r.stderr
+    if sys.platform == "win32":
+        assert r.returncode == 71
+    else:
+        import signal
+        assert r.returncode == -signal.SIGKILL
+
+
+# ---------------------------------------------------------------------------------------------------
+# #7c — startup PRELOADS the heavy native deps (BURGESS_BUG_kg_context_hang, fix #1)
+#   The projector imports numpy/igraph/leidenalg lazily inside _leiden, so the first read that projects
+#   would otherwise trigger the first native import from WITHIN a handler (cross-thread) — the hang site.
+#   Preloading at startup makes those later lazy imports pure sys.modules cache hits.
+# ---------------------------------------------------------------------------------------------------
+def test_preload_native_deps_warms_sys_modules():
+    """After the startup preload, the native projection deps live in sys.modules, so the projector's
+    lazy imports inside a handler are cache hits (no cross-thread loader activity)."""
+    import sys
+    pytest.importorskip("numpy")
+    pytest.importorskip("igraph")
+    pytest.importorskip("leidenalg")
+    S._preload_native_deps()
+    for name in ("numpy", "networkx", "igraph", "leidenalg"):
+        assert name in sys.modules, f"{name} was not preloaded into sys.modules"
+
+
+def test_preload_native_deps_is_best_effort_when_a_dep_is_missing(monkeypatch):
+    """A genuinely-absent/broken native dep must DEGRADE (projector falls back to label propagation),
+    never crash startup — so an ImportError during preload is swallowed, not raised."""
+    import builtins
+    real_import = builtins.__import__
+
+    def _boom(name, *a, **k):
+        if name == "leidenalg":
+            raise ImportError("simulated missing native dep")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", _boom)
+    S._preload_native_deps()  # must not raise
+
+
+def test_main_preloads_before_starting_the_watchdog(monkeypatch, tmp_path):
+    """main() must run the (single-threaded) native preload BEFORE the watchdog thread and the serve loop
+    start — that ordering is what keeps the heavy import off the multi-threaded event loop (the deadlock
+    site). Drive main() with every side effect stubbed and assert the call order."""
+    import mcp.server.fastmcp as fastmcp_mod
+
+    monkeypatch.setenv("KG_DATA", str(tmp_path))  # keep server.log out of the cwd
+    order = []
+    monkeypatch.setattr(S, "configure_logging", lambda *a, **k: None)
+    monkeypatch.setattr(S, "_preload_native_deps", lambda: order.append("preload"))
+    monkeypatch.setattr(S, "_start_watchdog", lambda: order.append("watchdog"))
+    monkeypatch.setattr(S, "build_engine_from_env", lambda: order.append("engine") or object())
+    monkeypatch.setattr(S, "_register", lambda mcp, engine: None)
+
+    class FakeFastMCP:
+        def __init__(self, *a, **k):
+            pass
+
+        def run(self):
+            order.append("run")
+
+    monkeypatch.setattr(fastmcp_mod, "FastMCP", FakeFastMCP)
+    S.main()
+    assert order.index("preload") < order.index("watchdog") < order.index("run")
+
+
+# ---------------------------------------------------------------------------------------------------
 # #8 — REGRESSION GUARD for the ruled-out cause: a full projection over a real fixture canon
 # ---------------------------------------------------------------------------------------------------
 def test_full_projection_over_fixture_canon_completes(engine):

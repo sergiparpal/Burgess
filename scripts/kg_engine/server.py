@@ -150,6 +150,39 @@ DEFAULT_HANDLER_TIMEOUT = 300.0
 _WRITE_CACHE_MAX = 256
 
 
+def _hard_exit(code: int) -> None:
+    """Terminate THIS process immediately, without running interpreter / DLL-detach teardown.
+
+    Why not a plain ``os._exit`` (BURGESS_BUG_kg_context_hang, failure #2): when the watchdog trips
+    because a handler wedged INSIDE a native-extension load — a numpy/OpenBLAS import that deadlocked on
+    the Windows loader lock — ``os._exit`` routes through ``ExitProcess``, which needs that SAME loader
+    lock to run DLL-detach teardown, so it deadlocks too. The process then never dies, the supervisor
+    never sees the exit (so never lets the client reconnect), and a 300s watchdog silently becomes an
+    hours-long hang. So force a kill that touches NO teardown path:
+      - Windows: ``TerminateProcess(GetCurrentProcess(), code)`` — no DLL detach, never takes the loader lock.
+      - POSIX:   ``SIGKILL`` — uncatchable, immediate, no atexit/teardown.
+    Both preserve the observable outcome the Node supervisor keys on (a non-clean child exit → it lets the
+    client reconnect with a fresh ``initialize`` handshake). ``os._exit`` stays as a last-ditch fallback
+    for the (unexpected) case where the OS primitive itself can't be issued."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            # Declare the handle types so the current-process PSEUDO-handle ((HANDLE)-1) isn't truncated
+            # to a 32-bit int on 64-bit Windows (ctypes' default int marshalling would sign-lose it).
+            kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+            kernel32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+            kernel32.TerminateProcess(kernel32.GetCurrentProcess(), ctypes.c_uint(code))
+        else:
+            import signal
+            os.kill(os.getpid(), signal.SIGKILL)
+    except Exception:  # noqa: BLE001 — if the hard kill can't be issued, fall through to os._exit
+        pass
+    # Belt-and-braces: SIGKILL / TerminateProcess terminate before reaching here; this only runs if the
+    # OS primitive above raised or (impossibly) returned — still leave, just via the softer path.
+    os._exit(code)
+
+
 # The canonical env-value cleaner (empty / ${...} placeholder / bare sentinel → unset). The rule
 # itself is single-homed in envconfig (review-r5) — shared with bootstrap, the PreToolUse hook, and
 # the lightrag arm; launch_server.clean is its declared JS mirror.
@@ -288,12 +321,13 @@ class _Watchdog:
     (atomic temp+replace, the reclaimable lease) makes a hard exit recoverable; idempotent write receipts
     make a lost in-flight response harmless to retry.
 
-    `on_trip` is injected so tests can assert a trip WITHOUT killing the test process (default os._exit)."""
+    `on_trip` is injected so tests can assert a trip WITHOUT killing the test process (default
+    `_hard_exit` — a teardown-free kill, because a wedged native import can deadlock `os._exit`)."""
 
     def __init__(self, timeout: float, *, on_trip=None, poll: float | None = None):
         self.timeout = float(timeout)
         self._poll = poll if poll is not None else max(1.0, self.timeout / 10.0)
-        self._on_trip = on_trip or (lambda: os._exit(EXIT_WATCHDOG))
+        self._on_trip = on_trip or (lambda: _hard_exit(EXIT_WATCHDOG))
         self._lock = threading.Lock()
         self._name: str | None = None
         self._started: float = 0.0
@@ -368,9 +402,10 @@ class _Watchdog:
             stacks.append(f"--- thread {tid} ---\n" + "".join(traceback.format_stack(frame)))
         logger.critical("watchdog: handler %r exceeded %.0fs (ran %.0fs); forcing a fresh process so "
                         "the supervisor relaunches.\n%s", name, self.timeout, elapsed, "\n".join(stacks))
-        # FLUSH (don't logging.shutdown()) before the trip: the default on_trip is os._exit, which bypasses
-        # the interpreter's atexit flush, so the critical record must be pushed to disk now. shutdown()
-        # would CLOSE every handler process-wide — harmful to a still-running process and to the test suite.
+        # FLUSH (don't logging.shutdown()) before the trip: the default on_trip is a hard kill
+        # (_hard_exit — SIGKILL/TerminateProcess), which bypasses the interpreter's atexit flush, so the
+        # critical record must be pushed to disk NOW. shutdown() would CLOSE every handler process-wide —
+        # harmful to a still-running process and to the test suite.
         for h in logging.getLogger().handlers:
             try:
                 h.flush()
@@ -2392,6 +2427,33 @@ def _register(mcp, engine: KGEngine) -> None:
                                              node_type=node_type, edges=edges)
 
 
+def _preload_native_deps() -> None:
+    """Import the heavy native projection deps (numpy, igraph, leidenalg) — and networkx — ONCE at
+    startup, on the MAIN thread, BEFORE the asyncio serve loop / anyio worker threads exist.
+
+    Load-bearing, not a mere warm-up (BURGESS_BUG_kg_context_hang, failure #1). The projector imports
+    these LAZILY, deep inside ``_leiden``/``_ranks`` — so on a populated canon the FIRST read that
+    projects (``kg_context``, ``query_graph``, any lazy-projecting read) triggers the very first
+    ``import numpy`` from WITHIN an MCP handler, i.e. on the event-loop thread while anyio worker threads
+    are already alive. On Windows that late native-extension load (numpy → OpenBLAS spawning threads) can
+    DEADLOCK on the loader lock and never return; the handler hangs, and the watchdog's own force-exit
+    then also blocks on that same lock (see ``_hard_exit``). Importing here — single-threaded, before any
+    of that exists — both (a) removes the multi-second-to-forever hot-path stall and (b) sidesteps the
+    loader-lock deadlock entirely: ``sys.modules`` is warm, so the projector's later lazy imports are pure
+    cache hits that take no loader lock. This is the highest-impact / lowest-risk of the reported fixes.
+
+    Best-effort: a genuinely-absent or broken dep must still DEGRADE gracefully — the projector falls back
+    to pure-Python label propagation (``projector._leiden``) and every ``kg_*`` graph tool keeps working —
+    so an import failure here is logged at INFO and swallowed, NEVER a startup failure. Ordered so numpy
+    (the actual hang site) is imported first and alone, before igraph pulls it in transitively."""
+    for name in ("numpy", "networkx", "igraph", "leidenalg"):
+        try:
+            __import__(name)
+        except Exception as e:  # noqa: BLE001 — a missing/broken native dep must degrade, not block startup
+            logger.info("preload: %s unavailable (%s: %s); projection will fall back to the pure-Python "
+                        "path if needed", name, type(e).__name__, e)
+
+
 def _start_watchdog() -> "_Watchdog | None":
     """Construct + start the handler watchdog from KG_HANDLER_TIMEOUT (default DEFAULT_HANDLER_TIMEOUT;
     0/negative/invalid disables it), and publish it for the tool envelope to feed. Returns it (or None)."""
@@ -2412,6 +2474,11 @@ def main() -> None:
     # transport-crash class was previously undiagnosable because nothing was persisted).
     configure_logging()
     logger.info("kg_engine.server starting (version=%s pid=%s)", __version__, os.getpid())
+    # Pull the heavy native projection deps (numpy/igraph/leidenalg) into sys.modules NOW — on the main
+    # thread, before the watchdog thread and the asyncio/anyio serve loop start — so the first read that
+    # projects never triggers a late, cross-thread native import that can deadlock the Windows loader lock
+    # (BURGESS_BUG_kg_context_hang, fix #1). Before _start_watchdog for a fully single-threaded import.
+    _preload_native_deps()
     _start_watchdog()
     try:
         from mcp.server.fastmcp import FastMCP
