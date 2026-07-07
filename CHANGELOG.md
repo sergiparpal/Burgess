@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.2.2 — 2026-07-07
+
+Patch release. Fixes a Windows/Py3.14 projection hang and adds nothing else — no
+API or tool-surface changes (the 27-tool surface is unchanged).
 
 ### Fixed
 
