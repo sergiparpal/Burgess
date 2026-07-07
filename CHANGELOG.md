@@ -1,9 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.2.3 — 2026-07-07
 
-Bug-fix batch from a Windows startup/provisioning report (no tool-surface change — the
-27-tool surface is unchanged; `kg_status()` gains one additive `source` field).
+Patch release. Bug-fix batch from a Windows startup/provisioning report (no tool-surface
+change — the 27-tool surface is unchanged; `kg_status()` gains one additive `source` field).
 
 ### Fixed
 
