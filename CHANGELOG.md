@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.2.4 — 2026-07-07
+
+Patch release. One provisioning fix from a crash report; no API or tool-surface change
+(the 27-tool surface is unchanged).
+
+### Fixed
+
+- **An interrupted plugin auto-upgrade wedged the engine venv, crash-looping the MCP
+  server.** When a plugin update changes dependencies the install stamp goes stale, so
+  `bootstrap.do_install` upgrades the existing venv **in place** — `uv sync` uninstalls the
+  old wheels before reinstalling the new ones. A hard kill during that swap (the plugin's
+  process tree being torn down mid-upgrade) could leave the venv missing a transitive
+  dependency (e.g. `anyio`, pulled in by `mcp`), so the server died on `ModuleNotFoundError`
+  at startup and relaunched until it hit the crash-loop cap — every `kg_*` tool absent for
+  the session. The 0.2.3 self-heal sentinel (`.burgess-venv-owner`, FALLO 1) that lets an
+  interrupted build be reclaimed was only stamped on the **fresh-build** path, so an
+  interrupted **in-place upgrade** — which also strips the completion markers — left a
+  populated, markerless, ownerless dir that the foreign-venv guard refused forever. Fixed by
+  claiming the ownership sentinel **before any mutation on both paths** (fresh build and
+  in-place upgrade), so an interrupted upgrade now lands in the existing reclaim branch and
+  is rebuilt clean on the next provision instead of wedging (`bootstrap.do_install`).
+
 ## 0.2.3 — 2026-07-07
 
 Patch release. Bug-fix batch from a Windows startup/provisioning report (no tool-surface
