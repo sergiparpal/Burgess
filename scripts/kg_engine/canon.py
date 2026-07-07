@@ -51,9 +51,9 @@ TRANSIENT_REAP_TTL = 3600.0
 # only for its own brief write, so a writer that finds it taken retries with exponential backoff and
 # serializes cleanly instead of failing outright. Capped so a genuinely wedged LIVE foreign holder
 # surfaces as the locked-vault error rather than hanging forever. A DEAD holder on the SAME host is
-# reclaimed immediately via staleness inside acquire() (its pid no longer probes alive), so it is never
-# waited on; a CROSS-HOST holder's pid can't be probed (and Windows can't probe at all), so such a dead
-# holder is only seen stale once its lease TTL lapses — a writer may wait up to this budget meanwhile,
+# reclaimed immediately via staleness inside acquire() (its pid no longer probes alive on POSIX or, since
+# FALLO 2, via OpenProcess on Windows), so it is never waited on; only a CROSS-HOST holder's pid can't be
+# probed, so such a dead holder is only seen stale once its lease TTL lapses — a writer may wait up to this budget meanwhile,
 # then surface the error, and a later attempt reclaims it. The default comfortably covers a full max-size
 # (10) wave of brief writes serializing; tests override it per Canon (e.g. 0 to assert the old immediate-fail).
 LOCK_ACQUIRE_TIMEOUT = 30.0
@@ -349,18 +349,47 @@ def _replace_lockfile(src: Path, dst: Path) -> None:
             backoff = min(backoff * 2, LOCK_RETRY_MAX)
 
 
+def _win_pid_alive(pid: int) -> bool:
+    """Windows liveness probe via ``OpenProcess`` + ``GetExitCodeProcess`` (ctypes — stdlib). A
+    running pid → True, a pid that no longer exists → False, a pid owned by another account → True
+    (assume alive). Any ctypes/loader hiccup → True (fail SAFE: never reclaim a lock we can't PROVE
+    is dead). This is the parallel-by-design twin of ``dirlock._win_pid_alive`` — the two locks keep
+    their own copies (see dirlock's module header) but share the identical Windows probe (FALLO 2)."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        ERROR_ACCESS_DENIED = 5
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return ctypes.get_last_error() == ERROR_ACCESS_DENIED  # denied → exists; else no such pid
+        try:
+            code = wintypes.DWORD()
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return code.value == STILL_ACTIVE
+            return True
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:  # noqa: BLE001 — a ctypes/loader failure must never over-reclaim a live lease
+        return True
+
+
 def _pid_probe(pid: int, host: str, my_host: str) -> bool:
-    """True if the pid is (possibly) alive. A pid on another host is treated as alive."""
+    """True if the pid is (possibly) alive. A pid on another host is treated as alive; a same-host pid
+    is probed on BOTH platforms — os.kill(pid, 0) on POSIX, OpenProcess (_win_pid_alive) on Windows.
+    (FALLO 2: os.kill(pid, 0) on Windows is CTRL_C_EVENT, not a no-op existence check, so the probe
+    used to be skipped there and a crashed holder's lease was reclaimed only once its TTL lapsed.)"""
     if not pid:
         return False
     if host and host != my_host:
         return True
     if os.name == "nt":
-        # On Windows, os.kill(pid, 0) does NOT probe liveness: signal 0 is CTRL_C_EVENT, which delivers
-        # a console-control event (KeyboardInterrupt) to the target's process group rather than a
-        # no-op existence check — it would interrupt us. Skip the probe and rely on the heartbeat/TTL
-        # for staleness on Windows (a crashed holder's lock is reclaimed once its TTL lapses).
-        return True
+        return _win_pid_alive(pid)
     try:
         os.kill(pid, 0)
         return True

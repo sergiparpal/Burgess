@@ -73,19 +73,31 @@ def test_stale_lock_always_reclaimed(tmp_path):
     import os
     p = tmp_path / ".kg-session-lock"
 
-    # (a) dead pid, fresh heartbeat -> stale (pid not alive). POSIX-only: Windows cannot probe pid
-    # liveness without os.kill(pid, 0) sending a console CTRL_C event, so it relies on the TTL (case b)
-    # rather than pid-death detection.
-    if os.name != "nt":
-        p.write_text(json.dumps({"pid": 2 ** 30, "host": LeaseLock(p).host,
-                                 "acquired_at": time.time(), "ttl": 120, "heartbeat_at": time.time()}))
-        lock = LeaseLock(p, ttl=120)
-        assert lock.is_stale() and lock.acquire()
+    # (a) dead pid, fresh heartbeat -> stale (pid not alive). Cross-platform since FALLO 2: the pid
+    # probe is os.kill(pid, 0) on POSIX and OpenProcess (_win_pid_alive) on Windows, so a dead holder
+    # is reclaimed by pid-death detection on BOTH — no longer relying on the TTL (case b) on Windows.
+    p.write_text(json.dumps({"pid": 2 ** 30, "host": LeaseLock(p).host,
+                             "acquired_at": time.time(), "ttl": 120, "heartbeat_at": time.time()}))
+    lock = LeaseLock(p, ttl=120)
+    assert lock.is_stale() and lock.acquire()
 
     # (b) expired heartbeat -> stale (ttl exceeded) — the cross-platform staleness signal
     p.write_text(json.dumps({"pid": os.getpid(), "host": LeaseLock(p).host,
                              "acquired_at": 0, "ttl": 1, "heartbeat_at": time.time() - 999}))
     assert LeaseLock(p, ttl=1).is_stale() and LeaseLock(p, ttl=1).acquire()
+
+
+def test_canon_pid_probe_dispatches_to_windows_liveness_probe(monkeypatch):
+    # FALLO 2 dispatch (runs on any OS): under os.name == "nt", canon._pid_probe must consult
+    # _win_pid_alive rather than blanket assume-alive — the twin of dirlock.pid_probe. Stub the probe
+    # so the Windows branch is exercised on the Linux CI too.
+    monkeypatch.setattr(canon_mod.os, "name", "nt")
+    monkeypatch.setattr(canon_mod, "_win_pid_alive", lambda pid: False)
+    assert canon_mod._pid_probe(4321, host="h", my_host="h") is False   # dead per the Windows probe
+    monkeypatch.setattr(canon_mod, "_win_pid_alive", lambda pid: True)
+    assert canon_mod._pid_probe(4321, host="h", my_host="h") is True    # alive per the Windows probe
+    # A cross-host pid is assumed alive WITHOUT probing, even on nt.
+    assert canon_mod._pid_probe(4321, host="other", my_host="h") is True
 
 
 def test_live_lock_not_reclaimed(tmp_path):

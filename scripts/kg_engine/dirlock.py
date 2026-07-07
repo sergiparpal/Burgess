@@ -14,8 +14,9 @@ The parallel-by-design pairs with ``canon.LeaseLock``, stated once here:
     aside, restore it when the holder proves live (``LeaseLock._reclaim_stale``);
   - release ownership re-check via a nonce token, so a falsely-stolen holder never deletes the
     thief's fresh lock on its way out (F15);
-  - pid-probe semantics: cross-host or host-less records assume-alive; the probe is skipped on
-    Windows (``os.kill(pid, 0)`` there is CTRL_C_EVENT, not an existence check).
+  - pid-probe semantics: cross-host or host-less records assume-alive; same-host records are probed
+    on BOTH platforms — ``os.kill(pid, 0)`` on POSIX, ``OpenProcess`` (``_win_pid_alive``) on Windows,
+    since ``os.kill(pid, 0)`` there is CTRL_C_EVENT, not an existence check (FALLO 2).
 
 Every function takes the LOCK DIR path itself; the caller owns where that lives (bootstrap keys
 it beside the venv, so a half-built venv can never shadow its own lock).
@@ -69,10 +70,52 @@ def parse_info(lock: Path) -> dict[str, str]:
     return rec
 
 
+def _win_pid_alive(pid: int) -> bool:
+    """Windows liveness probe via ``OpenProcess`` + ``GetExitCodeProcess`` (ctypes — stdlib, so this
+    stays importable with a bare system Python before any venv dep). Mirrors the POSIX ``os.kill(pid,
+    0)`` semantics used below: a running pid → True, a pid that no longer exists → False, a pid we
+    lack the rights to open (another user) → True (exists, assume alive).
+
+    This is the FALLO 2 fix: on Windows ``os.kill(pid, 0)`` is CTRL_C_EVENT (it would interrupt the
+    target), so the probe used to be skipped there and a crashed provisioner's lock could only be
+    reclaimed once its heartbeat aged past ``STALE_LOCK_SECS`` (30 min). OpenProcess gives a real,
+    cheap existence check, so a dead holder is reclaimed in milliseconds on Windows too. Any ctypes /
+    loader hiccup returns True (fail SAFE: never steal a lock we cannot PROVE is dead). Its POSIX twin
+    in ``canon._pid_probe`` carries the identical helper (the two locks are parallel-by-design)."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        ERROR_ACCESS_DENIED = 5
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            # No handle: ERROR_INVALID_PARAMETER (87) == no such process → dead; ERROR_ACCESS_DENIED
+            # (5) == the process exists but is owned by another account → alive (mirrors POSIX EPERM).
+            return ctypes.get_last_error() == ERROR_ACCESS_DENIED
+        try:
+            code = wintypes.DWORD()
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                # A still-running process reports STILL_ACTIVE; anything else is a real exit code, so
+                # the handle refers to an already-terminated (not-yet-freed) process → dead.
+                return code.value == STILL_ACTIVE
+            return True  # couldn't read the exit code → assume alive (never over-steal)
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:  # noqa: BLE001 — a ctypes/loader failure must never over-steal a live lock
+        return True
+
+
 def pid_probe(rec: dict[str, str]) -> bool:
-    """True if the lock's recorded holder is (possibly) alive. Mirrors canon._pid_probe: a
-    pid on another host (or no host recorded) is treated as alive, and the probe is skipped
-    on Windows (os.kill(pid, 0) there is CTRL_C_EVENT, not a no-op existence check)."""
+    """True if the lock's recorded holder is (possibly) alive. Mirrors canon._pid_probe: a pid on
+    another host (or no host recorded) is treated as alive; on the same host the pid is probed —
+    ``os.kill(pid, 0)`` on POSIX, ``_win_pid_alive`` (OpenProcess) on Windows (FALLO 2: the probe is
+    no longer skipped on Windows, so a crashed holder is reclaimed in ms rather than after the 30-min
+    stale window)."""
     try:
         pid = int(rec.get("pid", "0"))
     except ValueError:
@@ -85,7 +128,7 @@ def pid_probe(rec: dict[str, str]) -> bool:
     if not host:
         return True  # an old info record without a host can't be probed — assume alive
     if os.name == "nt":
-        return True
+        return _win_pid_alive(pid)
     try:
         os.kill(pid, 0)
         return True

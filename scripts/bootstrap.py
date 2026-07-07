@@ -82,6 +82,13 @@ PYPROJECT = REPO_ROOT / "pyproject.toml"          # the dependency source of tru
 MIN_PY = (3, 10)                    # matches pyproject's requires-python = ">=3.10"
 PTR_NAME = "engine-python.txt"      # interpreter pointer, written inside the venv dir
 STAMP_NAME = "install.stamp"        # content hash of the install inputs
+# Ownership sentinel written INSIDE the venv dir BEFORE any bin/lib lands (bootstrap FALLO 1). It
+# marks "THIS provisioner started building here", so a dir populated but carrying NO completion marker
+# (engine-python.txt / install.stamp) can be told apart from a user's foreign venv: sentinel-present →
+# our own HARD-KILLED build (its except-cleanup never ran) → reclaim and rebuild; sentinel-absent →
+# genuinely foreign → refuse. Without it, a kill between "venv populated" and "_write_markers" left an
+# unmarked, unowned dir that wedged the venv path until a human deleted it.
+OWNER_NAME = ".burgess-venv-owner"
 LOCK_NAME = ".kg-provision.lock"    # atomic lock dir, kept beside the venv
 STALE_LOCK_SECS = 30 * 60           # treat a lock older than this as abandoned
 # Heartbeat cadence must stay well under STALE_LOCK_SECS so a healthy holder is never
@@ -392,8 +399,36 @@ def _has_engine_marker(venv_dir: Path) -> bool:
     ownership on ``pyvenv.cfg`` would let a failed install ``rmtree`` a user's real venv. So we
     key strictly on the files bootstrap writes; a populated dir without one is treated as
     foreign user data and is never scaffolded into nor deleted.
+
+    The COMPLETION markers here mean "a build finished and verified". The weaker
+    ``OWNER_NAME`` sentinel (``_has_owner_sentinel``) means "a build STARTED here" — enough to
+    reclaim an interrupted build, but never proof of a usable venv, so it is kept separate.
     """
     return (venv_dir / PTR_NAME).exists() or (venv_dir / STAMP_NAME).exists()
+
+
+def _owner_sentinel(venv_dir: Path) -> Path:
+    return venv_dir / OWNER_NAME
+
+
+def _has_owner_sentinel(venv_dir: Path) -> bool:
+    """True when the dir carries OUR ``OWNER_NAME`` sentinel — proof that a bootstrap run began
+    populating this exact dir (written before any bin/lib). Distinguishes a HARD-KILLED build of
+    ours (reclaimable) from a user's foreign venv (never touched); see ``do_install`` (FALLO 1)."""
+    return _owner_sentinel(venv_dir).exists()
+
+
+def _claim_owner_sentinel(venv_dir: Path) -> None:
+    """Stamp the ownership sentinel BEFORE populating the venv, so a kill mid-build leaves a dir the
+    NEXT run recognises as its own interrupted work (do_install reclaims it) rather than wedging on
+    the foreign-venv guard. Durable (fsync_dir) so it survives the crash it exists to be read after."""
+    _owner_sentinel(venv_dir).parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(
+        _owner_sentinel(venv_dir),
+        f"pid={os.getpid()} t={time.time():.0f} building\n",
+        mkparents=False,
+        fsync_dir=True,
+    )
 
 
 @contextlib.contextmanager
@@ -451,23 +486,40 @@ def do_install(venv_dir: Path) -> Path:
     # (no marker yet) nor buildable next run (the foreign guard would see a populated markerless dir),
     # wedging the venv path until a human deletes it (bootstrap).
     try:
-        ours_to_clean = not venv_dir.exists() or not any(venv_dir.iterdir())
+        empty_or_absent = not venv_dir.exists() or not any(venv_dir.iterdir())
     except OSError:
-        ours_to_clean = False
-    # A PRE-EXISTING, populated dir that carries NO engine marker is FOREIGN — a user's own venv (a bare
-    # pyvenv.cfg does NOT make it ours; see _has_engine_marker) or unrelated data that --venv /
-    # KG_ENGINE_VENV merely points at (bootstrap-1/4). Refuse to SCAFFOLD into it BEFORE writing anything,
-    # so we neither pollute user data with bin/lib nor (below) ever rmtree it. DELIBERATE trade-off: a
-    # half-built venv left by a HARD-KILLED previous run (pyvenv.cfg but no marker, its own cleanup never
-    # ran) is also treated as foreign and so wedges this path until a human removes it — chosen over any
-    # risk of deleting real user data. The COMMON half-built case (this run created it, then failed) is
-    # ours_to_clean and is cleaned below.
-    preexisting_foreign = (not ours_to_clean) and not _has_engine_marker(venv_dir)
+        empty_or_absent = False
+    # A PRE-EXISTING, populated dir is FOREIGN — refuse — UNLESS it is unambiguously ours: it carries an
+    # engine COMPLETION marker (a prior build of ours) OR our OWNER sentinel (a build we STARTED here; a
+    # bare pyvenv.cfg does NOT make it ours, see _has_engine_marker). A user's own venv that --venv /
+    # KG_ENGINE_VENV points at has neither, so it is still refused BEFORE we scaffold anything — we never
+    # pollute user data with bin/lib nor (below) rmtree it (bootstrap-1/4).
+    preexisting_foreign = (
+        (not empty_or_absent)
+        and not _has_engine_marker(venv_dir)
+        and not _has_owner_sentinel(venv_dir)
+    )
     if preexisting_foreign:
         raise SystemExit(
             f"[bootstrap] refusing to provision into {venv_dir}: it already exists and is not an "
-            f"engine venv (no {PTR_NAME} / {STAMP_NAME}). Point --venv / KG_ENGINE_VENV "
-            f"at a dedicated path.")
+            f"engine venv (no {PTR_NAME} / {STAMP_NAME} / {OWNER_NAME}). Point --venv / "
+            f"KG_ENGINE_VENV at a dedicated path.")
+    # A populated dir carrying our OWNER sentinel but NO completion marker is a HARD-KILLED build of ours
+    # (killed between "venv populated" and "_write_markers", so its own except-cleanup never ran — FALLO 1).
+    # It is unambiguously ours and NOT a usable venv: wipe it and rebuild clean rather than layering a fresh
+    # install over a partial dependency graph. This is the wedge fix: without it such a dir was foreign
+    # forever. (A dir WITH a completion marker but a stale stamp is a legit prior build — left untouched here
+    # so install_with_uv updates it in place, exactly as before.)
+    if (not empty_or_absent) and _has_owner_sentinel(venv_dir) and not _has_engine_marker(venv_dir):
+        print(f"[bootstrap] Reclaiming an interrupted prior build at {venv_dir}", flush=True)
+        shutil.rmtree(venv_dir, ignore_errors=True)
+        empty_or_absent = True
+    # WE are (re)populating this dir THIS run iff it is now empty/absent; such a dir is safe to rmtree on
+    # failure even before any marker exists. Claim ownership FIRST (before bin/lib) so a kill mid-build is
+    # reclaimable next run via the branch above.
+    ours_to_clean = empty_or_absent
+    if ours_to_clean:
+        _claim_owner_sentinel(venv_dir)
 
     with _heartbeat_pulse(venv_dir):
         try:
@@ -486,14 +538,16 @@ def do_install(venv_dir: Path) -> Path:
         except BaseException:
             # A failed/interrupted install leaves a venv with an interpreter but a partial
             # dependency graph that the next run would silently "reuse". Remove it so the next
-            # provision rebuilds clean — but ONLY when it is genuinely ours: either WE created
-            # the dir THIS run (ours_to_clean) or it carries an engine marker from a prior build
-            # (engine-python.txt / install.stamp). A pre-existing populated dir WITHOUT an engine
-            # marker is foreign and was already refused above, so we never reach here for one — but
-            # the marker re-check keeps the rmtree from ever touching such a dir even if that guard
-            # changed. A bare pyvenv.cfg never qualifies (bootstrap-1). The lock lives BESIDE the
-            # venv (_lock_dir), so this never deletes the lock this process still holds.
-            if ours_to_clean or _has_engine_marker(venv_dir):
+            # provision rebuilds clean — but ONLY when it is genuinely ours: WE created/reclaimed
+            # the dir THIS run (ours_to_clean, which also means our OWNER sentinel is present) OR it
+            # carries an engine marker from a prior build (engine-python.txt / install.stamp). A
+            # pre-existing populated dir WITHOUT a marker OR our sentinel is foreign and was already
+            # refused above, so we never reach here for one — but the re-check keeps the rmtree from
+            # ever touching such a dir even if that guard changed. A bare pyvenv.cfg never qualifies
+            # (bootstrap-1). The lock lives BESIDE the venv (_lock_dir), so this never deletes the
+            # lock this process still holds. (Even if this cleanup is skipped or a HARD kill preempts
+            # it, the OWNER sentinel we stamped makes the leftover reclaimable next run — FALLO 1.)
+            if ours_to_clean or _has_engine_marker(venv_dir) or _has_owner_sentinel(venv_dir):
                 shutil.rmtree(venv_dir, ignore_errors=True)
             raise
 

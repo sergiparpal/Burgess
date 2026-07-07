@@ -524,6 +524,7 @@ build** after a transport hiccup without grepping the filesystem. No args.
   "edges_by_epistemic_state": {"unverified": 150, "grounded": 25, "failed": 5},
   "nodes_by_epistemic_state": {"unverified": 113},
   "unverified_edges": 150,
+  "source": {"path": "/abs/path/source.md", "exists": true, "files": ["source.md"]},
   "coverage": {
     "files": [{"file": "source.md", "covered": true, "sections": 19, "covered_sections": 12}],
     "sections": [{"file": "source.md", "title": "The boundary", "covered": true}]
@@ -534,6 +535,12 @@ build** after a transport hiccup without grepping the filesystem. No args.
 ```
 
 - `unverified_edges` — the still-`unverified` grounding-queue size (the `/kg-ground` backlog).
+- `source` — the **engine-resolved** source (`{path, exists, files}`): `path` is the configured
+  `source_path` the server resolved (or `null` when nothing is configured), `exists` is true iff it
+  resolves to ≥1 readable `.md`/`.txt` file, `files` are the ordered basenames (R4). `/kg-build` reads the
+  source path from HERE, not from a shell env var — the host injects userConfig only into the server
+  process, so a Bash-shell env-var read would silently miss a configured `source_path` and build the demo
+  by surprise.
 - `coverage` — which source files / `##` sections already have at least one ANCHORED (span-present) edge:
   `files[]` (`{file, covered, sections, covered_sections}`) and per-section `sections[]`
   (`{file, title, covered}`). A section with no covered span hasn't been extracted yet — the **resume**

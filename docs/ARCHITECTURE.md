@@ -215,7 +215,8 @@ renormalized (`fertile | absorbed | isolated`).
 Full signatures and return shapes: `skills/burgess/references/tools.md`.
 
 - **Read/query (12):** `kg_ping`, `kg_scrub`, `kg_metrics`, `kg_status` (projection-free
-  status + section coverage — the build-resume probe), `query_graph`, `get_node`, `get_neighbors`,
+  status + section coverage + the engine-resolved `source` — the build-resume probe and
+  `/kg-build`'s source-of-truth for the configured `source_path`), `query_graph`, `get_node`, `get_neighbors`,
   `shortest_path`, `kg_explain_path` (grounded-edges-only chain + advisory `leap`), `kg_context`
   (budgeted, falsification-aware; grounded `items[]` never mixed with `hypotheses[]`), `kg_agenda`
   (structural suggested questions, `answerable_now` vs `blocked_on_grounding`), `kg_export`

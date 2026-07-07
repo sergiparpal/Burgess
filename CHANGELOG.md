@@ -1,5 +1,43 @@
 # Changelog
 
+## Unreleased
+
+Bug-fix batch from a Windows startup/provisioning report (no tool-surface change — the
+27-tool surface is unchanged; `kg_status()` gains one additive `source` field).
+
+### Fixed
+
+- **A hard-killed provision wedged the engine venv permanently (no MCP server until a
+  human deleted `.venv`).** If the provisioner was force-killed after populating
+  `$CLAUDE_PLUGIN_DATA/.venv` but before writing its completion markers
+  (`engine-python.txt` / `install.stamp`), the leftover was a populated but unmarked venv.
+  Every later start's foreign-venv guard then refused to provision into it — a permanent
+  wedge, since the guard can't tell an interrupted build of ours from a user's own venv.
+  Fixed by stamping an ownership sentinel (`.burgess-venv-owner`) **before** any bin/lib
+  lands, so the next run recognises its own interrupted build and rebuilds clean, while a
+  genuinely foreign dir (no sentinel, no marker) is still refused and never deleted
+  (`bootstrap.do_install`). (FALLO 1.)
+- **A crashed provisioner's lock blocked startup for up to 30 minutes on Windows.** The
+  provision lock (and the canon session lease) could only reclaim a dead holder's lock by
+  PID-liveness on POSIX; on Windows `os.kill(pid, 0)` is `CTRL_C_EVENT` (not an existence
+  check), so the probe was skipped and a crashed holder was only reclaimed once its
+  heartbeat aged past the 30-minute stale window. Added an `OpenProcess`-based Windows
+  liveness probe (`dirlock._win_pid_alive`, mirrored in `canon._pid_probe`), so a dead
+  holder on the same host is reclaimed in milliseconds on Windows too. (FALLO 2.)
+- **`/kg-build` ignored a configured `source_path` and silently built the demo corpus.**
+  Step 0 resolved the source from `CLAUDE_PLUGIN_OPTION_SOURCE_PATH` in the model's Bash
+  shell, but the host injects userConfig options only into the MCP server process — that
+  env var is empty in the tool shell — so a required, configured `source_path` was missed
+  and the command fell back to `examples/source.md`. `kg_status()` now exposes the
+  engine-resolved source (`source: {path, exists, files}`), and `/kg-build` reads the path
+  from there and **fails loud** instead of building the demo by surprise. (FALLO 3.)
+- **`/kg-build` collapsed a `### `-structured file into one section.** The section
+  enumeration assumed level-2 `## ` headings; a file whose only `## ` is its title but
+  whose content is `### ` subsections was extracted as a single whole-file section,
+  weakening span-isolation. Step 0 now detects each file's dominant heading level (falls
+  back to `### ` when the sole `## ` is a title) and warns when a file yields 0–1 level-2
+  sections. (FALLO 4.)
+
 ## 0.2.2 — 2026-07-07
 
 Patch release. Fixes a Windows/Py3.14 projection hang and adds nothing else — no

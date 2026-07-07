@@ -283,6 +283,97 @@ def test_has_engine_marker_ignores_bare_pyvenv_cfg(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# FALLO 1 — ownership sentinel: a hard-killed build is reclaimed, never wedged
+# --------------------------------------------------------------------------- #
+def _install_ok(monkeypatch):
+    """Stub the install so do_install runs its guard/marker logic without a real venv build."""
+    monkeypatch.setattr(bootstrap, "install_with_uv", _fake_install_real_venv)
+    monkeypatch.setattr(bootstrap, "install_with_pip", _fake_install_real_venv)
+    monkeypatch.setattr(bootstrap, "verify_imports", lambda py: None)
+    monkeypatch.setattr(bootstrap, "probe_leidenalg", lambda py: None)
+    monkeypatch.setattr(bootstrap, "probe_divergence", lambda py: None)
+
+
+def test_do_install_claims_owner_sentinel_before_populating(tmp_path, monkeypatch):
+    # FALLO 1: bootstrap stamps the ownership sentinel BEFORE any bin/lib lands, so a kill mid-build
+    # leaves a dir the next run recognises as its own. Assert the sentinel is already present when
+    # install_with_* first runs, and survives into the finished venv.
+    pp = tmp_path / "pyproject.toml"
+    pp.write_text("[project]\n", encoding="utf-8")
+    monkeypatch.setattr(bootstrap, "PYPROJECT", pp)
+    venv_dir = tmp_path / "data" / ".venv"
+
+    seen = {}
+
+    def install(vd, *a, **k):
+        seen["sentinel_present_during_install"] = bootstrap._has_owner_sentinel(vd)
+        _fake_install_real_venv(vd, *a, **k)
+
+    monkeypatch.setattr(bootstrap, "install_with_uv", install)
+    monkeypatch.setattr(bootstrap, "install_with_pip", install)
+    monkeypatch.setattr(bootstrap, "verify_imports", lambda py: None)
+    monkeypatch.setattr(bootstrap, "probe_leidenalg", lambda py: None)
+    monkeypatch.setattr(bootstrap, "probe_divergence", lambda py: None)
+
+    bootstrap.do_install(venv_dir)
+    assert seen["sentinel_present_during_install"] is True     # claimed BEFORE populating
+    assert bootstrap._has_owner_sentinel(venv_dir) is True     # persists in the finished venv
+    assert (venv_dir / bootstrap.PTR_NAME).exists()            # and it built + sealed
+
+
+def test_do_install_reclaims_own_hard_killed_build(tmp_path, monkeypatch):
+    # FALLO 1 (the wedge): a hard-killed provision populated the venv (pyvenv.cfg + interpreter) but
+    # died before _write_markers, and its except-cleanup never ran — so the dir has our OWNER sentinel
+    # but NO completion marker. The next do_install must recognise it as ITS OWN interrupted build and
+    # rebuild clean, instead of raising SystemExit "refusing to provision" (which wedged the venv path
+    # until a human deleted it).
+    pp = tmp_path / "pyproject.toml"
+    pp.write_text("[project]\n", encoding="utf-8")
+    monkeypatch.setattr(bootstrap, "PYPROJECT", pp)
+    venv_dir = tmp_path / "data" / ".venv"
+
+    # Simulate the leftover of a hard kill: populated, OWNER sentinel present, NO completion marker.
+    venv_dir.mkdir(parents=True)
+    (venv_dir / bootstrap.OWNER_NAME).write_text("pid=99999 t=0 building\n", encoding="utf-8")
+    (venv_dir / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+    py = bootstrap.venv_python(venv_dir)
+    py.parent.mkdir(parents=True, exist_ok=True)
+    py.write_text("#!stub\n", encoding="utf-8")
+    assert not bootstrap._has_engine_marker(venv_dir)          # the wedge precondition
+    assert bootstrap._has_owner_sentinel(venv_dir)
+
+    _install_ok(monkeypatch)
+    bootstrap.do_install(venv_dir)                             # must NOT raise "refusing to provision"
+    assert (venv_dir / bootstrap.PTR_NAME).exists()            # rebuilt + sealed
+    assert (venv_dir / bootstrap.STAMP_NAME).exists()
+
+
+def test_do_install_still_refuses_foreign_dir_without_sentinel(tmp_path, monkeypatch):
+    # The FALLO 1 fix must NOT widen the reclaim to a user's foreign venv: a populated dir with a bare
+    # pyvenv.cfg (every venv has one) but NEITHER a completion marker NOR our OWNER sentinel is still
+    # refused — never scaffolded into, never rmtree'd. This is the guard the sentinel narrows, not removes.
+    pp = tmp_path / "pyproject.toml"
+    pp.write_text("[project]\n", encoding="utf-8")
+    monkeypatch.setattr(bootstrap, "PYPROJECT", pp)
+    venv_dir = tmp_path / "user-venv"
+    venv_dir.mkdir()
+    (venv_dir / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+    keep = venv_dir / "keep.txt"
+    keep.write_text("user data\n", encoding="utf-8")
+
+    def _boom(*a, **k):  # pragma: no cover - asserts it is never invoked
+        raise AssertionError("must not scaffold into a foreign venv")
+
+    monkeypatch.setattr(bootstrap, "install_with_uv", _boom)
+    monkeypatch.setattr(bootstrap, "install_with_pip", _boom)
+    with pytest.raises(SystemExit):
+        bootstrap.do_install(venv_dir)
+    assert keep.read_text(encoding="utf-8") == "user data\n"   # survives intact
+    assert not (venv_dir / bootstrap.OWNER_NAME).exists()       # never claimed
+    assert not (venv_dir / bootstrap.PTR_NAME).exists()
+
+
+# --------------------------------------------------------------------------- #
 # leidenalg soft probe (SAC-blocked native DLL → graceful degradation)
 # --------------------------------------------------------------------------- #
 def test_verify_imports_excludes_leidenalg_but_keeps_core():
@@ -481,18 +572,13 @@ def _write_info(venv_dir, *, pid, host, token="tok", t=None):
 
 
 # --------------------------------------------------------------------------- #
-# M7 — PID-liveness probe: a crashed holder is reclaimable in ms, not 30 min
+# M7 / FALLO 2 — PID-liveness probe: a crashed holder is reclaimable in ms, not 30 min
 # --------------------------------------------------------------------------- #
-@pytest.mark.skipif(
-    os.name == "nt",
-    reason="pid-liveness probe is POSIX-only: os.kill(pid, 0) is unsafe on Windows "
-    "(CTRL_C_EVENT, not a no-op existence check), so _pid_probe assumes-alive there and a "
-    "dead-pid lock is reclaimed by age, not the probe — mirroring canon.LeaseLock._pid_probe.",
-)
 def test_dead_pid_lock_is_stolen_before_stale_window(tmp_path):
-    # M7: a hard-killed background worker freezes its heartbeat, so the age signal stays
-    # FRESH for the full 30-min STALE_LOCK_SECS. A cheap os.kill(pid, 0) probe must reclaim
-    # it in milliseconds instead — mirroring canon._pid_probe. POSIX-only (see skipif).
+    # M7 / FALLO 2: a hard-killed background worker freezes its heartbeat, so the age signal stays
+    # FRESH for the full 30-min STALE_LOCK_SECS. A cheap pid-liveness probe must reclaim it in
+    # milliseconds instead — os.kill(pid, 0) on POSIX, OpenProcess (_win_pid_alive) on Windows. Now
+    # cross-platform (FALLO 2 removed the Windows skip: the probe there is no longer a no-op).
     venv_dir = tmp_path / "venv"
     # A held, FRESH lock (heartbeat just now) whose recorded holder is a dead pid on THIS host.
     bootstrap._lock_dir(venv_dir).mkdir(parents=True)
@@ -501,6 +587,28 @@ def test_dead_pid_lock_is_stolen_before_stale_window(tmp_path):
     assert dirlock.lock_age(bootstrap._lock_dir(venv_dir)) < bootstrap.STALE_LOCK_SECS  # NOT stale by age
     assert bootstrap.try_acquire(venv_dir) is True  # ...but the dead-pid probe reclaims it
     bootstrap.release(venv_dir)
+
+
+def test_pid_probe_dispatches_to_windows_liveness_probe(monkeypatch):
+    # FALLO 2 dispatch (runs on any OS): under os.name == "nt", pid_probe must consult _win_pid_alive
+    # instead of returning a blanket assume-alive — that is what makes a dead holder reclaimable in ms
+    # on Windows. Stub the probe so this is exercised on the Linux CI too (the real OpenProcess call is
+    # covered by the reclaim test above when it runs on Windows).
+    monkeypatch.setattr(dirlock.os, "name", "nt")
+    seen = {}
+
+    def fake_alive(pid):
+        seen["pid"] = pid
+        return False  # report the recorded holder dead
+
+    monkeypatch.setattr(dirlock, "_win_pid_alive", fake_alive)
+    rec = {"pid": "4321", "host": dirlock._HOST}
+    assert dirlock.pid_probe(rec) is False   # dead per the Windows probe
+    assert seen["pid"] == 4321               # ...which pid_probe actually consulted
+    monkeypatch.setattr(dirlock, "_win_pid_alive", lambda pid: True)
+    assert dirlock.pid_probe(rec) is True     # alive per the Windows probe
+    # A cross-host record is still assumed alive WITHOUT probing, even on nt.
+    assert dirlock.pid_probe({"pid": "4321", "host": "other-host"}) is True
 
 
 def test_live_pid_fresh_lock_is_not_stolen(tmp_path):

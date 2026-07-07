@@ -16,16 +16,15 @@ You do **not** call `kg_write` yourself, and you **never** assert a verdict — 
 
 ## Inputs
 
-- `$1` — the source to build from: a single **file**, or a **directory / glob** of `.md`/`.txt` files
-  (R4 — multi-document). **Default**: `${CLAUDE_PLUGIN_OPTION_SOURCE_PATH}` if set, else
-  `examples/source.md`. Resolve once at the top:
-
-  ```
-  SOURCE="${1:-${CLAUDE_PLUGIN_OPTION_SOURCE_PATH:-examples/source.md}}"
-  ```
-
-  then strip a matched surrounding quote-pair from `$SOURCE` (Step 0 shows the exact `case`) — a
-  path the user wrapped in quotes must not carry literal quotes into the file enumeration below.
+- `$1` — an **optional** explicit source override: a single **file**, or a **directory / glob** of
+  `.md`/`.txt` files (R4 — multi-document). **When omitted, the source is the user's configured
+  `source_path`, which you read from the ENGINE in Step 0a (`kg_status().source.path`) — NOT from a
+  shell env var.** `CLAUDE_PLUGIN_OPTION_SOURCE_PATH` / `KG_SOURCE_PATH` are **not visible to this
+  command's Bash shell** (the host injects userConfig options only into the MCP server process), so
+  resolving the default in Bash silently misses a configured `source_path` and builds the demo by
+  surprise. Step 0 resolves the path through the engine and **fails loud** — it never falls back to
+  `examples/source.md` when a `source_path` is configured (FALLO 3). `source_path` is `required` in
+  `plugin.json`, so a configured value must be honored.
 
 - `$2` — **optional inline wave size**: how many section-extractor subagents to launch CONCURRENTLY per
   wave (bounded parallelism). **Precedence: explicit `$2` > user_config > default.** When `$2` is omitted
@@ -36,18 +35,42 @@ You do **not** call `kg_write` yourself, and you **never** assert a verdict — 
 
 ## Procedure
 
-### 0. Resolve & enumerate the source FILES (Bash)
+### 0. Resolve & enumerate the source FILES
 
-A single file is the common case; a directory or glob builds from **every** `.md`/`.txt` member. Build the
-file list, then iterate the sections **within each file**, carrying that file's **basename** as `source_file`.
+#### 0a. Resolve the source path via the ENGINE (tool, not the shell)
+
+Call `mcp__plugin_burgess_burgess__kg_status()` and read its **`source`** block — `{path, exists, files}`.
+`source.path` is the engine-resolved `source_path` (the server has `KG_SOURCE_PATH`, already dequoted): the
+single source of truth. Decide the source, in this order:
+
+- **`$1` given** → the source is **`$1`** (explicit override wins).
+- **else `source.path` is set** → the source is **`source.path`**.
+- **else** (no `$1` and `source.path` is `null`) → **STOP.** No `source_path` is configured and none was
+  passed. Do **not** silently build the demo corpus — tell the user to set the plugin's `source_path`
+  userConfig or pass the path as `$1`. (`source_path` is `required` in `plugin.json`; a missing value is a
+  configuration error, not a cue to build `examples/source.md`.)
+
+If `source.path` is set but **`source.exists` is `false`** (configured but resolving to zero readable
+`.md`/`.txt` files), **STOP** and report that unreadable path — never fall through to the demo. This is the
+FALLO 3 fix: the command reads the path the engine actually resolved instead of an env var that is empty in
+the tool shell, so a configured `source_path` can never be silently ignored.
+
+> In the plugin **dev repo**, an unconfigured run resolves to the bundled demo (`examples/source.md` exists
+> under the project) and builds the five-section theory-of-grounding corpus — that path is a legitimate
+> engine default, surfaced as `source.path`, not a silent Bash fallback.
+
+#### 0b. Enumerate the FILES and each file's sections (Bash)
+
+With the source chosen in 0a, build the file list and enumerate each file's sections. A single file is the
+common case; a directory or glob builds from **every** `.md`/`.txt` member. **Substitute the chosen path for
+`SRC` below** — pass `$1` verbatim if the user gave one, else the `source.path` string from 0a. Never
+hard-code `examples/source.md` here; Step 0a already decided (or stopped).
 
 ```bash
-SOURCE="${1:-${CLAUDE_PLUGIN_OPTION_SOURCE_PATH:-examples/source.md}}"
-# Dequote: a user who wrapped the path in quotes — or a host that handed us a JSON-quoted userConfig
-# value — would otherwise leave literal quotes in $SOURCE and every ls/find below would miss. Peel
-# matched surrounding pairs REPEATEDLY (so a double-wrapped ""path"" collapses to the bare path),
-# mirroring kg_engine.envconfig.clean (the engine dequotes its own KG_SOURCE_PATH read; this bash
-# enumerates files before the engine sees the path, so it repeats it).
+SOURCE="$SRC"   # $1 if the user passed one, else the source.path value from kg_status() (Step 0a)
+# Dequote defensively: a path a user wrapped in quotes — or a host that handed back a JSON-quoted value —
+# must not carry literal quotes into the ls/find below. Peel matched surrounding pairs REPEATEDLY (a
+# double-wrapped ""path"" collapses to the bare path), mirroring kg_engine.envconfig.clean.
 while :; do
   case "$SOURCE" in
     \"*\") SOURCE="${SOURCE#\"}"; SOURCE="${SOURCE%\"}" ;;
@@ -55,6 +78,7 @@ while :; do
     *) break ;;
   esac
 done
+[ -n "$SOURCE" ] || { echo "no source resolved — see Step 0a (configure source_path or pass \$1)"; exit 1; }
 # Resolve the extraction WAVE SIZE: inline override ($2) > user_config > default 6; integer; clamp 1..10.
 # (This pure-Bash resolution mirrors kg_engine.waves.resolve_wave_size, the unit-tested reference — no
 # venv/PYTHONPATH dependency here. A present-but-invalid value falls straight to the default 6, not the
@@ -72,14 +96,34 @@ else
 fi
 [ -n "$FILES" ] || { echo "no .md/.txt source found at: $SOURCE"; exit 1; }
 echo "building from:"; echo "$FILES"
-# For each file, enumerate its section headings (you iterate one section per extractor launch).
-for f in $FILES; do echo "== $f =="; grep -nE '^## ' "$f"; done
+# Enumerate each file's section headings at that file's DOMINANT heading level (FALLO 4). Most files use
+# level-2 `## ` sections; a file whose ONLY `## ` is its title but that carries several `### ` subsections
+# is split at `### ` instead — otherwise the whole file collapses into ONE section, breaking the
+# per-section span-isolation the extractor relies on (see the span-isolation note in Step 2). Warn when a
+# file yields 0-1 sections at level 2 so a mis-levelled document is never silently built as one blob.
+for f in $FILES; do
+  echo "== $f =="
+  H2=$(grep -cE '^## '  "$f"); H2=${H2:-0}
+  H3=$(grep -cE '^### ' "$f"); H3=${H3:-0}
+  if [ "$H2" -le 1 ] && [ "$H3" -ge 2 ]; then
+    echo "(dominant heading level: '### ' — $H3 subsections; the single '## ' is the file title)"
+    grep -nE '^### ' "$f"
+  else
+    [ "$H2" -le 1 ] && echo "WARNING: only $H2 level-2 '## ' section(s) here — the whole file is one section; verify the heading level before launching one extractor over the entire file"
+    grep -nE '^## ' "$f"
+  fi
+done
 ```
 
 The demo corpus (`examples/source.md`) is the five-section "theory of grounded conceptual knowledge":
 **§1 Compression and the cost of generality**, **§2 Provenance and the span**, **§3 Bridges and betweenness**,
-**§4 Memory of failures**, **§5 The canon and the projection**. One extractor launch per `## ` section, **per
-file**; pass the file's basename (e.g. `source.md`) as the extractor's `source_file`.
+**§4 Memory of failures**, **§5 The canon and the projection**. One extractor launch per section — at each
+file's **dominant heading level** from Step 0b (usually `## `; `### ` for a file whose only `## ` is its
+title), **per file**; pass the file's basename (e.g. `source.md`) as the extractor's `source_file`.
+
+> **Resume note.** `kg_status().coverage` reports `##`-level sections; for a `### `-dominant file it shows a
+> single section, so treat your Step 0b per-file enumeration as the authority for which slices to launch and
+> use `coverage` as a best-effort "has this file been touched" signal.
 
 ### 1. Egress scrub — the §1.9 egress point (now WIRED)
 
@@ -106,8 +150,9 @@ as `span-not-in-source` (fabrication).
 
 ### 2. Launch the `kg-extractor` subagent per section, in BOUNDED PARALLEL WAVES (Task)
 
-For **each** `## ` section **of each file**, launch the extractor with the **section's verbatim text** and the
-**basename of the file it came from** as `source_file`. The extractor stamps every edge in that section with that
+For **each** section **of each file** — at that file's dominant heading level from Step 0b (`## `, or `### `
+for a title-only-`##` file) — launch the extractor with the **section's verbatim text** and the **basename of
+the file it came from** as `source_file`. The extractor stamps every edge in that section with that
 basename; with a multi-file build the boundary verifies each span against **that file specifically** (R4 — a span
 attributed to the wrong file is REJECTED `span-not-in-named-source`). The extractor reads the section, emits a
 single complete `kg_write` payload, and reports its dispositions back to you.

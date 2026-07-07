@@ -1432,14 +1432,40 @@ class KGEngine:
                           "sections": len(secs), "covered_sections": sum(covered_flags)})
         return {"files": files, "sections": sections}
 
+    def _source_info(self) -> dict:
+        """The engine-resolved source — the single source of truth for /kg-build's Step 0 (FALLO 3).
+
+        The MCP server process receives the configured source via ``KG_SOURCE_PATH`` (from
+        ``.mcp.json``'s ``${user_config.source_path}``) and dequotes/resolves it here; the model's Bash
+        tool shell does NOT (the host injects userConfig options only into the server process env). So a
+        command that resolved the path from a shell env var read it as EMPTY and silently fell back to
+        ``examples/source.md`` — ignoring a REQUIRED, configured ``source_path``. Exposing the already-
+        resolved path here lets /kg-build read it from this tool instead of the (absent) env var, and lets
+        it fail loud when nothing is configured rather than building the demo corpus by surprise.
+
+        ``path`` is the configured/resolved path string (or None when nothing is configured — the demo
+        fallback only fires when it exists under the project); ``exists`` is True iff it resolves to at
+        least one readable ``.md``/``.txt`` file; ``files`` is the ordered basename list (R4). It echoes
+        the user's OWN declared config back to their OWN session — no canon content crosses here."""
+        sp = self.source_path
+        if sp is None:
+            return {"path": None, "exists": False, "files": []}
+        try:
+            files = self.source_set().basenames
+        except Exception as e:  # noqa: BLE001 — a source-read hiccup still reports the path, never crashes kg_status
+            return {"path": str(sp), "exists": False, "files": [],
+                    "note": f"source unreadable ({type(e).__name__})"}
+        return {"path": str(sp), "exists": bool(files), "files": files}
+
     def kg_status(self) -> dict:
         """A cheap, projection-FREE status + coverage probe (resume a partial build after any transport
         hiccup without grepping the filesystem). Reads ONLY the canon (and the source text for coverage) —
         it never triggers or refreshes the derived layer, so it is safe and instant even mid-build while a
         projection would be expensive. Reports node/edge counts, edges by epistemic state, the
-        still-`unverified` grounding-queue size, and which source files/`##` sections already have an
-        anchored edge. `derived_present` is a path-existence check only (no db open); `projection_degraded`
-        echoes any last reprojection failure (a read, not this probe, sets it)."""
+        still-`unverified` grounding-queue size, the engine-resolved `source` (path + files — /kg-build's
+        source of truth, FALLO 3), and which source files/`##` sections already have an anchored edge.
+        `derived_present` is a path-existence check only (no db open); `projection_degraded` echoes any
+        last reprojection failure (a read, not this probe, sets it)."""
         nodes = self.canon.all_nodes()
         edges = [e for n in nodes for e in n.edges]
         by_state = dict(Counter(e.epistemic_state.value for e in edges))
@@ -1452,6 +1478,7 @@ class KGEngine:
             "edges_by_epistemic_state": by_state,
             "nodes_by_epistemic_state": nodes_by_state,
             "unverified_edges": by_state.get(EpistemicState.UNVERIFIED.value, 0),
+            "source": self._source_info(),
             "coverage": self._coverage(edges),
             "derived_present": self.projector.db_path.exists(),
             "projection_degraded": self._projection_degraded,
@@ -2179,8 +2206,10 @@ def _register(mcp, engine: KGEngine) -> None:
         """Cheap, projection-FREE status + coverage probe — confirm build progress and RESUME a partial
         build after any transport hiccup without grepping the filesystem. Reads ONLY the canon (+ source
         text for coverage); never triggers/refreshes the derived layer. Returns node/edge counts, edges
-        by epistemic state, the still-`unverified` grounding-queue size, and which source files/`##`
-        sections already have an anchored edge. Unlike kg_metrics it never opens the derived db."""
+        by epistemic state, the still-`unverified` grounding-queue size, the engine-resolved `source`
+        (`{path, exists, files}` — /kg-build reads the source path from HERE, not a shell env var, so a
+        configured source_path is never silently ignored), and which source files/`##` sections already
+        have an anchored edge. Unlike kg_metrics it never opens the derived db."""
         return engine.kg_status()
 
     @mcp.tool()
