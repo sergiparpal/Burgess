@@ -70,7 +70,8 @@ divergence:
     - {name: angle, type: categorical}        # the lens/perspective taken
     - {name: scope, type: categorical}        # how broad or narrow the idea is
     - {name: form, type: categorical}         # the shape/format of the output
-    - {name: boldness, type: continuous, range: [0.0, 1.0]}  # safe <-> daring
-    - {name: mechanism, type: open, primary_novelty: true}   # the core "how"; novelty carrier
+    - {name: boldness, type: continuous, range: [0.0, 1.0]}  # safe <-> daring (degree of divergence; capped by the reach dial)
+    - {name: feasibility, type: continuous, range: [0.0, 1.0]}  # far-fetched <-> buildable; a coverage axis: MAP-Elites keeps buildable ideas in their own niches so bold ones can't evict them (mirrors domains/generic.yaml)
+    - {name: mechanism, type: open, primary_novelty: true}   # the core "how"; novelty carrier (divergence in KIND — never capped)
   slate_size: 6
   candidates_per_generation: 12

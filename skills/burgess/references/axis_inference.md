@@ -32,8 +32,15 @@ Produce **4–6 axes** that:
    different here?" Make that the `open`, `primary_novelty` axis.
 3. Add 1–2 **audience/context** categoricals: who it's for, where/when it lives.
 4. Add 1–2 **form/style** categoricals: shape, format, register, genre.
-5. Add 1 **continuous dial** that the user clearly cares about (safe↔daring,
-   simple↔complex, cheap↔lavish, near↔far term).
+5. Add a **`feasibility` continuous dial** (`range: [0.0, 1.0]`, far-fetched↔buildable)
+   whenever the unit can be more or less grounded — ideas, concepts, features,
+   strategies, hypotheses. It is a **coverage axis**: MAP-Elites keeps buildable
+   ideas in their own niches (a bold idea can't evict a grounded one), which is what
+   lets the `/kg-diverge` **reach** dial keep grounded options alive rather than
+   drowning in extravagant ones. Skip it only when "buildable" isn't meaningful for
+   the unit (names, taglines). Then add **at most one other** continuous dial the
+   user clearly cares about (`boldness` safe↔daring, simple↔complex, cheap↔lavish,
+   near↔far term).
 6. Drop redundant axes (if two move together, keep one). Aim for 4–6 total.
 
 ## Worked examples (illustrative — infer fresh each time)
@@ -65,6 +72,7 @@ axes:
   - {name: site, type: categorical}                 # plaza / transit / water / rooftop
   - {name: sense, type: categorical}                # visual / sonic / tactile / olfactory
   - {name: scale, type: continuous, range: [0, 1]}  # intimate <-> monumental
+  - {name: feasibility, type: continuous, range: [0, 1]}  # far-fetched <-> buildable (coverage axis)
   - {name: interaction, type: categorical}          # passive / participatory / generative
   - {name: device, type: open, primary_novelty: true}  # the core artistic mechanism
 ```
