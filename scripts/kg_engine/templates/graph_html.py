@@ -3,7 +3,11 @@ force-layout viz, as a Python module constant (no separate `.html` asset, no pac
 
 The whole point is **three axes on independent visual channels** (never one confidence colour):
   - `epistemic_state` → edge line style/colour (solid green=grounded, dashed grey=unverified,
-    RED=failed/rejected, dotted blue=hypothesized; failed/rejected edges are DRAWN, never filtered);
+    RED=failed/rejected, dotted blue=hypothesized; failed/rejected edges are DRAWN, never filtered —
+    but they exert NO force in the force layout and can be toggled off, so a rejected relation cannot
+    spring its endpoints together and fake a connectivity the grounding path already refuted. This is
+    the last geometric surface to agree with projector._live_subgraph, which already excludes the
+    identical edges from degree / betweenness / community / bridge ranks §1.7);
   - `authored_by`     → node border colour (deterministic / agent / human);
   - `provenance`      → node fill opacity (span-present opaque / inferred mid / hypothesized faint).
 Node **size = degree only** (the honest advisory). The **bridge highlight** is gate-aware (a gold ring;
@@ -51,7 +55,7 @@ HTML_TEMPLATE = r"""<!doctype html>
   <ul>
     <li><span class="sw" id="sw-grounded"></span>grounded (solid)</li>
     <li><span class="sw" id="sw-unverified" style="border-top-style:dashed"></span>unverified (dashed)</li>
-    <li><span class="sw" id="sw-failed"></span>failed / rejected (red — drawn, never pruned)</li>
+    <li><label style="cursor:pointer"><input type="checkbox" id="toggle-failed" checked style="vertical-align:middle;margin:0 4px 0 0"><span class="sw" id="sw-failed"></span>failed / rejected (red — drawn, never pruned; no layout pull)</label></li>
     <li><span class="sw" id="sw-hypothesized" style="border-top-style:dotted"></span>hypothesized (dotted)</li>
   </ul>
   <div class="ax">authored_by — node border</div>
@@ -149,6 +153,17 @@ window.__KG_DATA__ = __KG_DATA_JSON__;
   var links = []; (DATA.links || []).forEach(function (l) {
     var s = ensureNode(l.source), t = ensureNode(l.target); if (s && t) links.push(Object.assign({}, l, { s: s, t: t })); });
 
+  // §1.7: a `failed`/`rejected` edge is DRAWN (negative memory is never pruned) but must exert NO
+  // layout force — a verdict that a relation does NOT hold cannot be allowed to spring its endpoints
+  // together, or the geometry would assert a connectivity grounding already refuted. This is the last
+  // geometric surface to agree with projector._live_subgraph, which already excludes the identical
+  // edges from degree/betweenness/community/bridge. `springLinks` (built once) drives the simulation;
+  // the full `links` set still DRAWS, subject to the show-failed toggle. FAILURE_STATES is injected,
+  // so the failure vocabulary is never re-typed here (review-r5).
+  function isFailed(l) { return FAILURE_STATES.indexOf(l.epistemic_state) !== -1; }
+  var springLinks = links.filter(function (l) { return !isFailed(l); });
+  var showFailed = true;  // legend checkbox: whether failed/rejected edges are DRAWN (default on, §1.7); never affects layout
+
   var view = { x: 0, y: 0, k: 1 }, alpha = 1;
 
   // node size = DEGREE ONLY (the honest advisory) — never the bridge metric
@@ -172,7 +187,7 @@ window.__KG_DATA__ = __KG_DATA_JSON__;
         a.vx += fx; a.vy += fy; b.vx -= fx; b.vy -= fy;
       }
     }
-    links.forEach(function (l) {
+    springLinks.forEach(function (l) {  // NON-failed edges only — failed/rejected exert no layout force (§1.7)
       var dx = l.t.x - l.s.x, dy = l.t.y - l.s.y, d = Math.sqrt(dx * dx + dy * dy) + 0.01, f = (d - SIM.SPRING_LEN) * SIM.SPRING_K;
       var fx = dx / d * f, fy = dy / d * f; l.s.vx += fx; l.s.vy += fy; l.t.vx -= fx; l.t.vy -= fy;
     });
@@ -187,6 +202,7 @@ window.__KG_DATA__ = __KG_DATA_JSON__;
     ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.clearRect(0, 0, W, H);
     ctx.save(); ctx.translate(view.x, view.y); ctx.scale(view.k, view.k);
     links.forEach(function (l) {
+      if (!showFailed && isFailed(l)) return;  // toggle hides failed/rejected from the DRAW only (layout already ignores them)
       var style = edgeStyle(l); ctx.strokeStyle = style.color; ctx.lineWidth = style.width; ctx.setLineDash(style.dash);
       ctx.beginPath(); ctx.moveTo(l.s.x, l.s.y); ctx.lineTo(l.t.x, l.t.y); ctx.stroke();
     });
@@ -219,6 +235,13 @@ window.__KG_DATA__ = __KG_DATA_JSON__;
   }
   function kick() { if (!running) { running = true; requestAnimationFrame(frame); } }
   kick();
+
+  // failed/rejected toggle — hides the red negative-memory edges from the DRAW for a valid-only view.
+  // They already exert no layout force, so nothing has to re-settle; a single repaint via kick() (which
+  // resumes the parked rAF loop for one frame) suffices. Default ON so §1.7's "negative memory is always
+  // surfaced" holds unless the human explicitly opts out.
+  var toggleFailed = document.getElementById("toggle-failed");
+  if (toggleFailed) toggleFailed.addEventListener("change", function () { showFailed = toggleFailed.checked; kick(); });
 
   // --- interactivity: pan (drag background), zoom (wheel), drag node, hover tooltip
   function toWorld(px, py) { return { x: (px - view.x) / view.k, y: (py - view.y) / view.k }; }

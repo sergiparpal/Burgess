@@ -23,7 +23,9 @@ view, not a source of truth (the canon is the source of truth).
      no dependencies). The **three orthogonal axes** are on **independent visual channels** — never one
      "confidence" colour:
      - `epistemic_state` → **edge line**: solid green = grounded · dashed = unverified · **red = failed/rejected**
-       (drawn, never pruned — §1.7) · dotted = hypothesized;
+       (drawn, never pruned — §1.7; but they exert **no force in the layout** and a legend checkbox can hide
+       them, so a refuted relation never springs its endpoints together and fakes a connectivity grounding
+       already rejected — matching `projector._live_subgraph`, which excludes them from every rank) · dotted = hypothesized;
      - `authored_by` → **node border**: deterministic · agent · human;
      - `provenance` → **node fill opacity**: span-present (opaque) · inferred (mid) · hypothesized (faint).
      - **Node size = degree** (the honest advisory). The **bridge highlight** (gold ring) is gate-aware —

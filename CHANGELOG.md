@@ -20,6 +20,18 @@
   command (point `/kg-build` at a second `KG_PROJECT_DIR` — impossible, the running canon is fixed at
   startup) is replaced with the real flow. Pinned in `tests/test_perturb_second_construction.py`.
 
+### Fixed
+
+- **`graph.html` no longer lets falsified edges fake a connected graph.** `failed`/`rejected` edges are
+  still **drawn** (§1.7 — negative memory is never pruned), but they no longer exert any force in the
+  force-directed layout, so a refuted relation can no longer spring its two endpoints together and give
+  the false impression that the graph is more connected than its *valid* edges make it. This brings the
+  one remaining geometric surface into line with `projector._live_subgraph`, which already excludes the
+  identical edges from every centrality rank (degree / betweenness / community / bridge) — node **size**
+  was therefore already honest and is unchanged. A new legend **checkbox** (default on) can hide the red
+  edges entirely for a valid-only view. Pinned in `tests/test_export.py`
+  (`test_failed_edges_exert_no_layout_force`, `test_failed_edge_toggle_hides_from_draw_only`).
+
 ## 0.2.6 — 2026-07-07
 
 Patch release. A broad correctness/robustness sweep from an exhaustive codebase review — two

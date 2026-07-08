@@ -240,6 +240,36 @@ def test_animation_loop_parks_when_cooled_and_resumes_on_interaction():
     assert 'window.addEventListener("resize", function () { resize(); kick(); });' in t
 
 
+def test_failed_edges_exert_no_layout_force():
+    """§1.7 layout parity: a `failed`/`rejected` edge is DRAWN but must not spring its endpoints
+    together — otherwise the force layout asserts a connectivity the grounding path refuted, faking a
+    bridge. The simulation iterates `springLinks` (non-failed), mirroring projector._live_subgraph
+    which already excludes the identical edges from degree/betweenness/community/bridge ranks."""
+    t = HTML_TEMPLATE
+    # springLinks is the non-failed subset, derived by filtering the failure predicate
+    assert "var springLinks = links.filter(function (l) { return !isFailed(l); });" in t
+    # the spring-force loop runs over springLinks, NOT the full links set
+    assert "springLinks.forEach(function (l) {" in t
+    assert "(d - SIM.SPRING_LEN) * SIM.SPRING_K" in t          # the spring force still exists...
+    # ...and the OLD form (spring force applied over every link, failed included) is gone
+    assert "links.forEach(function (l) {\n      var dx = l.t.x - l.s.x" not in t
+    # the failure vocabulary is the injected array, never re-typed by hand (review-r5)
+    assert "function isFailed(l) { return FAILURE_STATES.indexOf(l.epistemic_state) !== -1; }" in t
+
+
+def test_failed_edge_toggle_hides_from_draw_only():
+    """A legend checkbox hides the red negative-memory edges from the DRAW for a valid-only view. It
+    defaults ON (§1.7 — negative memory is surfaced unless the human opts out) and never touches the
+    layout (which already ignores failed edges), so toggling only repaints via kick()."""
+    t = HTML_TEMPLATE
+    assert 'id="toggle-failed" checked' in t                   # present, default ON
+    assert "var showFailed = true;" in t
+    # the DRAW skips failed edges when the toggle is off; the LAYOUT never sees the flag
+    assert "if (!showFailed && isFailed(l)) return;" in t
+    # the change handler flips showFailed and repaints (no alpha bump — layout doesn't re-settle)
+    assert "showFailed = toggleFailed.checked; kick();" in t
+
+
 def test_export_dispatch_kinds(engine):
     _build(engine)
     assert export(engine, "html")["report_path"] is None
