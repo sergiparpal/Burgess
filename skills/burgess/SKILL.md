@@ -160,7 +160,10 @@ Keep this guide tight; full detail lives in `references/` and is read only when 
   specificity seeds,
 - `operators.md`, `judge_rubric.md`, `axis_inference.md` — the divergence-side language work:
   variation operators, the validity-only judge rubric, and how to infer descriptor axes from
-  a brief (`/kg-diverge`).
+  a brief (`/kg-diverge`). `/kg-diverge` also takes a **reach** dial
+  (`conservative|balanced|wild`, default `balanced`) that tempers divergence in *degree* —
+  `boldness` band, `feasibility` lean, operator mix — while leaving divergence in *kind* (the
+  `mechanism` axis) maximal; coherence is enforced at every reach.
 
 The authoritative data model is the engine source under `scripts/kg_engine` (start at `model.py`
 and `boundary.py`). When in doubt about a field or symbol, grep the engine rather than guessing.

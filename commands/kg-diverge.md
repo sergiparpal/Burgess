@@ -1,6 +1,6 @@
 ---
 description: Turn any creative brief into a diverse, non-cliché slate of ideas — pure divergence, no graph and no source document required. Cliché map → mechanism-first generation → engine geometry (MAP-Elites, k-NN novelty, DPP slate, anti-collapse monitor) → the user pins/discards in chat. Pinned ideas can later be materialized into the hypothesized lane.
-argument-hint: "<brief> [domain-template]"
+argument-hint: "<brief> [domain-template] [reach: conservative|balanced|wild]"
 allowed-tools: Read, mcp__plugin_burgess_burgess__kg_diverge_init, mcp__plugin_burgess_burgess__kg_diverge_ingest, mcp__plugin_burgess_burgess__kg_diverge_remember, mcp__plugin_burgess_burgess__kg_diverge_parents, mcp__plugin_burgess_burgess__kg_diverge_metrics, mcp__plugin_burgess_burgess__kg_diverge_recall, mcp__plugin_burgess_burgess__kg_diverge_materialize
 ---
 
@@ -20,6 +20,30 @@ The engine runs inside the plugin's MCP server as the `kg_diverge_*` tools. Ther
 interpreter to locate and no hand-off files to write — the tools take JSON directly. If a
 `kg_diverge_*` tool errors with a provisioning message (engine deps still installing), relay
 it verbatim and wait; convergence tools are unaffected by design (I9).
+
+## Reach — how far out (the divergence dial)
+
+Maximum divergence is not always what the user wants: it produces extravagant, and
+sometimes absurd or cryptic, ideas. **Reach** is the tempered middle band between
+greatest divergence and collapse-to-the-mean. It caps divergence in *degree*
+(`boldness`) and biases the operator mix and `feasibility` lean — it **never** caps
+divergence in *kind* (the `mechanism` axis always spreads maximally, so every slate
+is still made of genuinely different approaches).
+
+| reach | `boldness` band | `feasibility` lean | operators | feel |
+| --- | --- | --- | --- | --- |
+| `conservative` | `[0, 0.5]` | high (`0.6`–`1.0`) | recombinative | spirited but buildable |
+| **`balanced`** (default) | `[0, 0.75]` | spread `[0.2, 1.0]` | mixed | novel, still coherent |
+| `wild` | `[0, 1]` | full `[0, 1]` | far-reaching welcome | maximal divergence (prior behavior) |
+
+Pick the reach from the user's phrasing if they gave one (in `$ARGUMENTS` or the
+brief's tone); otherwise **default to `balanced`** and mention it in the same
+one-line confirm as the axes (step 2) — e.g. "Running at *balanced* reach; say
+*wild* for further-out or *conservative* for safer." The user can change it any
+round. Reach is a language-layer directive you apply when assigning descriptors and
+choosing operators — the engine is unchanged; it still only measures dispersion over
+what you submit (I5). Coherence (the judge's validity gate) is enforced at **every**
+reach — `wild` means further-out, never incoherent.
 
 ## One session
 
@@ -54,16 +78,21 @@ it verbatim and wait; convergence tools are unaffected by design (I9).
    not guarantee novelty against the world.
 
 4. **Generate candidates yourself, mechanism-first**, using `references/operators.md`
-   (apply several DIFFERENT operators per round):
+   (apply several DIFFERENT operators per round — biased by the reach dial: recombinative
+   under `conservative`, mixed under `balanced`, far-reaching welcome under `wild`):
    - *Layer 1 — mechanism first.* Before writing a candidate's `text`, choose its
      **mechanism** (the open-axis value): the core "how it works" in a few words, far from
      (a) O_train's mechanisms, (b) mechanisms already used this round or in the archive.
-     **Same mechanism = same idea.**
-   - *Layer 2 — surface second.* Write the `text` that expresses that mechanism.
+     **Same mechanism = same idea.** Reach never narrows this — mechanism variety is
+     always maximal.
+   - *Layer 2 — surface second.* Write the `text` that expresses that mechanism, and make
+     it self-explanatory: a reader should grasp *how it works* without a footnote.
    - **Descriptor discipline:** niche placement runs on YOUR descriptor words. No two
-     candidates share a `mechanism` string unless they genuinely share a mechanism; prefer
-     the extremes of continuous axes over the middle; make each axis value meaningfully
-     distinct. See `operators.md` → "Descriptor discipline".
+     candidates share a `mechanism` string unless they genuinely share a mechanism; spread
+     each continuous axis to the extremes **of its reach band** (`boldness` within the band
+     for this reach; honest `feasibility` across its lean) rather than clustering in the
+     middle; make each axis value meaningfully distinct. See `operators.md` →
+     "Descriptor discipline".
 
 5. **Prefilter** with `references/judge_rubric.md`: drop ONLY invalid/off-brief candidates.
    NEVER judge novelty here. You may attach a within-niche `fitness` (0–1) — the engine clips
@@ -85,6 +114,9 @@ it verbatim and wait; convergence tools are unaffected by design (I9).
 
 7. **Present the returned `slate`** — for each idea: its text, mechanism label, niche
    `coords`, and a one-line *why-picked* (which niche it holds + what its `novelty` says).
+   **De-obscure it:** add a plain "*how it works in practice*" clause and one concrete
+   instantiation ("e.g., …") so a bold idea reads as clear, not cryptic. If you cannot write
+   that clause for an idea, it was incoherent and should have been cut at step 5 — drop it now.
    Field honesty: `novelty` is mean k-NN distance to THIS SESSION's own ideas — a variety
    proxy, not originality vs the world; `mechanism_novelty` is the same for its mechanism.
    Report them as such. Then:
