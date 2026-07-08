@@ -1,8 +1,28 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 — 2026-07-08
+
+Minor release. Feature-led: **tempered divergence** for `/kg-diverge` (a reach dial, a feasibility
+coverage axis, and a coherence gate) and a **key-free, in-session second construction** for
+`/kg-perturb`. Plus a correctness/robustness sweep from a second exhaustive review (review-r10) and an
+honesty fix to the `graph.html` layout. No change to the 27-tool MCP surface.
 
 ### Added
+
+- **Tempered divergence for `/kg-diverge` — a reach dial, a feasibility coverage axis, and a coherence
+  gate.** The briefs skewed extravagant, sometimes absurd or cryptic; three distinct leaks, three
+  language-layer fixes (no engine change — the engine still only measures dispersion, I5). A **reach
+  dial** (`conservative|balanced|wild`, default `balanced`) caps divergence in *degree* (boldness band,
+  operator mix, feasibility lean) but never in *kind* — the mechanism axis always spreads maximally, so
+  every slate stays genuinely varied. A **feasibility coverage axis** in MAP-Elites keeps one elite per
+  feasibility bin, so a bold idea can't evict a buildable one (a coverage guarantee, not a promise about
+  the final six); it is now a default on **all three axis paths** — the omit-axes default (`pack.yaml`),
+  the `generic.yaml` default, and the inferred-axes recipe (`axis_inference.md`), with the honest caveat
+  to skip it where "buildable" is meaningless (names, taglines). A **coherence gate** in the judge rubric
+  adds a one-line "why does the mechanism actually work?" test that separates bold-but-valid (keep) from
+  incoherent (kill), and killing a broken idea no longer counts against the over-filtering budget. Plus a
+  **de-obscure step**: each idea carries a plain "how it works in practice" clause + one concrete example,
+  so bold ideas read clear, not cryptic.
 
 - **`/kg-perturb` now builds its second construction key-free, in-session.** The exo "attack coverage"
   move needs a *second graph construction* to cross-generate against, and the only builder was the
