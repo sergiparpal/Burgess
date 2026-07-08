@@ -34,10 +34,22 @@ mcp__plugin_burgess_burgess__kg_ground(
 )
 ```
 
-`verdict ∈ {grounded, rejected, failed, obsolete}` and `kind ∈ {edge, node}`. You operate on **edges**;
-you emit only **grounded** (the span specifically supports the relation) or **rejected** (it does not, or it
-is "true" only by being vague). Returns `{ok, key, from, to, by}` — check `ok:true` and that `from` was
-`unverified`.
+`verdict ∈ {grounded, rejected, failed, obsolete}` and `kind ∈ {edge, node}`. You mostly operate on **edges**
+(emitting only **grounded** — the span specifically supports the relation — or **rejected** — it does not, or
+it is "true" only by being vague). But you ALSO verdict unverified **nodes**: a materialized `/kg-diverge` pin
+is a hypothesized node that, by default, has **no incident edge at all** (its `edges` are optional extras), so
+you ground it by targeting the *node* itself:
+
+```
+kg_ground(target_id="<node.id>", kind="node", verdict="grounded",
+          support_note="<external citation>")   # a Node has no span field — support is restated into the body
+```
+
+**A pin with no wired edge is still fully groundable — "no edge → can't be grounded" is false.** Grounding
+operates on nodes, not only edges. A Node's promotion support goes in the body (`support_note` → `inferred`,
+or a verbatim `support_span` → `span-present`); a bare novel pin with no support yet is correctly LEFT
+`unverified` (the `[diverge]` triage below), never skipped for lacking an edge. Every verdict call returns
+`{ok, key, from, to, by}` — check `ok:true` and that `from` was `unverified`.
 
 ## The hypothesized queue — proposals from /kg-generate (PLAN Stage 8)
 
@@ -106,11 +118,13 @@ Never construct an id by hand and hope. **Read the `id` field off the edge dict*
 
 ## Inputs
 
-- The edge queue, from `mcp__plugin_burgess_burgess__query_graph(epistemic_state="unverified", limit=50)`
+- The queue, from `mcp__plugin_burgess_burgess__query_graph(epistemic_state="unverified", limit=50)`
   → `{nodes[], edges[]}`. **Note:** `query_graph` applies `epistemic_state` only to the returned `nodes[]`; the
   `edges[]` are filtered only by `relation`/`limit`, so select the edges whose `epistemic_state == "unverified"`
   yourself. Each edge carries: `id, source, target, relation, span, provenance, authored_by,
-  epistemic_state, confidence, confidence_score`.
+  epistemic_state, confidence, confidence_score`. The returned **`nodes[]` ARE your node queue** — already
+  filtered to `unverified` — and a materialized `/kg-diverge` pin appears here as a hypothesized node with no
+  incident edge; verdict it with `kind="node"`. Do not treat the response as edges-only.
 - Triage signal, from `mcp__plugin_burgess_burgess__kg_context(budget=2000)` → `items[]`,
   `falsification_counters.failed_or_rejected_edges` (the running tally of negative information, §1.7),
   and `advisory` (if `signal == "structural-bridge"`, those `nodes[]` are likely generic hubs — scrutinize
@@ -118,7 +132,7 @@ Never construct an id by hand and hope. **Read the `id` field off the edge dict*
 - The real source: read `examples/source.md` (demo), or `${CLAUDE_PROJECT_DIR}` for the live corpus. This is
   the ground truth. The span field on the edge is the *claim* of support; the source file is the *check*.
 
-## Procedure (bounded — at most 20 edges per run)
+## Procedure (bounded — at most 20 items per run: edges, then nodes)
 
 1. **Load the queue.** `query_graph(epistemic_state="unverified", limit=50)`. Also call `kg_context(budget=2000)`
    to read the advisory and the current falsification count. Take the first **20** edges (the per-run cap;
@@ -144,8 +158,15 @@ Never construct an id by hand and hope. **Read the `id` field off the edge dict*
       defeasible → `grounded`, note quoting the deciding clause.
 4. **Stamp the verdict** with `kg_ground(target_id=<edge.id>, verdict=..., kind="edge", note=...)`.
    Confirm `ok:true` and `from == "unverified"`. If `from` was already a verdict, skip — someone else ruled.
-5. **Report.** Summarize: N grounded, M rejected (broken out by reason: vague / no-support / wrong-relation),
-   K skipped, and how many remain `unverified`. Re-run to drain the rest.
+5. **Then the unverified NODES** (`query_graph` `nodes[]`). Do not stop because the edge queue is empty — a
+   materialized `/kg-diverge` pin is a node with no incident edge and is groundable on its own. For each: if
+   the current source verbatim-supports the idea, promote it with `kg_ground(target_id=<node.id>, kind="node",
+   verdict="grounded", support_span="<verbatim run>")` (or `support_note="<external citation>"` if the support
+   is off-source); if the idea is a `[diverge]`-lineage pin with no support yet, **leave it `unverified`**
+   (triage — a novel idea has no in-source span by construction); only for a non-`[diverge]` node with no
+   support do you `rejected`. "No edge → can't be grounded" is false — ground the node.
+6. **Report.** Summarize: N grounded, M rejected (broken out by reason: vague / no-support / wrong-relation),
+   K skipped, split by kind (edge/node), and how many remain `unverified`. Re-run to drain the rest.
 
 ## Invariants you enforce
 

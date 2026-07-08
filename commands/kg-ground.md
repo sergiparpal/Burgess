@@ -20,8 +20,17 @@ Find what is actually pending before spending any subagent budget.
 1. `mcp__plugin_burgess_burgess__kg_metrics()` → record the baseline `edges_by_epistemic_state` map (keys are the
    `epistemic_state` values: `unverified | grounded | rejected | failed | obsolete`). The count under
    `unverified` is the grounding queue depth.
-2. `mcp__plugin_burgess_burgess__query_graph(epistemic_state="unverified", limit=50)` → the concrete edge backlog
-   the first grounder must verdict. If `$ARGUMENTS` is non-empty, also call
+2. `mcp__plugin_burgess_burgess__query_graph(epistemic_state="unverified", limit=50)` → the concrete backlog
+   the first grounder must verdict. This returns BOTH lanes of the queue: the `edges[]` (extractor
+   candidates + hypothesized proposals) **and** the `nodes[]`, which `epistemic_state` filters directly. A
+   materialized `/kg-diverge` pin lands as a hypothesized **node** and, by default, carries **no incident
+   edge at all** — its optional `edges` are extras, not a requirement. Such a bare pin is still fully
+   groundable: the node itself is the target — `kg_ground(target_id=<node_id>, verdict=…, kind="node", …)`.
+   **"No edge → can't be grounded" is false**: grounding operates on nodes, not just edges (a Node has no span
+   field, so its support is restated into the body — §1.4). Never skip a pin because it has no wired edge.
+   Note also that the `unverified` count in `kg_metrics.edges_by_epistemic_state` (Stage 0.1) is EDGES-only,
+   so a queue that is "0 unverified edges" can still have unverified nodes waiting here.
+   If `$ARGUMENTS` is non-empty, also call
    `mcp__plugin_burgess_burgess__kg_context(query="$ARGUMENTS")` and read its `advisory` block —
    `advisory.signal == "structural-bridge"`, `advisory.note`, `advisory.nodes[]` — to learn which nodes the
    structural-bridge heuristic flags as bridges (the honest advisory is degree; specificity-weighted
@@ -90,12 +99,16 @@ verdicted items on its own, so this is the only place they come back up.
    always a manual `kg_ground` decision. The flag self-clears on the next projection once the item leaves the
    `{failed, rejected}` set.
 
-## Stage 1 — Verdict the unverified edges (kg-grounder)
+## Stage 1 — Verdict the unverified queue: edges AND nodes (kg-grounder)
 
 Launch the `kg-grounder` subagent via the Task tool to drain the `unverified` queue. It walks each pending
 edge, re-checks the `span` is a verbatim substring of `examples/source.md`, confirms the `relation` is
 specific (NOT "true" only because it is generic/unfalsifiable — that is the generality confound, §1.6, whose
-verdict reason is `vague`), and calls `kg_ground(target_id=<edge_id>, verdict=...)` for each.
+verdict reason is `vague`), and calls `kg_ground(target_id=<edge_id>, verdict=...)` for each. The **same pass
+also grounds unverified NODES** — a materialized `/kg-diverge` pin is a hypothesized node that may have no
+incident edge — via `kg_ground(target_id=<node_id>, kind="node", ...)`; a node's support is restated into its
+body, since a Node has no span field (§1.4). A pin without a wired edge is groundable *as a node*; "no edge"
+never means "cannot ground".
 
 ```
 Task(
@@ -110,8 +123,15 @@ Task(
       - rejected : no supporting span, span not in source (fabrication), OR the edge is "true"
                    only because it is vague/unfalsifiable (the generality confound, §1.6) —
                    use note reason `vague` for the latter.
+    ALSO drain the unverified NODES in query_graph's nodes[] — a materialized /kg-diverge pin
+    is a hypothesized NODE and, by default, has NO incident edge (its edges are optional extras).
+    It is groundable AS A NODE — do NOT skip it for lacking an edge ("no edge -> can't ground"
+    is false). Ground a node with kg_ground(target_id=<node_id>, kind="node", verdict=..., ...);
+    a Node has no span field, so promotion support is restated into its body (support_note for an
+    external citation, or support_span for a verbatim source substring; a bare novel pin with no
+    support is correctly LEFT unverified, per the "Materialized pins go first" triage below).
     Do NOT write verdicts into any kg_write payload (§1.4: forged verdicts are stripped/DEMOTED);
-    kg_ground is the only verdict channel. Report a per-edge table: edge_id, verdict, reason.
+    kg_ground is the only verdict channel. Report a per-item table: id, kind (edge|node), verdict, reason.
   """
 )
 ```
@@ -198,15 +218,18 @@ deliberate node-merge tool: it rewrites + dedups the colliding edges (negative i
 
 When choosing what to ground next among `unverified` items, prefer edges/nodes whose
 notes/body carry the `[diverge] pinned` lineage marker — the human explicitly selected
-these ideas, so they earn the queue's front. This is PURELY an ordering preference:
-the verdict logic is identical for pinned and unpinned items (verdict neutrality is
-test-enforced), a pin never lowers the evidence bar, and promotion still requires
-support (span or citation) like any hypothesis.
+these ideas, so they earn the queue's front. Note the shape: a materialized pin is a
+hypothesized **node** (`kg_diverge_materialize` writes one node per pin; any `edges` are
+optional extras), so a pin **routinely has no incident edge** — and is nonetheless
+groundable *as a node* via `kg_ground(kind="node")`. **"No edge → can't be grounded" is false.**
+This is PURELY an ordering preference: the verdict logic is identical for pinned and unpinned
+items (verdict neutrality is test-enforced), a pin never lowers the evidence bar, and promotion
+still requires support (span or citation, restated into the node body) like any hypothesis.
 
 Because a materialized pin is a *novel* idea, grounding it against the current source will
 usually find no in-source span — that is the expected outcome, **not** a failure. So the
-grounder **leaves an unsupported `[diverge]`-lineage edge `unverified`** (triage: don't spend a
-rejection on an item that by construction has no span yet) rather than rejecting it. Only a pin
+grounder **leaves an unsupported `[diverge]`-lineage node (or edge) `unverified`** (triage: don't
+spend a rejection on an item that by construction has no span yet) rather than rejecting it. Only a pin
 that is actively **FALSIFIED** (`failed`, the adversarial grounder's verdict) folds back into its
 /kg-diverge brief's **permanent** discards; a merely-unsupported (`rejected`) pin stays recoverable
 in the lane until sources are added. Ordinary `/kg-generate` proposals (no `[diverge]` marker) are

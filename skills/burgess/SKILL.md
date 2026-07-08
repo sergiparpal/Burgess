@@ -51,7 +51,9 @@ afterward. The portico moved from the door of imagination to after generation.
 1. **`/kg-build [source_path] [wave_size]`** — extract candidate nodes/edges from prose and write them
    through the boundary. Orchestrates **kg-extractor** (one per `##` section, Sonnet by default, launched
    in bounded parallel waves of `wave_size`; emits a `kg_write` payload). Output edges land `unverified`.
-2. **`/kg-ground [node_or_query]`** — adjudicate `unverified` edges. **kg-grounder** confirms or
+2. **`/kg-ground [node_or_query]`** — adjudicate `unverified` **edges AND nodes** (a materialized
+   `/kg-diverge` pin is a hypothesized node — often with no incident edge — groundable via
+   `kg_ground(kind="node")`; "no edge → can't ground" is false). **kg-grounder** confirms or
    rejects on the merits and stamps verdicts via `kg_ground`; **kg-adversarial-grounder** tries to
    *falsify* surviving edges, recording `attacked_by` edges + `kg_ground(verdict="failed")`.
 3. **`/kg-generate [mechanism] [k]`** — turn the graph into an idea generator. `kg_generate` runs the

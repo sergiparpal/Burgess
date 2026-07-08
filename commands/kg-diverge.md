@@ -133,7 +133,10 @@ it verbatim and wait; convergence tools are unaffected by design (I9).
   only pins, only during a session that still holds the idea's record (I10 — a stale pin is
   reported `skipped`; re-ingest it first). No source in the project? The ideas simply WAIT
   in the lane. Optional `edges` link materialized ideas to existing nodes (same boundary:
-  forged verdicts stripped, text claims refused). Materialized pins may be ground FIRST by
+  forged verdicts stripped, text claims refused) — but they are **extras, not required**: a pin
+  is materialized as a **node**, and that node is grounded on its own via `kg_ground(kind="node")`.
+  A pin with **no wired edge is still fully groundable** — "no edge → can't be grounded" is false;
+  grounding operates on nodes, not just edges. Materialized pins may be ground FIRST by
   /kg-ground (priority is ordering only — verdict-neutral by test). Grounding a materialized
   pin against an existing source will (correctly) leave it `unverified` — a novel idea has no
   in-source span yet — so it WAITS in the lane, recoverable, until you add supporting sources;
