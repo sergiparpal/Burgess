@@ -137,9 +137,13 @@ async def _answer_async(prompts: list[str], source_path: Path, working_dir: Path
     rag = LightRAG(working_dir=str(working_dir),
                    llm_model_func=gpt_4o_mini_complete,
                    embedding_func=openai_embed)
-    await rag.initialize_storages()
-    await initialize_pipeline_status()
     try:
+        # init INSIDE the try so a failure of initialize_pipeline_status() (or of initialize_storages
+        # itself, which may leave partially-opened storages) still reaches finalize_storages() and leaves
+        # the working_dir clean for reuse — previously init ran BEFORE the try, so an init-path failure
+        # leaked the storages (review-fix).
+        await rag.initialize_storages()
+        await initialize_pipeline_status()
         # build the index the first time OR when the source content changed — a populated working_dir
         # matching the recorded signature is reused as a cache; a changed source re-inserts (and the
         # signature is re-recorded) so a stale index is never served.
@@ -152,7 +156,11 @@ async def _answer_async(prompts: list[str], source_path: Path, working_dir: Path
             answers.append(str(ans).strip())
         return answers
     finally:
-        await rag.finalize_storages()
+        # best-effort: never let a cleanup error mask the real failure being propagated
+        try:
+            await rag.finalize_storages()
+        except Exception:  # noqa: BLE001 — opt-in experiment arm; cleanup is advisory
+            pass
 
 
 def answer_prompts(prompts: list[str], source_path: Path, working_dir: Path | None = None) -> list[str]:

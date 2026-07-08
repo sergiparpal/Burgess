@@ -204,7 +204,11 @@ def _git_merge_file(base_text: str, ours_text: str, theirs_text: str) -> tuple[s
             paths = {}
             for name, text in (("base", base_text), ("ours", ours_text), ("theirs", theirs_text)):
                 p = Path(td) / name
-                p.write_text(text, encoding="utf-8")
+                # write_bytes, not write_text: the in-memory texts are LF-normalized, and write_text under
+                # the default newline=None re-expands \n → os.linesep on Windows (\r\n), so git merge-file
+                # would echo CRLF into the committed merge and defeat byte-identical (LF) canon. The decode
+                # side is already hardened to utf-8 below; this is the matching encode-side fix (review-fix).
+                p.write_bytes(text.encode("utf-8"))
                 paths[name] = str(p)
             r = subprocess.run(
                 ["git", "merge-file", "-p",

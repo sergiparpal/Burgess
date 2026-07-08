@@ -24,6 +24,11 @@ _GLOB_CHARS = "*?["
 # What starts a section: a level-2 ATX heading — `##` followed by whitespace. `###` and deeper never
 # match (the char after `##` is `#`, not whitespace) and stay inside their section's body.
 _SECTION_HEAD_RE = re.compile(r"^##\s+(.*)$")
+# A fenced-code-block delimiter (``` or ~~~, optionally indented, with an optional info string). Lines
+# INSIDE a fence are literal content, so a `## ...` there (a shell comment, Markdown-about-Markdown) is
+# NOT a section heading — toggling on this keeps split_sections from carving a code block at such a line
+# (review-fix: the single section-splitting home, so backend/projector/harness all inherit the fix).
+_FENCE_RE = re.compile(r"^\s*(```|~~~)")
 
 
 def split_sections(text: str, *, include_heading: bool = False,
@@ -49,8 +54,13 @@ def split_sections(text: str, *, include_heading: bool = False,
         text = text[1:]
     sections: "list[tuple[str, str]]" = []
     title, buf = None, []  # title=None -> still in the preamble
+    in_fence = False       # inside a ``` / ~~~ fenced code block — headings there are literal content
     for line in text.splitlines():
-        m = _SECTION_HEAD_RE.match(line)
+        if _FENCE_RE.match(line):
+            in_fence = not in_fence
+            buf.append(line)
+            continue
+        m = None if in_fence else _SECTION_HEAD_RE.match(line)
         if m:
             if title is not None or buf:
                 sections.append((title or preamble_title, "\n".join(buf)))

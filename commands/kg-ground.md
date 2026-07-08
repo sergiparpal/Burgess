@@ -37,8 +37,12 @@ Find what is actually pending before spending any subagent budget.
    betweenness stays GATED until validated, §1.6). Those `advisory.nodes[]` plus any high-degree nodes are
    the **hub candidates** for Stage 2.
 
-If the `unverified` count is 0 and there are no hub candidates, stop and report "queue empty — nothing to
-ground". Otherwise proceed.
+Stop and report "queue empty — nothing to ground" **only if ALL of these hold**: the Stage-0.2
+`query_graph` result has **no** unverified `edges[]`, **no** unverified `nodes[]`, **and** there are no
+hub candidates. Do **not** decide this from the Stage-0.1 `kg_metrics` `unverified` count alone — that
+count is EDGES-only, so a queue whose only pending items are bare materialized `/kg-diverge` pins (which
+land as hypothesized **nodes** with no incident edge) reads as "0 unverified" there while `nodes[]` still
+holds groundable pins. Missing this silently skips the entire node-grounding pass. Otherwise proceed.
 
 > **Alternative prioritization (optional).** `mcp__plugin_burgess_burgess__kg_agenda()`'s
 > `blocked_on_grounding[]` lane is a read-only structural shortlist of what grounding would unblock —

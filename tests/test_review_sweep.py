@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import unicodedata
 
-from kg_engine.boundary import MIN_EDGE_BUDGET, merge_results_into_nodes, validate_payload
+from kg_engine.boundary import MIN_EDGE_BUDGET, MIN_NODE_BUDGET, merge_results_into_nodes, validate_payload
 from kg_engine.model import Edge, EpistemicState, Disposition, edge_id, node_from_markdown, slug
 
 # a source containing both spans the boundary tests cite
@@ -82,8 +82,9 @@ def test_boundary_dedup_and_merge_agree_on_canonical_id(pack):
 
 def test_node_flood_budget_is_seeded_canon_wide(pack):
     # boundary-3: the node limiter is seeded with the existing canon node ids, not reset to 0 each
-    # call — so a NET-NEW node at the cap is flooded.
-    existing = {f"n{i}" for i in range(MIN_EDGE_BUDGET)}
+    # call — so a NET-NEW node at the cap is flooded. The node lane has its OWN floor MIN_NODE_BUDGET
+    # (> the edge floor) so a small source doesn't cap the canon at 64 nodes (review-fix: L15).
+    existing = {f"n{i}" for i in range(MIN_NODE_BUDGET)}
     payload = {"nodes": [{"label": "NewOne", "node_type": "compression"}]}
     at_cap = validate_payload(payload, pack=pack, source_text="x", existing_node_ids=existing)
     n = next(r for r in at_cap if r.kind == "node")
@@ -95,7 +96,7 @@ def test_node_flood_budget_is_seeded_canon_wide(pack):
 def test_idempotent_existing_node_not_flooded_at_cap(pack):
     # boundary-3 regression guard: re-emitting an ALREADY-EXISTING node when the canon is at its node
     # budget must NOT be flooded (it grows the canon by zero — the edge path's "deduped costs zero").
-    existing = {f"n{i}" for i in range(MIN_EDGE_BUDGET)}
+    existing = {f"n{i}" for i in range(MIN_NODE_BUDGET)}
     payload = {"nodes": [{"id": "n0", "label": "n0", "node_type": "compression"}]}  # already exists
     res = validate_payload(payload, pack=pack, source_text="x", existing_node_ids=existing)
     n = next(r for r in res if r.kind == "node")

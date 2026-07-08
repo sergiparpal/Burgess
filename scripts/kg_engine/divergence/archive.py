@@ -136,12 +136,20 @@ class FrozenVoronoiNicher:
 
 def continuous_bin(axis: Axis, value: Any) -> int:
     lo, hi = axis.range  # type: ignore[misc]
+    # A MISSING or un-coercible value maps to the NEUTRAL mid-bin, never bin 0. Bin 0 is a real extreme
+    # (for `feasibility` it is "far-fetched"), so defaulting a candidate that simply OMITS the axis there
+    # would (a) silently bias every such descriptor toward that extreme — the opposite of the coverage
+    # axis's intent — and (b) collapse all omitting candidates into ONE bin, dissolving the "one elite per
+    # bin" coverage guarantee. A middle default keeps the archive honest when the language layer forgets
+    # the axis (review-fix: L6). The guarantee is still only fully realized when descriptors DO carry it.
+    # (A genuinely GARBAGE finite-but-out-of-range value still clamps below; a non-finite NaN/inf — an
+    # agent emitting "nan" — stays bin 0: that is a bad value, not an omitted one.)
+    mid = max(0, axis.bins // 2)
     try:
         v = float(value)
     except (TypeError, ValueError):
-        return 0
-    # A non-finite value (NaN/inf, e.g. an agent emitting "nan") would make
-    # ``int(frac * bins)`` raise; treat it as an out-of-range value -> bin 0.
+        return mid
+    # A non-finite value (NaN/inf) would make ``int(frac * bins)`` raise; treat it as out-of-range -> bin 0.
     if not math.isfinite(v):
         return 0
     if hi <= lo:

@@ -232,19 +232,33 @@ class BackendExtractor:
             + ". Copy every span verbatim from this exact text:\n\n"
             + scrubbed_text
         )
-        resp = client.messages.create(
+        create_kwargs: dict[str, Any] = dict(
             model=self.model,
             max_tokens=self._effective_max_tokens(),
             system=SYSTEM_PROMPT,
-            # passed as a plain dict deliberately: "adaptive" is a runtime-valid thinking type accepted
-            # by the API at the anthropic>=0.77 floor, but it is newer than the typed ThinkingConfigParam
-            # union at that floor — the dict avoids a static-typing mismatch with no runtime effect
-            # (review-low). The project runs no type-checker, so this is purely forward-doc.
-            thinking={"type": "adaptive"},
             output_config={"format": {"type": "json_schema", "schema": self.section_schema()}},
             messages=[{"role": "user", "content": user}],
         )
+        thinking = self._thinking_config()
+        if thinking is not None:
+            create_kwargs["thinking"] = thinking
+        resp = client.messages.create(**create_kwargs)
         return self._decode_response(resp, title)
+
+    @staticmethod
+    def _thinking_config():
+        """The `thinking` param for messages.create — a plain dict deliberately: "adaptive" is a
+        runtime-valid thinking type accepted by the API at the anthropic>=0.77 floor, but it is newer than
+        the typed ThinkingConfigParam union at that floor (the dict avoids a static-typing mismatch, no
+        runtime effect; the project runs no type-checker). "adaptive" is correct for the default
+        claude-opus-4-8 and every 4.6+ model, but a PRE-4.6 model chosen via --model / KG_BACKEND_MODEL
+        REJECTS it with a 400 on every section — turning the whole headless run into N per-section
+        failures. Set KG_BACKEND_THINKING=off (or 0/none/disabled) to OMIT thinking entirely for such a
+        model, rather than editing code (review-fix)."""
+        if os.environ.get("KG_BACKEND_THINKING", "adaptive").strip().lower() in ("off", "0", "none",
+                                                                                 "disabled", ""):
+            return None
+        return {"type": "adaptive"}
 
     def _decode_response(self, resp: Any, title: str) -> dict:
         """Interpret the model response: dispatch on stop_reason, extract the text block, parse JSON."""

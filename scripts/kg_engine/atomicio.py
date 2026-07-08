@@ -18,28 +18,35 @@ import tempfile
 import time
 from pathlib import Path
 
-_REPLACE_RETRIES = 5
-_REPLACE_BACKOFF = 0.05  # seconds, grows linearly per attempt
+_REPLACE_TIMEOUT = 5.0    # seconds — a DEADLINE, matched to the lease lock's LOCK_REPLACE_RETRY_TIMEOUT
+_REPLACE_BACKOFF = 0.05   # initial sleep; doubles per attempt, capped by _REPLACE_BACKOFF_MAX
+_REPLACE_BACKOFF_MAX = 0.25
 
 
 def _replace_with_retry(tmp: str, path: Path) -> None:
-    """``os.replace(tmp, path)`` with a small bounded retry for the Windows sharing-violation case.
+    """``os.replace(tmp, path)`` with a bounded retry for the Windows sharing-violation case.
 
     On Windows, replacing a destination another process holds open WITHOUT ``FILE_SHARE_DELETE`` raises
     ``PermissionError`` (ERROR_SHARING_VIOLATION): e.g. a lease-free canon reader (a second session, the
     per-session reconcile worker, the headless backend) mid-reading the note, or the AV/search indexer
     briefly opening the freshly-renamed file. The lease lock file already retries the same transient
-    class (``canon._acquire_lease_blocking``); mirror it here so a momentary concurrent open does not
-    fail an otherwise-valid canon write — which, via ``canon.write_nodes``, would spuriously roll back
-    the whole batch. A no-op on POSIX, where ``os.replace`` over an open file succeeds."""
-    for attempt in range(_REPLACE_RETRIES):
+    class to a ~5s deadline (``canon._acquire_lease_blocking`` / ``LOCK_REPLACE_RETRY_TIMEOUT``); mirror
+    that DEADLINE here so a momentary concurrent open does not fail an otherwise-valid canon write —
+    which, via ``canon.write_nodes``, would spuriously roll back the whole batch. Previously this capped
+    at 5 attempts / ~0.5s total — an order of magnitude shorter than the lease lock's budget, so a brief
+    AV/indexer hold (>0.5s, common on Windows) would roll back a full /kg-build wave that the lease file
+    would have survived (review-fix). A no-op on POSIX, where ``os.replace`` over an open file succeeds."""
+    deadline = time.monotonic() + _REPLACE_TIMEOUT
+    backoff = _REPLACE_BACKOFF
+    while True:
         try:
             os.replace(tmp, path)
             return
         except PermissionError:
-            if attempt == _REPLACE_RETRIES - 1:
+            if time.monotonic() >= deadline:
                 raise
-            time.sleep(_REPLACE_BACKOFF * (attempt + 1))
+            time.sleep(min(backoff, _REPLACE_BACKOFF_MAX))
+            backoff *= 2
 
 
 def fsync_dir(directory: Path) -> None:

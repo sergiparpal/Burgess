@@ -392,16 +392,20 @@ class Projector:
     def _live_subgraph(G: nx.MultiDiGraph) -> nx.Graph:
         import networkx as nx  # deferred — see the TYPE_CHECKING note (review-r6: hook-import-tax)
         # The advisory ranks (degree/communities/betweenness/spec_betweenness) are computed over the
-        # NON-FAILED subgraph (§1.7). graph.json and the edges table stay COMPLETE — failure memory is
-        # never pruned — but a `failed`/`rejected` edge must not inflate centrality: the adversarial
-        # grounder stamps its attacked_by/confounded_by counter-edges `failed`, so counting them would
-        # make "more refutation -> higher apparent centrality". Excluding only the edges keeps every
-        # node present (an attacked hub whose edges are all refuted still ranks honestly at degree 0).
-        _fail = FAILURE_STATE_VALUES
+        # LIVE subgraph (§1.7). graph.json and the edges table stay COMPLETE — failure memory is never
+        # pruned — but a `failed`/`rejected` edge must not inflate centrality: the adversarial grounder
+        # stamps its attacked_by/confounded_by counter-edges `failed`, so counting them would make "more
+        # refutation -> higher apparent centrality". `obsolete` is excluded for the SAME reason and for
+        # consistency with the answer lane (kg_context excludes FAILURE_STATE_VALUES | {OBSOLETE}): a
+        # SUPERSEDED relation is no longer live, so it must not confer degree/betweenness/community/bridge
+        # weight while being invisible as an answer — previously obsolete was left IN centrality only,
+        # an undocumented inconsistency (review-fix: L14). Excluding only the edges keeps every node
+        # present (an attacked hub whose edges are all refuted still ranks honestly at degree 0).
+        _excluded = FAILURE_STATE_VALUES | {EpistemicState.OBSOLETE.value}
         live = nx.MultiDiGraph()
         live.add_nodes_from(G.nodes(data=True))
         live.add_edges_from((u, v, k, d) for u, v, k, d in G.edges(keys=True, data=True)
-                            if d.get("epistemic_state") not in _fail)
+                            if d.get("epistemic_state") not in _excluded)
         return live.to_undirected()
 
     # ---- ranks (off the hot path)
@@ -630,6 +634,16 @@ class Projector:
         # graph.json is always written in full (cheap projection, must round-trip). Write atomically
         # (temp + os.replace) so a concurrent reader never observes a half-written file.
         data = node_link_data(G)
+        # Determinism (review-fix: M7). A shell-hydrated reproject reads edges `ORDER BY rowid`, and rowids
+        # are reassigned by `INSERT OR REPLACE` on incremental churn — so WITHOUT a stable emission sort,
+        # graph.json's node/link order is a function of write HISTORY, not canon content, and a
+        # byte-identical canon could emit a differently-ordered graph.json (violating the "graph.json is
+        # reproducible" contract). Sort by content keys here so the SERIALIZED order is canonical regardless
+        # of full-vs-shell parse or incremental history. Ranks/betweenness are computed on G above and are
+        # order-invariant, so this only canonicalizes serialization — never a metric.
+        data.get("nodes", []).sort(key=lambda n: str(n.get("id", "")))
+        data.get("links", []).sort(
+            key=lambda l: (str(l.get("source", "")), str(l.get("target", "")), str(l.get("id", ""))))
         data.setdefault("graph", {})["built_from_commit"] = head
         _atomic_write(self.graph_path, json.dumps(data, indent=2))
 
@@ -712,11 +726,13 @@ class Projector:
                         # acquiring this exclusive lock. Dropping on that stale read would discard the
                         # freshly-projected rows, so only DROP/recreate what is STILL outdated under the
                         # lock.
+                        healed = False
                         cols = {r[1] for r in con.execute("PRAGMA table_info(nodes)")}
                         if not _NEW_NODE_COLUMNS <= cols:
                             con.execute("DROP TABLE IF EXISTS nodes")
                             con.execute(self._NODES_DDL)
                             con.execute("CREATE INDEX IF NOT EXISTS idx_nodes_degree ON nodes(degree)")
+                            healed = True
                         ecols = {r[1] for r in con.execute("PRAGMA table_info(edges)")}
                         if not _NEW_EDGE_COLUMNS <= ecols:
                             con.execute("DROP TABLE IF EXISTS edges")
@@ -724,6 +740,18 @@ class Projector:
                             con.execute("CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source)")
                             con.execute("CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target)")
                             con.execute("CREATE INDEX IF NOT EXISTS idx_edges_owner ON edges(owner)")
+                            healed = True
+                        if healed:
+                            # The DROP/CREATE just committed EMPTY new-schema tables; _write_full
+                            # repopulates them in a SEPARATE transaction (`_connect` returns before that).
+                            # Invalidate the stored staleness signature NOW, in the same transaction as the
+                            # heal, so a crash in that window leaves is_stale()==True (no cheap_sig) and the
+                            # next read reprojects — instead of trusting a committed-empty, schema-current
+                            # index as "fresh" and serving an empty graph until an unrelated canon edit
+                            # (review-fix: M6). _save_meta fully rewrites meta on the success path.
+                            if con.execute("SELECT name FROM sqlite_master WHERE type='table' AND "
+                                           "name='meta'").fetchone():
+                                con.execute("DELETE FROM meta")
                         con.execute("COMMIT")
                     except Exception:
                         con.execute("ROLLBACK")
@@ -1686,7 +1714,15 @@ class DerivedReader:
                 conds.append("epistemic_state=?"); na.append(epistemic_state)
             if conds:
                 nq += " WHERE " + " AND ".join(conds)
-            nq += " ORDER BY degree DESC, id ASC LIMIT ?"; na.append(limit)  # id tiebreak: deterministic top-N
+            if epistemic_state == EpistemicState.UNVERIFIED.value:
+                # Grounding queue: float bare materialized `/kg-diverge` pins (provenance=hypothesized,
+                # typically degree 0) to the FRONT so they are not pushed past `limit` behind high-degree
+                # extractor nodes — /kg-ground is told to ground pins first, but degree DESC alone buried
+                # them (review-fix: L8). id tiebreak keeps the top-N deterministic.
+                nq += " ORDER BY (provenance='hypothesized') DESC, degree DESC, id ASC LIMIT ?"
+            else:
+                nq += " ORDER BY degree DESC, id ASC LIMIT ?"  # id tiebreak: deterministic top-N
+            na.append(limit)
             nodes = [dict(r) for r in con.execute(nq, na)]
             eq, ea = "SELECT * FROM edges", []
             if relation:
@@ -1698,11 +1734,19 @@ class DerivedReader:
             con.close()
 
     def shortest_path(self, source: str, target: str) -> list[str] | None:
-        # path search over the derived edge list; still no centrality computation
+        # path search over the derived edge list; still no centrality computation. Exclude
+        # `failed`/`rejected` edges (§1.7): grounding REFUTED those relations, so a path must not route
+        # through one and present a connectivity the graph already disproved — matches _live_subgraph,
+        # which excludes the identical edges from every centrality surface (review-fix: L13). Failure
+        # memory is still fully DRAWN/counted elsewhere; it just can't carry a live path here.
         con = self._ro()
         try:
             adj: dict[str, list[str]] = {}
-            for s, t in con.execute("SELECT source,target FROM edges"):
+            fail_states = sorted(FAILURE_STATE_VALUES)  # sorted → deterministic SQL text
+            placeholders = ",".join("?" * len(fail_states))
+            for s, t in con.execute(
+                    f"SELECT source,target FROM edges WHERE epistemic_state NOT IN ({placeholders})",
+                    fail_states):
                 adj.setdefault(s, []).append(t)
                 adj.setdefault(t, []).append(s)
         finally:

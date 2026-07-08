@@ -104,13 +104,18 @@ reach — `wild` means further-out, never incoherent.
    ```json
    [{"id": "c1", "text": "the idea, one or two sentences",
      "descriptor": {"angle": "…", "scope": "…", "form": "…", "boldness": 0.9,
-                     "mechanism": "the core how, a few words"},
+                     "feasibility": 0.4, "mechanism": "the core how, a few words"},
      "fitness": 0.8,
      "genealogy": {"operator_id": "analogy", "parents": []}}]
    ```
 
    Give every candidate a fresh unique `id` (`c<round><letter>` works). Use the same `axes`
    argument you initialized with, and one integer `seed` per session for reproducibility.
+   **Populate every continuous axis your resolved `axes` declares** — including `feasibility`
+   (0 = far-fetched, 1 = buildable) when present. Omitting a continuous value is not neutral: the engine
+   bins a missing value to the middle, so an unpopulated `feasibility` forfeits the coverage guarantee
+   (one buildable elite per bin) that the axis exists to provide. Skip it only if your `axes` truly
+   omit it (e.g. names/taglines, where "buildable" is meaningless).
 
 7. **Present the returned `slate`** — for each idea: its text, mechanism label, niche
    `coords`, and a one-line *why-picked* (which niche it holds + what its `novelty` says).

@@ -276,11 +276,14 @@ class LeaseLock:
         # harmless — the next one, or the still-valid TTL, covers it.
         try:
             rec = self._read()
-            # Refresh, never acquire: a heartbeat only extends a lock we VERIFIABLY hold. If the record
-            # is gone (rec is None) or owned by someone else, do nothing — blind-writing a fresh
-            # self-owned record here would be an un-CAS'd acquisition that could steal a path a successor
-            # reclaimed after our lease lapsed. Acquisition goes solely through acquire()'s O_EXCL/reclaim
-            # CAS (F16).
+            # Refresh, never acquire: a heartbeat extends a lock we BELIEVE we hold as of the read below.
+            # If the record is gone (rec is None) or owned by someone else, do nothing — blind-writing a
+            # fresh self-owned record here would be an un-CAS'd acquisition that could steal a path a
+            # successor reclaimed after our lease lapsed. This is a read-check-then-write, NOT a CAS: a
+            # residual TOCTOU remains if OUR OWN lease goes TTL-stale in the check→write gap (e.g. a long
+            # GC/suspend pause) and a successor reclaims in that instant — narrow, and bounded because we
+            # heartbeat every ttl/3. Full acquisition safety comes solely from acquire()'s O_EXCL/reclaim
+            # CAS (F16); the heartbeat is a best-effort TTL extension, not a correctness guarantee.
             if rec is None or not self._owned_by_self(rec):
                 return
             now = time.time() if now is None else now
@@ -361,13 +364,20 @@ def _win_pid_alive(pid: int) -> bool:
 
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
         STILL_ACTIVE = 259
-        ERROR_ACCESS_DENIED = 5
+        ERROR_INVALID_PARAMETER = 87
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel32.OpenProcess.restype = wintypes.HANDLE
         kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
         handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
         if not handle:
-            return ctypes.get_last_error() == ERROR_ACCESS_DENIED  # denied → exists; else no such pid
+            # DEAD only on ERROR_INVALID_PARAMETER (87 = no such process). Every other failure fails SAFE
+            # to alive: ERROR_ACCESS_DENIED (5) is a live process owned by another account, and a TRANSIENT
+            # error (ERROR_NOT_ENOUGH_MEMORY, handle exhaustion, AV interference) against a genuinely-live
+            # canon-lease holder must NOT be read as dead and let its lease be reclaimed. This is byte-for-
+            # byte the hardened dirlock._win_pid_alive logic — the two probes are parallel-by-design and were
+            # ONE-WAY drifted (dirlock hardened, this twin left on the fail-UNSAFE `== ACCESS_DENIED` form,
+            # which read 87 AND every transient error as dead → over-reclaim a live lease, review-fix).
+            return ctypes.get_last_error() != ERROR_INVALID_PARAMETER
         try:
             code = wintypes.DWORD()
             if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
@@ -388,6 +398,10 @@ def _pid_probe(pid: int, host: str, my_host: str) -> bool:
         return False
     if host and host != my_host:
         return True
+    if not host:
+        return True  # an old/corrupt record with a pid but no host can't be probed — assume alive
+                     # (mirrors dirlock.pid_probe; otherwise a coincidental same-numbered LOCAL pid or a
+                     #  truly-remote holder would be mis-probed against THIS host, review-fix)
     if os.name == "nt":
         return _win_pid_alive(pid)
     try:
@@ -424,8 +438,16 @@ class RollbackInfo:
 class Canon:
     """Markdown canon rooted at a project dir; notes live under <project>/canon/."""
 
-    def __init__(self, project_dir: str | os.PathLike, *, ensure_layout: bool = True):
+    def __init__(self, project_dir: str | os.PathLike, *, ensure_layout: bool = True,
+                 git_enabled: bool = True):
         self.root = Path(project_dir)
+        # git_enabled=False makes _commit_batch a no-op for a vault that lives UNDER a parent repo's
+        # worktree but must never be committed into it — the /kg-perturb "second construction", rooted at
+        # <project>/.kg/constructions/<slug>/. There `_git_ok` would discover the PARENT repo (rev-parse
+        # walks up) and commit the ephemeral construction canon into the user's tracked history (§9/§15,
+        # review-fix: H1). The atomic note writes + snapshot rollback are unaffected (they work on git and
+        # non-git vaults alike), so a construction is still crash-safe, just never committed.
+        self.git_enabled = git_enabled
         self.notes_dir = self.root / CANON_SUBDIR
         # Resolve the notes dir ONCE — node_path() runs the vault-prefix check 4-5×/node/batch and was
         # re-running notes_dir.resolve() (a syscall) on every call. The path is fixed for this Canon's
@@ -781,6 +803,8 @@ class Canon:
         history — a no-op commit exits non-zero, which check=False ignores harmlessly. The COMMIT is
         scoped to the same pathspec (a bare `git commit` would record the WHOLE staged index,
         including any unrelated file another process staged concurrently)."""
+        if not self.git_enabled:
+            return  # an ephemeral vault under a parent repo (second construction) — never commit (H1)
         if not (snapshot and _git_ok(self.root)):
             return
         paths = [str(p) for p in snapshot]

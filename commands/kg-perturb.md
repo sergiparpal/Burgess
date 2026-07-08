@@ -45,7 +45,10 @@ elif [ "${SECOND##*.}" = "json" ]; then
 else
   # a second SOURCE document → derive a stable construction NAME from its basename
   NAME=$(basename "$SECOND"); NAME="${NAME%.*}"
-  NAME=$(printf '%s' "$NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]\+/-/g; s/^[-_.]\+//; s/[-_.]\+$//')
+  # POSIX BRE (`*`, not the GNU `\+` extension — BSD/macOS sed treats `\+` as a literal `+`, so the
+  # basename would not be cleaned there). The engine's _construction_slug re-slugs identically anyway,
+  # so this only keeps the echoed NAME clean and portable.
+  NAME=$(printf '%s' "$NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-][^a-z0-9._-]*/-/g; s/^[-_.][-_.]*//; s/[-_.][-_.]*$//')
   [ -n "$NAME" ] || NAME="second"
   echo "MODE=source"; echo "CONSTRUCTION=$NAME"; echo "SECOND_SOURCE=$SECOND"
 fi
@@ -87,6 +90,15 @@ After the extractor finishes, sanity-check the build landed (its reported ACCEPT
 it wrote **nothing**, tell the user the second source yielded no anchored structure and either fix the source
 or fall back to `MODE=degrade` — do not proceed on an empty construction (Step 2 would then degrade to
 `regroup` anyway, with a note saying so).
+
+**Also verify nothing leaked into the PRIMARY graph.** Routing depends on the extractor passing
+`construction=`/`source=` on *every* `kg_write`; a single omitted pair silently writes second-source
+structure into the real canon, where it would later be grounded as native. Before Step 1, record the
+primary node/edge counts (`mcp__plugin_burgess_burgess__kg_metrics()` / `kg_status()`); after the extractor
+returns, re-read them. The primary counts must be **unchanged** — the whole build lands in the construction's
+own canon. If the primary grew, the extractor dropped the routing args on some section: tell the user, and do
+**not** ground until the leaked primary nodes/edges are identified (they are `unverified`, so a subsequent
+`/kg-ground` is the backstop, but flag it explicitly rather than absorbing them silently).
 
 ## Step 2 — cross-generate (ensemble §9)
 

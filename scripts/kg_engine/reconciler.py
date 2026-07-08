@@ -15,7 +15,10 @@ from pathlib import Path
 
 from .canon import Canon, GROUND_AUDIT, RECONCILE_STATE_NAME, _atomic_write
 from .groundaudit import GroundAuditLog
-from .model import EpistemicState, GROUNDABLE_STATES, VERDICT_STATES, node_from_markdown, slug
+from .model import (
+    EpistemicState, FAILURE_STATE_VALUES, GROUNDABLE_STATES, VERDICT_STATES,
+    node_from_markdown, slug,
+)
 
 __all__ = ["Reconciler", "ReconcileReport", "OrphanReport", "GROUND_AUDIT"]
 
@@ -245,7 +248,12 @@ class Reconciler:
 
         # node-level forged verdict
         nkey = f"node:{node.id}"
-        if self._check_and_spend(nkey, node.epistemic_state, epistemic, consumed, audit):
+        restored = self._restore_erased_negative(node.epistemic_state, epistemic.get(nkey))
+        if restored is not None:
+            node.epistemic_state = restored
+            report.requarantined.append(node.id)
+            mutated = True
+        elif self._check_and_spend(nkey, node.epistemic_state, epistemic, consumed, audit):
             node.epistemic_state = EpistemicState.UNVERIFIED
             report.requarantined.append(node.id)
             mutated = True
@@ -254,7 +262,12 @@ class Reconciler:
         # edge-level forged verdicts
         for e in node.edges:
             ekey = e.id
-            if self._check_and_spend(ekey, e.epistemic_state, epistemic, consumed, audit):
+            restored = self._restore_erased_negative(e.epistemic_state, epistemic.get(ekey))
+            if restored is not None:
+                e.epistemic_state = restored  # keep verdict_by/at as canon holds them (the state is §1.7)
+                report.requarantined.append(e.id)
+                mutated = True
+            elif self._check_and_spend(ekey, e.epistemic_state, epistemic, consumed, audit):
                 e.epistemic_state = EpistemicState.UNVERIFIED
                 e.verdict_by = None
                 e.verdict_at = None
@@ -263,6 +276,23 @@ class Reconciler:
             epistemic[ekey] = e.epistemic_state.value
 
         return mutated
+
+    @staticmethod
+    def _restore_erased_negative(current: EpistemicState, last_value):
+        """§1.7 permanent-negative-memory guard, the OTHER direction from `_check_and_spend`.
+
+        The verdict monopoly polices out-of-band edits *into* a groundable state (a forged verdict).
+        But a `failed`/`rejected` edge hand-edited in canon *out* to `unverified` is equally anomalous:
+        no legitimate tool path ever writes `unverified` (VALID_VERDICTS excludes it) and the §1.4/§1.7
+        merge precedence makes failure states sticky, so a re-proposal can never demote one either. Such
+        an edit ERASES negative memory — it drops the item from `failure_ids`, so the boundary stops
+        quarantining re-proposals of the refuted claim. Restore the prior verdict rather than accept the
+        reset (previously the `current not in GROUNDABLE_STATES` early-return in `_check_and_spend` let
+        this transition survive silently — review-fix, symmetric to reconciler-5/server-1). Returns the
+        state to restore, or None when this is not an erasure of negative memory."""
+        if current == EpistemicState.UNVERIFIED and last_value in FAILURE_STATE_VALUES:
+            return EpistemicState(last_value)
+        return None
 
     def _relocate_to_canonical(self, node, p: Path, rel: str, files_state: dict,
                                live_files: set) -> "tuple[Path, str] | None":
@@ -607,7 +637,15 @@ class Reconciler:
             data = json.loads(Path(graph_json).read_text(encoding="utf-8"))
         except (FileNotFoundError, ValueError):
             return report
-        derived_edge_ids = {e.get("id") for e in data.get("links", data.get("edges", []))}
+        # A valid-JSON-but-malformed graph.json (a list, null, a string, or `links`/`edges` not a list)
+        # must degrade to "no derived edges", not crash with AttributeError/TypeError — mirror the same
+        # non-dict coercion _load_state already applies (review-fix).
+        if not isinstance(data, dict):
+            return report
+        links = data.get("links")
+        if not isinstance(links, list):
+            links = data.get("edges")
+        derived_edge_ids = {e.get("id") for e in links if isinstance(e, dict)} if isinstance(links, list) else set()
         for e in self.canon.all_edges():
             # only true verdicts (grounded/rejected/failed) are "verdicts" that can be orphaned;
             # OBSOLETE is a lifecycle state, not a verdict, so it is not reported here.

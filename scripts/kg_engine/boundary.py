@@ -44,6 +44,14 @@ from .model import (
 # The flood budget has a floor so normal small corpora are never affected; writable edges past the
 # budget are REJECTED `rate-limited-flood`.
 MIN_EDGE_BUDGET = 64
+# The NODE lane seeds its flood baseline with the raw count of ALL existing node ids (total-canon bound,
+# not per-call), so a SMALL source (< ~3.2KB → budget pinned at the floor) would cap the WHOLE canon's
+# node count at the floor forever — silently REJECTING genuinely-new nodes (later builds, kg_operate /
+# kg_generate structure, materialized /kg-diverge pins that deliberately exceed the source) as
+# `rate-limited-flood` once the canon crossed it. Nodes hit the floor long before edges do (20 edges/KB is
+# generous), so the node lane gets its OWN, higher floor to leave headroom for legitimate accumulation on
+# a small source while still bounding a single runaway payload (review-fix: L15).
+MIN_NODE_BUDGET = 512
 
 
 # --------------------------------------------------------------------------- pydantic contract
@@ -224,8 +232,12 @@ def validate_payload(
     # 2. nodes ---------------------------------------------------------------
     seen_nodes = set(existing_node_ids or [])      # canon-wide dedup set, like `seen` for edges
     # node flood baseline = raw count of existing ids (the node lane has no failure-state exemption,
-    # unlike the edge baseline below).
-    node_budget = None if budget is None else _FloodBudget(len(seen_nodes), budget)
+    # unlike the edge baseline below), against the node lane's OWN higher floor (MIN_NODE_BUDGET) so a
+    # small source doesn't cap the canon's node count at the edge floor (review-fix: L15).
+    node_budget = None
+    if max_edges_per_kb is not None:
+        node_budget_value = max(MIN_NODE_BUDGET, int(len(source_text) / 1024.0 * max_edges_per_kb))
+        node_budget = _FloodBudget(len(seen_nodes), node_budget_value)
     # slug-collision detection (non-fatal): slug() is non-injective on trailing/leading punctuation, so
     # two distinct labels in ONE payload ('C++' and 'C') can collapse onto one node id and silently
     # alias. We can only see labels for the nodes IN THIS payload (the canon stores labels in canon.py,

@@ -16,6 +16,7 @@ from collections import Counter, OrderedDict
 import math
 import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -176,6 +177,11 @@ EXIT_WATCHDOG = 71      # a handler wedged past KG_HANDLER_TIMEOUT and the watch
 DEFAULT_HANDLER_TIMEOUT = 300.0
 # Idempotency: bound the in-memory replay cache so a long-lived server can't grow it without limit.
 _WRITE_CACHE_MAX = 256
+# Upper bound on distinct NAMED second constructions alive in one session (§9/§15). Names come straight
+# from the LLM, and each mints a live sub-engine + an on-disk canon under .kg/constructions/, so an
+# unbounded map is a slow resource-exhaustion vector. Normal use is ONE; refuse (never silently evict —
+# eviction + the session-fresh wipe below would discard a half-built construction) past this (review-fix).
+_MAX_CONSTRUCTIONS = 8
 
 
 def _hard_exit(code: int) -> None:
@@ -813,9 +819,22 @@ class KGEngine:
     def _construction_root(self, construction: str) -> Path:
         """On-disk root of a NAMED alternate canon — a SIBLING of the divergence base
         (`<project>/.kg/diverge`) under the gitignored `.kg/` runtime tree (§12 open-q: keep the two
-        concerns in separate dirs). `.kg/` dies with the project's runtime state, so a second
-        construction is session-ephemeral by construction."""
+        concerns in separate dirs). `.kg/` is gitignored but DURABLE on disk (it does not delete itself
+        between sessions), so session-ephemerality is enforced by `_construction_engine`, which wipes a
+        stale root the first time a construction is materialized in a session (review-fix: M1)."""
         return self.project_dir / ".kg" / "constructions" / _construction_slug(construction)
+
+    def _new_construction_engine(self, root: Path, source) -> "KGEngine":
+        """Build a fresh sub-engine rooted at a construction dir with git COMMITS DISABLED — the dir
+        lives under the parent repo's worktree, so a commit would `git add` the ephemeral construction
+        canon into the user's tracked history (§9/§15, review-fix: H1). Everything else is the full
+        primary write path (boundary → canon → projector)."""
+        root.mkdir(parents=True, exist_ok=True)
+        eng = KGEngine(root, source_path=source, pack_path=self.pack_path,
+                       sensitivity=self.sensitivity, metrics_mode=self.metrics_mode,
+                       max_edges_per_kb=self.max_edges_per_kb)
+        eng.canon.git_enabled = False  # H1: never commit an ephemeral construction into the parent repo
+        return eng
 
     def _construction_engine(self, construction: str, source=None) -> "KGEngine":
         """Lazily create + cache a `KGEngine` bound to a SEPARATELY-NAMED alternate canon under
@@ -824,27 +843,40 @@ class KGEngine:
         this mirrors `divergence/state.py`'s per-name store rule (perturb-fix finding 5).
 
         The crux (perturb-fix §6.3): it reuses the FULL primary write path — boundary → canon →
-        projector — rooted at the alternate dir, so the session's OWN `kg-extractor` can populate a
-        second construction with **no API key** (the "LLM is the session" model, §2.2), and spans
-        verify against the construction's OWN `source`. `source` (the second source document) is set on
-        first build and refreshed when re-supplied; a later projection-only resolve may pass `None`
-        (spans are verified + stored at write time, never re-verified, and the projector degrades
-        cleanly with an empty corpus)."""
+        projector — rooted at the alternate dir (git-disabled, H1), so the session's OWN `kg-extractor`
+        can populate a second construction with **no API key** (the "LLM is the session" model, §2.2),
+        and spans verify against the construction's OWN `source`.
+
+        Session-ephemerality + staleness (review-fix: M1). `.kg/` persists on disk across sessions, so
+        the FIRST materialization of a name this session WIPES any stale root left by a dead session —
+        making the store genuinely session-fresh rather than silently merging yesterday's structure. A
+        same-session re-point to a DIFFERENT `source` (an edited second source under the same name) also
+        rebuilds from scratch; re-passing the SAME source (a per-section build wave) keeps the engine and
+        its resolver memo. `source=None` is a projection-only resolve — keep the configured source (spans
+        are verified + stored at write time, never re-verified; the projector degrades on an empty
+        corpus)."""
         name = str(construction)
         eng = self._constructions.get(name)
         if eng is None:
+            if len(self._constructions) >= _MAX_CONSTRUCTIONS:
+                raise ValueError(
+                    f"too many second constructions this session (limit {_MAX_CONSTRUCTIONS}); reuse an "
+                    "existing construction name instead of minting new ones")
             root = self._construction_root(name)
-            root.mkdir(parents=True, exist_ok=True)
-            eng = KGEngine(root, source_path=source, pack_path=self.pack_path,
-                           sensitivity=self.sensitivity, metrics_mode=self.metrics_mode,
-                           max_edges_per_kb=self.max_edges_per_kb)
+            if root.exists():
+                shutil.rmtree(root, ignore_errors=True)  # M1: drop a stale prior-session build
+            eng = self._new_construction_engine(root, source)
             self._constructions[name] = eng
         elif source is not None and eng.source_path != Path(source):
-            # a re-resolve that CHANGES the second source — never CLEARS it (None keeps the already-
-            # configured source, so a projection-only resolve doesn't blind span checks). Only re-point
-            # on an actual change, so a per-section build wave re-passing the same path doesn't drop the
-            # resolver memo every call.
-            eng.source_path = source
+            # the second source CHANGED mid-session (an edited doc under the same name): rebuild from
+            # scratch so stale nodes/edges from the old source don't merge with the new (M1). Re-pointing
+            # the resolver alone would keep the old structure. `source=None` never reaches here, so a
+            # projection-only resolve keeps the configured source and the built structure intact.
+            root = self._construction_root(name)
+            if root.exists():
+                shutil.rmtree(root, ignore_errors=True)
+            eng = self._new_construction_engine(root, source)
+            self._constructions[name] = eng
         return eng
 
     def kg_write(self, payload: dict, *, message: str = "kg_write", existing_nodes=None,
@@ -879,6 +911,12 @@ class KGEngine:
             # existing_nodes) and uses its own idempotency cache.
             return self._construction_engine(construction, source).kg_write(
                 payload, message=message, idempotency_key=idempotency_key)
+        if source is not None:
+            # `source` only names the second construction's own source; without `construction` it would be
+            # silently dropped (the primary source is fixed at startup). Refuse loudly rather than no-op on
+            # a caller that thinks it is re-pointing the primary source (review-fix: L3/server-5).
+            raise ValueError("`source` is only valid together with `construction` (it names the second "
+                             "construction's source document); omit it for a primary-canon write")
         receipt = self._payload_receipt(payload)
         if idempotency_key:
             cached = self._write_cache.get(idempotency_key)
@@ -975,6 +1013,9 @@ class KGEngine:
         unchanged primary-canon path."""
         if construction:
             return self._construction_engine(construction, source).kg_propose(payload, message=message)
+        if source is not None:
+            raise ValueError("`source` is only valid together with `construction` (it names the second "
+                             "construction's source document); omit it for a primary-canon propose")
         payload = dict(payload or {})
         refused: list[dict] = []
 
@@ -1686,8 +1727,11 @@ class KGEngine:
                 payload["candidates"] = ordered
                 payload["divergence_advisory"] = advisory
             except Exception as e:  # noqa: BLE001 — the advisory layer must never break generation (I9)
+                # Scrub: the embedder-load failure can carry a HuggingFace cache path (~/.cache/...), and
+                # `note` is egress'd through _scrub_egress which does secrets/PII only, NOT path redaction
+                # (§1.9) — so route it through _scrub_error like the sibling notes above (review-fix).
                 payload["note"] = ((payload["note"] + "; ") if payload["note"] else "") + \
-                    f"divergence.dpp advisory ordering unavailable ({e}); donor ordering kept"
+                    f"divergence.dpp advisory ordering unavailable ({self._scrub_error(e)}); donor ordering kept"
         # Echo projection_degraded like the sibling reads so a caller can tell "no candidates because the
         # graph is genuinely empty" from "no candidates because projection failed/was contended"
         # (review: generative-reads-omit-degraded-flag). Scrubbed like the sibling reads: candidate
@@ -1716,6 +1760,13 @@ class KGEngine:
                 f"construction {construction!r} is empty — build it first with "
                 f"kg_write(..., construction={construction!r})")
         eng._ensure_projected()
+        # _ensure_projected never raises — a failed/contended projection sets _projection_degraded and
+        # leaves an EMPTY graph.json behind (_ensure_degraded_db). Surface that here so kg_generate
+        # degrades to `regroup` with a note, instead of silently cross-generating against an empty second
+        # graph the caller can't distinguish from a real one (review-fix: L2/server-4).
+        if eng._projection_degraded:
+            raise RuntimeError(
+                f"construction {construction!r} failed to project ({eng._projection_degraded})")
         path = eng.projector.graph_path
         if not path.exists():
             raise FileNotFoundError(f"construction {construction!r} failed to project a graph.json")

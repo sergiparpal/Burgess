@@ -116,7 +116,10 @@ def specificity(graph_data: dict, corpus: list[str], *, precomputed_betweenness:
     # reach node_link_graph and raise an opaque AttributeError on `data.get(...)`, escaping _main's
     # ValueError handler. The projector always passes precomputed_undirected, so this only guards the
     # standalone CLI (review-r7).
-    if precomputed_undirected is None and not isinstance(graph_data, dict):
+    if precomputed_undirected is None and not (isinstance(graph_data, dict) and "nodes" in graph_data):
+        # Also require the node-link keys, not just dict-ness: a dict WITHOUT `nodes` (e.g. {"foo": 1})
+        # passed the old isinstance-only guard and then raised KeyError: 'nodes' in node_link_graph, again
+        # escaping _main's (_LoadError, ValueError) handler with a raw traceback (review-fix: harness).
         raise ValueError("graph must be a node-link object (a JSON object with nodes/links)")
     G = precomputed_undirected if precomputed_undirected is not None else node_link_graph(graph_data).to_undirected()
     if G.number_of_nodes() < 3:

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 
-from kg_engine.boundary import MIN_EDGE_BUDGET, validate_payload
+from kg_engine.boundary import MIN_EDGE_BUDGET, MIN_NODE_BUDGET, validate_payload
 from kg_engine.model import (Disposition, Edge, EpistemicState, Node, edge_id,
                              node_from_markdown, node_to_markdown, span_verifies)
 from kg_engine.projector import Projector
@@ -42,14 +42,17 @@ def test_obsolete_state_is_stripped_on_write(pack):
     assert "forged-verdict-stripped" in e.reason
 
 
-# ---- node floods are capped the same way edge floods are ----
+# ---- node floods are capped the same way edge floods are (at the node lane's own floor) ----
 def test_node_flood_is_capped():
+    # The node lane has its OWN floor MIN_NODE_BUDGET (> the edge floor) so a small source doesn't cap
+    # the canon at 64 nodes and silently reject legitimate growth (review-fix: L15); the flood mechanism
+    # itself is unchanged — past the floor, extra nodes are still REJECTED rate-limited-flood.
     payload = {"nodes": [{"label": f"n{i}", "node_type": "compression"}
-                         for i in range(MIN_EDGE_BUDGET + 5)]}
+                         for i in range(MIN_NODE_BUDGET + 5)]}
     res = validate_payload(payload, source_text="x", pack=None)
     flooded = [r for r in res if r.kind == "node" and r.reason == "rate-limited-flood"]
     written = [r for r in res if r.kind == "node" and r.written]
-    assert len(written) == MIN_EDGE_BUDGET and len(flooded) == 5
+    assert len(written) == MIN_NODE_BUDGET and len(flooded) == 5
 
 
 # ---- Unicode NFC / zero-width: a verbatim span in another composition form still verifies ----

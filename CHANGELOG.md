@@ -22,6 +22,42 @@
 
 ### Fixed
 
+- **Correctness + robustness sweep from a second exhaustive review (review-r10).** 29 findings across the
+  engine and language layer, each pinned (`tests/test_review_r10.py`, key ones mutation-verified). Highlights:
+  - **High — a second construction no longer commits into the user's git history.** The `/kg-perturb`
+    construction sub-engine is rooted under the ephemeral `.kg/`, but `git rev-parse` walks *up* to the
+    parent repo, so `_commit_batch` was `git add`/`commit`-ing `.kg/constructions/<slug>/canon/*.md` into
+    the user's tracked history on any repo without `.kg/` gitignored. Construction sub-engines now build
+    with commits disabled (`Canon(git_enabled=False)`); the store is also **wiped fresh** on the first
+    materialization each session (and rebuilt when re-pointed at a different second source), making the
+    "session-ephemeral" contract real instead of silently merging a stale prior build.
+  - **Reconciler — an out-of-band demote of a `failed`/`rejected` edge to `unverified` no longer erases
+    §1.7 negative memory.** The verdict monopoly policed forged verdicts written *in*; it now also
+    **restores** a negative verdict edited *out* to `unverified` (no tool path produces `unverified`, and
+    the merge precedence makes failure states sticky, so the transition is anomalous).
+  - **Windows lease safety — canon's `_win_pid_alive` no longer over-reclaims a live lease.** It had
+    drifted from its hardened dirlock twin to a fail-*unsafe* form that read any transient `OpenProcess`
+    error as "process dead"; realigned to fail-safe (dead only on `ERROR_INVALID_PARAMETER`), plus the
+    matching host-less `_pid_probe` guard.
+  - **Section splitter is fenced-code aware** — a `## ` line inside a ` ``` ` block is no longer parsed as
+    a heading (was corrupting the extraction unit + per-section IDF for any source with such a fence).
+  - **Projection durability + determinism** — the schema-heal now invalidates `meta` in the same
+    transaction as the table DROP/CREATE, so a crash in the repopulation window leaves `is_stale()` True
+    instead of serving a committed-empty "fresh" index; and `graph.json` node/link order is now a stable
+    sort of content keys, so incremental rowid churn can't make a byte-identical canon emit a
+    differently-ordered graph.
+  - **§1.7 consistency** — `shortest_path` and `_live_subgraph` now both exclude `failed`/`rejected` (and
+    `_live_subgraph` also `obsolete`), so a refuted/superseded edge can neither carry a live path nor
+    confer centrality while being invisible as an answer.
+  - Plus: egress-scrub the `divergence.dpp` advisory failure note (a HuggingFace cache path could leak);
+    a MISSING continuous descriptor value bins to the neutral **middle**, not the far-fetched extreme, so
+    the new `feasibility` coverage guarantee holds when a descriptor omits it; the node flood lane gets its
+    own higher floor so a small source no longer silently caps the canon at 64 nodes; `query_graph` floats
+    bare materialized pins to the front of the grounding queue; `source=` without `construction=` is
+    refused rather than dropped; the `kg-grounder` is granted `kg_write` so the Stage 0b span-relocation
+    remedy is executable; the `/kg-ground` stop-gate consults unverified **nodes**, not just the edges-only
+    count; and several smaller CLI / cross-platform / resource-cleanup hardenings.
+
 - **`graph.html` no longer lets falsified edges fake a connected graph.** `failed`/`rejected` edges are
   still **drawn** (§1.7 — negative memory is never pruned), but they no longer exert any force in the
   force-directed layout, so a refuted relation can no longer spring its two endpoints together and give
