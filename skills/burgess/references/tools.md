@@ -73,12 +73,18 @@ local canon.
 For the no-PII demo source (`examples/source.md`), `kg_scrub` is a **no-op**: `redactions: 0`,
 `categories: []`, and `scrubbed` equals the source verbatim.
 
-### 1.3 `mcp__plugin_burgess_burgess__kg_write(payload: dict, idempotency_key: str | None = None)`
+### 1.3 `mcp__plugin_burgess_burgess__kg_write(payload: dict, idempotency_key: str | None = None, construction: str | None = None, source: str | None = None)`
 
 The boundary (§1.5). Validates an extraction payload, writes ACCEPTED/DEMOTED nodes & edges to the canon,
 quarantines or rejects the rest. `payload` is the write contract (see `references/contract.md` / the shared
 contract): `{nodes:[…], edges:[…], complete:true}`. **`complete` MUST be `true`** or the whole payload is
 REJECTED as `truncated-payload`.
+
+`construction` (optional) routes this SAME key-free, span-verified write to a separately-named **second
+construction**'s alternate canon under `<project>/.kg/constructions/<slug>/` instead of the primary canon —
+the in-session second construction `/kg-perturb` cross-generates against (§9/§15, `kg_generate`'s
+`second_construction`). `source` names the second source document so spans verify against IT. Omit both for
+the normal primary-canon write (byte-for-byte unchanged).
 
 ```json
 {
@@ -368,14 +374,16 @@ The four tools below are the *offensive* half (the inversion: **generate offensi
 **hypothesized** lane only — they can never set a verdict or forge a text anchor. A candidate becomes grounded
 knowledge solely when `kg_ground` (§1.4) promotes it with support.
 
-### 1.12 `mcp__plugin_burgess_burgess__kg_propose(payload)`
+### 1.12 `mcp__plugin_burgess_burgess__kg_propose(payload, construction=None, source=None)`
 
 The **hypothesized write lane** (PLAN Stage 1). A thin, explicit alias over `kg_write` that forces every item
 to `provenance=hypothesized` and **REFUSES** any item arriving with a text-claim provenance
 (`span-present`/`inferred`) with reason `propose-lane-text-claim` — text claims belong on `kg_write`. Accepted
 items transit the SAME `validate_payload`, so the hypothesized-lane rules apply (no span required; forged
 verdicts demoted; failure-collapse `QUARANTINED/collapses-into-known-failure`; pack vocabulary enforced;
-`authored_by=deterministic` **preserved** here, `human` demoted to `agent`).
+`authored_by=deterministic` **preserved** here, `human` demoted to `agent`). `construction`/`source` route the
+proposal to a named second construction's alternate canon exactly like `kg_write` (§9/§15); omit both for the
+primary canon.
 
 Returns the `kg_write` shape plus two fields:
 
@@ -388,7 +396,7 @@ Returns the `kg_write` shape plus two fields:
 `refused_text_claims` counts the call-site `propose-lane-text-claim` refusals (folded into `details[]` and the
 `REJECTED` count).
 
-### 1.13 `mcp__plugin_burgess_burgess__kg_generate(mechanism="bridge", k=10, second_graph=None, dpp=None)`
+### 1.13 `mcp__plugin_burgess_burgess__kg_generate(mechanism="bridge", k=10, second_graph=None, dpp=None, second_construction=None)`
 
 The **discovery engine** (PLAN Stage 3). **READ-ONLY** — projects if stale, reads precomputed ranks O(1),
 dispatches to the chosen mechanism, and returns ranked candidates. It never writes; `/kg-generate` routes the
@@ -399,8 +407,14 @@ candidates through `kg_propose`.
   constructions) | `periphery` (§5 low-degree sources → max-connectability anchor; the periphery the
   hub-seeking mechanisms ignore), or `all`/`default`.
 - `k: int = 10` — max candidates returned (ranked).
-- `second_graph: str | None` — path to a second construction's `graph.json` for `ensemble`; without one,
-  `ensemble`/`all` **degrades to `regroup`** and says so in `note` (run `/kg-perturb` to supply one).
+- `second_graph: str | None` — path to a **pre-built** second construction's `graph.json` for `ensemble`
+  (the §11 escape hatch). Without a second construction, `ensemble`/`all` **degrades to `regroup`** and says
+  so in `note` (run `/kg-perturb` to supply one).
+- `second_construction: str | None` — the **name** of an in-session second construction built key-free via
+  `kg_write(..., construction=<name>)`. The engine projects its alternate canon
+  (`<project>/.kg/constructions/<slug>/`) here and cross-generates — no API key, no `backend` extra. Takes
+  effect only when `second_graph` is not given (an explicit path wins); an absent/empty construction degrades
+  to `regroup` with a `note`. This is what `/kg-perturb` uses for its in-session exo move (§9/§15).
 - `dpp: bool | None = None` — the **advisory-DPP presentation** (I5). `None` falls back to the pack's
   `divergence.dpp` (default **off**). When ON and >1 candidate came back, the SAME candidate set is
   reordered by hybrid-descriptor DPP — one semantic axis (batch k-NN novelty over candidate embeddings)

@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`/kg-perturb` now builds its second construction key-free, in-session.** The exo "attack coverage"
+  move needs a *second graph construction* to cross-generate against, and the only builder was the
+  headless backend (`python -m kg_engine.backend extract`) — which requires the `anthropic` SDK **and**
+  `ANTHROPIC_API_KEY`, so `/kg-perturb` was the one command that could not run in a stock install (it
+  silently degraded to an internal `regroup`). The write path now accepts an optional
+  `construction` name (`kg_write`/`kg_propose`) that routes the SAME span-verified boundary to a
+  separately-named alternate canon under `<project>/.kg/constructions/<slug>/` (mirroring the
+  `.kg/diverge/<brief>/` per-name store rule), so a `kg-extractor` subagent builds the second
+  construction with **no API key** — the session does the language work, the engine only validates +
+  stores (§2.2). `kg_generate` gains `second_construction=<name>`, which projects that alternate canon
+  in-session and cross-generates; the pre-built `second_graph` path stays as the escape hatch. The
+  primary-canon default path (`construction=None`) is byte-for-byte unchanged, and the headless backend
+  is kept for out-of-session / CI builds. The old, non-functional "in-session alternative" note in the
+  command (point `/kg-build` at a second `KG_PROJECT_DIR` — impossible, the running canon is fixed at
+  startup) is replaced with the real flow. Pinned in `tests/test_perturb_second_construction.py`.
+
 ## 0.2.6 — 2026-07-07
 
 Patch release. A broad correctness/robustness sweep from an exhaustive codebase review — two

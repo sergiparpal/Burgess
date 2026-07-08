@@ -198,7 +198,12 @@ persisting: the scrub protects egress; the canon stores the original.
 5. **transplant** — import a hub's dominant relation pattern into the community with the highest
    absorption capacity.
 6. **ensemble** — bridges present in one construction's structure but not a second's (from
-   `/kg-perturb`); degrades to `regroup` without a second graph, and says so.
+   `/kg-perturb`); degrades to `regroup` without a second graph, and says so. The second construction
+   is built **key-free, in-session**: `kg_write(..., construction=<name>, source=<second source>)`
+   routes the same span-verified boundary to a separately-named alternate canon under
+   `<project>/.kg/constructions/<slug>/`, and `kg_generate(second_construction=<name>)` (or a pre-built
+   `second_graph` path) projects + cross-generates against it — no API key, no `backend` extra. The
+   headless `backend.py` stays available for out-of-session / CI builds.
 7. **periphery** — low-degree sources get a `bridges` edge to their max-connectability anchor —
    the periphery the hub-seeking mechanisms ignore.
 
@@ -370,6 +375,7 @@ and bare `/.venv` sentinels.
   .kg-ground-audit.jsonl(.ckpt) verdict audit ledger (gitignored engine state)
   .kg-reconcile-state.json      reconciler cache (gitignored)
   .kg/diverge/<brief>/          divergence state (durable memory + ephemeral session/)
+  .kg/constructions/<slug>/     /kg-perturb second construction (alt canon/ + derived/; ephemeral)
 <data dir>/                     $KG_DATA (or <project>/.kg-data)
   derived/                      graph.json, index.sqlite, generations.json, graph.html, GRAPH_REPORT.md
   .venv/                        provisioned engine venv

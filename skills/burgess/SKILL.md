@@ -81,7 +81,7 @@ afterward. The portico moved from the door of imagination to after generation.
 | `/kg-build` | `kg-extractor` | `kg_write` |
 | `/kg-ground` | `kg-grounder`, `kg-adversarial-grounder` | `kg_ground`, `query_graph`, `kg_write` |
 | `/kg-generate` | `kg-generator` | `kg_generate`, `kg_propose`, `kg_operate`, `kg_absorption`, `kg_context` |
-| `/kg-perturb` | `kg-generator` | `kg_generate` (ensemble), `kg_propose` |
+| `/kg-perturb` | `kg-extractor` (builds the second construction, key-free), `kg-generator` | `kg_write` (`construction=`), `kg_generate` (ensemble, `second_construction=`), `kg_propose` |
 | `/kg-query` | (none; direct reads) | `query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_explain_path`, `kg_context` |
 | `/kg-view` | (none; direct render) | `kg_export` |
 | `/kg-eval` | `kg-annotator` | `f4_probe.py`, `kg_engine.harness`, `query_graph` |

@@ -118,6 +118,24 @@ def _scrub_error_text(msg, *, sensitivity: str = "medium") -> str:
         pass
     return text
 
+
+# Filesystem-safe slug for a NAMED alternate canon — the /kg-perturb "second construction" (§9/§15).
+# Mirrors divergence/state._path_slug's collision-safe rule (a clean ASCII name round-trips unchanged;
+# a lossy slug gets a short hash suffix so two distinct names can never share one dir), but is
+# REIMPLEMENTED here rather than imported: the write/verdict path must stay import-firewalled from
+# kg_engine.divergence (I3, firewall-tested), even lazily. `construction=None` (every existing caller)
+# never reaches this, so a normal write still loads zero divergence code (test_i3_runtime_...).
+_CONSTRUCTION_SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _construction_slug(name: str, fallback: str = "construction") -> str:
+    raw = str(name)
+    s = _CONSTRUCTION_SLUG_RE.sub("-", raw.strip()).strip("-_.")
+    if s == raw:
+        return s  # already a clean slug: unchanged
+    suffix = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
+    return f"{s or fallback}-{suffix}"
+
 # Precedence used when kg_merge dedups two edges that collide on one canonical id (§1.4/§1.7). The
 # winning epistemic_state is whichever ranks higher: failed/rejected are sticky NEGATIVE INFORMATION
 # (never pruned, §1.7) so they dominate any positive state; then grounded > unverified; `obsolete`
@@ -561,6 +579,11 @@ class KGEngine:
         # re-read exactly the notes that moved (ours OR a concurrent foreign writer's) so the cached
         # nodes always match the stored signature (review-low: partial-refresh stale-as-fresh).
         self._baseline_cache: "tuple[str, dict[str, Node], dict[str, tuple[int, int]]] | None" = None
+        # §9/§15 — NAMED alternate canons (the /kg-perturb "second construction"): lazily-built,
+        # cached sub-engines rooted under <project>/.kg/constructions/<slug>/, one per construction
+        # name. The PRIMARY canon (`construction=None` everywhere else) is never in this map, so the
+        # default write path is byte-for-byte unchanged. See _construction_engine.
+        self._constructions: "dict[str, KGEngine]" = {}
 
     # ---- source set (for span verification) — delegate to the shared resolver
     def source_set(self) -> SourceSet:
@@ -786,8 +809,47 @@ class KGEngine:
         digest = hashlib.sha1("\n".join(sorted(items)).encode("utf-8")).hexdigest()
         return f"rcpt_{digest[:16]}"
 
+    # ---- named alternate canons (the /kg-perturb "second construction", §9/§15) ----------
+    def _construction_root(self, construction: str) -> Path:
+        """On-disk root of a NAMED alternate canon — a SIBLING of the divergence base
+        (`<project>/.kg/diverge`) under the gitignored `.kg/` runtime tree (§12 open-q: keep the two
+        concerns in separate dirs). `.kg/` dies with the project's runtime state, so a second
+        construction is session-ephemeral by construction."""
+        return self.project_dir / ".kg" / "constructions" / _construction_slug(construction)
+
+    def _construction_engine(self, construction: str, source=None) -> "KGEngine":
+        """Lazily create + cache a `KGEngine` bound to a SEPARATELY-NAMED alternate canon under
+        `<project>/.kg/constructions/<slug>/` — the key-free, in-session "second construction" the
+        `/kg-perturb` exo move cross-generates against (§9/§15). The PRIMARY canon is never touched;
+        this mirrors `divergence/state.py`'s per-name store rule (perturb-fix finding 5).
+
+        The crux (perturb-fix §6.3): it reuses the FULL primary write path — boundary → canon →
+        projector — rooted at the alternate dir, so the session's OWN `kg-extractor` can populate a
+        second construction with **no API key** (the "LLM is the session" model, §2.2), and spans
+        verify against the construction's OWN `source`. `source` (the second source document) is set on
+        first build and refreshed when re-supplied; a later projection-only resolve may pass `None`
+        (spans are verified + stored at write time, never re-verified, and the projector degrades
+        cleanly with an empty corpus)."""
+        name = str(construction)
+        eng = self._constructions.get(name)
+        if eng is None:
+            root = self._construction_root(name)
+            root.mkdir(parents=True, exist_ok=True)
+            eng = KGEngine(root, source_path=source, pack_path=self.pack_path,
+                           sensitivity=self.sensitivity, metrics_mode=self.metrics_mode,
+                           max_edges_per_kb=self.max_edges_per_kb)
+            self._constructions[name] = eng
+        elif source is not None and eng.source_path != Path(source):
+            # a re-resolve that CHANGES the second source — never CLEARS it (None keeps the already-
+            # configured source, so a projection-only resolve doesn't blind span checks). Only re-point
+            # on an actual change, so a per-section build wave re-passing the same path doesn't drop the
+            # resolver memo every call.
+            eng.source_path = source
+        return eng
+
     def kg_write(self, payload: dict, *, message: str = "kg_write", existing_nodes=None,
-                 idempotency_key: str | None = None) -> dict:
+                 idempotency_key: str | None = None, construction: str | None = None,
+                 source=None) -> dict:
         """Validate an extraction payload at the boundary and write accepted/demoted items.
 
         `existing_nodes` is the canon baseline used for dedup + rate-limit seeding; it defaults to the
@@ -804,7 +866,19 @@ class KGEngine:
         contract violation), the new write is NOT silently dropped: it is processed normally and re-caches
         the key (a warning is logged). Validation is never weakened: a mismatching/first-seen key validates
         and writes normally. Idempotency is also intrinsic without a key — kg_write dedups by canonical id,
-        so a re-send creates no duplicates regardless (§1.4)."""
+        so a re-send creates no duplicates regardless (§1.4).
+
+        **Second construction (§9/§15).** `construction` (a name) routes this SAME key-free, span-verified
+        write to a separately-named alternate canon (`_construction_engine`) instead of the primary one,
+        and `source` names the second source document the spans are verified against. This is how
+        `/kg-perturb` builds its exo "second construction" in-session with no API key. `construction=None`
+        (every other caller) is the unchanged primary-canon path."""
+        if construction:
+            # Route to the named alternate canon's own engine — full boundary → canon → projector,
+            # rooted elsewhere. The sub-engine computes its own baseline (never the primary's
+            # existing_nodes) and uses its own idempotency cache.
+            return self._construction_engine(construction, source).kg_write(
+                payload, message=message, idempotency_key=idempotency_key)
         receipt = self._payload_receipt(payload)
         if idempotency_key:
             cached = self._write_cache.get(idempotency_key)
@@ -884,7 +958,8 @@ class KGEngine:
                 self._write_cache.popitem(last=False)
         return out
 
-    def kg_propose(self, payload: dict, *, message: str = "kg_propose") -> dict:
+    def kg_propose(self, payload: dict, *, message: str = "kg_propose",
+                   construction: str | None = None, source=None) -> dict:
         """Write hypothesized candidates through the boundary (PLAN Stage 1: the propose lane).
 
         A thin, explicit alias over `kg_write` that keeps the two write lanes legible at the call site:
@@ -893,7 +968,13 @@ class KGEngine:
         rather than silently re-lanned — text claims belong on `kg_write`, proposals belong here. The
         accepted items then transit the SAME boundary (`validate_payload`), so the hypothesized-lane rules
         (no span required, forged verdicts demoted, failure-collapse quarantined, pack vocabulary enforced)
-        apply uniformly."""
+        apply uniformly.
+
+        `construction`/`source` route the propose lane to a named alternate canon exactly like `kg_write`
+        (§9/§15), for writing hypothesized edges into a second construction; `construction=None` is the
+        unchanged primary-canon path."""
+        if construction:
+            return self._construction_engine(construction, source).kg_propose(payload, message=message)
         payload = dict(payload or {})
         refused: list[dict] = []
 
@@ -1550,7 +1631,7 @@ class KGEngine:
         return {e.id for e in self.canon.all_edges() if e.epistemic_state in FAILURE_STATES}
 
     def kg_generate(self, mechanism: str = "bridge", k: int = 10, second_graph: str | None = None,
-                    dpp: bool | None = None) -> dict:
+                    dpp: bool | None = None, second_construction: str | None = None) -> dict:
         """Generate hypothesized candidates from the derived graph (PLAN Stage 3 — the generative
         engine). Projects if stale, reads precomputed ranks O(1), dispatches to the chosen mechanism(s)
         (`bridge|seed|compression|regroup|transplant|ensemble`, or `all`/`default`), and returns ranked
@@ -1569,7 +1650,17 @@ class KGEngine:
         failures = self._failure_ids(G)
         gate_on = int(next((G.nodes[n].get("gate_on", 0) for n in G.nodes()), 0) or 0)  # `or 0`: tolerate gate_on=None
         G2, note = None, ""
-        if second_graph:
+        # §9/§15: a NAMED in-session second construction — project its alternate canon to a graph.json
+        # and cross against it. Key-free (the session's kg-extractor built it via kg_write(construction=…)).
+        # An explicit `second_graph` PATH (the pre-built escape hatch, §11) takes precedence.
+        if second_construction and not second_graph:
+            try:
+                second_graph = str(self._project_construction(second_construction))
+            except Exception as e:  # noqa: BLE001 — an unbuilt/failed construction degrades to regroup, never crashes
+                # Scrubbed for the same §1.9 reason as the load failure below (the message can name a path).
+                note = (f"second_construction could not be built ({self._scrub_error(e)}); "
+                        "ensemble degraded to regroup")
+        if second_graph and not note:
             try:
                 G2 = self._second_graph(second_graph)
             except Exception as e:  # noqa: BLE001 — a bad second graph degrades, never crashes
@@ -1607,6 +1698,28 @@ class KGEngine:
         """Load a SECOND construction's graph.json into a NetworkX graph (raises on failure)."""
         from .generate import load_second_graph
         return load_second_graph(path)
+
+    def _project_construction(self, construction: str) -> Path:
+        """Project a NAMED second construction's alternate canon to its own `derived/graph.json` and
+        return that path — the in-session, key-free `second_graph` source for `kg_generate(ensemble)`
+        (§9/§15). The construction must have been BUILT first via `kg_write(..., construction=<name>)`;
+        an absent or empty construction raises (kg_generate catches it and degrades to `regroup`, so a
+        typo or a not-yet-built name never silently cross-generates against an empty graph)."""
+        root = self._construction_root(construction)
+        if not root.exists():
+            raise FileNotFoundError(
+                f"construction {construction!r} does not exist — build it first with "
+                f"kg_write(..., construction={construction!r})")
+        eng = self._construction_engine(construction)
+        if not eng.canon.note_paths():
+            raise ValueError(
+                f"construction {construction!r} is empty — build it first with "
+                f"kg_write(..., construction={construction!r})")
+        eng._ensure_projected()
+        path = eng.projector.graph_path
+        if not path.exists():
+            raise FileNotFoundError(f"construction {construction!r} failed to project a graph.json")
+        return path
 
     def kg_ensemble_graph(self, path: str) -> dict:
         """Load and summarise a SECOND construction's graph.json (PLAN Stage 7 — the §9/§15 ensemble /
@@ -2212,22 +2325,33 @@ def _register(mcp, engine: KGEngine) -> None:
 
     @mcp.tool()
     @_tool_result
-    def kg_write(payload: dict, idempotency_key: str | None = None) -> dict:
+    def kg_write(payload: dict, idempotency_key: str | None = None,
+                 construction: str | None = None, source: str | None = None) -> dict:
         """Validate an extraction payload at the boundary and write accepted/demoted nodes & edges. The
         response carries a deterministic `receipt` (a hash of the payload's target ids); pass an
         `idempotency_key` to make a retry of a write whose transport response was lost a TRUE no-op that
         replays the identical receipt + dispositions (`idempotent_replay: True`) instead of a second pass.
-        Without a key the write is still idempotent by canonical id — a re-send creates no duplicates."""
-        return engine.kg_write(payload, idempotency_key=idempotency_key)
+        Without a key the write is still idempotent by canonical id — a re-send creates no duplicates.
+
+        `construction` (optional) routes this SAME key-free, span-verified write to a separately-named
+        second construction's alternate canon under `<project>/.kg/constructions/<slug>/` instead of the
+        primary canon — the in-session "second construction" `/kg-perturb` cross-generates against
+        (§9/§15). `source` names the second source document so spans verify against IT. Omit both for the
+        normal primary-canon write."""
+        return engine.kg_write(payload, idempotency_key=idempotency_key,
+                               construction=construction, source=source)
 
     @mcp.tool()
     @_tool_result
-    def kg_propose(payload: dict) -> dict:
+    def kg_propose(payload: dict, construction: str | None = None,
+                   source: str | None = None) -> dict:
         """Propose hypothesized candidates (PLAN Stage 1: the propose lane). Forces every item to
         provenance=hypothesized (a discovery-mechanism proposal, no span needed) and REFUSES any
         span-present/inferred text claim with reason `propose-lane-text-claim` — text claims belong on
-        kg_write. Candidates land `unverified`; only kg_ground (with support) can ever promote them."""
-        return engine.kg_propose(payload)
+        kg_write. Candidates land `unverified`; only kg_ground (with support) can ever promote them.
+        `construction`/`source` route the proposal to a named second construction's alternate canon
+        exactly like kg_write (§9/§15); omit both for the primary canon."""
+        return engine.kg_propose(payload, construction=construction, source=source)
 
     @mcp.tool()
     @_tool_result
@@ -2283,15 +2407,20 @@ def _register(mcp, engine: KGEngine) -> None:
     @mcp.tool()
     @_tool_result
     def kg_generate(mechanism: str = "bridge", k: int = 10, second_graph: str | None = None,
-                    dpp: bool | None = None) -> dict:
+                    dpp: bool | None = None, second_construction: str | None = None) -> dict:
         """Generate hypothesized idea candidates from the graph's structure (PLAN Stage 3). Mechanisms:
         bridge (§2/§4), seed (§3 residual), compression (§7 new nodes), regroup (§8), transplant (§5),
         ensemble (§9) — or "all"/"default". READ-ONLY: candidates are proposals (provenance=hypothesized,
         no span); route them through kg_propose. Generate offensively; kg_ground judges later.
-        `dpp` (FUSION Stage 5; default = the pack's `divergence.dpp` flag, shipped OFF) reorders the
-        SAME candidate set by hybrid-descriptor DPP and adds a `divergence_advisory` block with bins,
-        semantic novelty and cliché-hub distances — advisory presentation only, verdict-invariant (I5)."""
-        return engine.kg_generate(mechanism=mechanism, k=k, second_graph=second_graph, dpp=dpp)
+        For the `ensemble` exo move, supply EITHER `second_construction` (the NAME of an in-session
+        second construction built via kg_write(..., construction=…) — projected here, key-free) OR
+        `second_graph` (a path to a pre-built graph.json); with neither, ensemble degrades to `regroup`
+        and says so. `dpp` (FUSION Stage 5; default = the pack's `divergence.dpp` flag, shipped OFF)
+        reorders the SAME candidate set by hybrid-descriptor DPP and adds a `divergence_advisory` block
+        with bins, semantic novelty and cliché-hub distances — advisory presentation only,
+        verdict-invariant (I5)."""
+        return engine.kg_generate(mechanism=mechanism, k=k, second_graph=second_graph, dpp=dpp,
+                                  second_construction=second_construction)
 
     @mcp.tool()
     @_tool_result

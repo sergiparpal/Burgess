@@ -27,36 +27,77 @@ in place (a re-partition), which degrades to `regroup`.
 Call `mcp__plugin_burgess_burgess__kg_context(budget=2000)`. If empty, tell the user to run
 `/kg-build` → `/kg-ground` (and optionally `/kg-generate`) first, and stop.
 
-## Step 1 — obtain the SECOND construction (a second graph.json)
+## Step 1 — obtain the SECOND construction (KEY-FREE, in-session)
 
-Resolve the runner once (dev vs runtime, per the contract), then produce a second `graph.json`:
+The second construction is built **in-session by a `kg-extractor` subagent** through the same span-verified
+`kg_write` boundary `/kg-build` uses — just routed to a **separately-named alternate canon** under
+`<project>/.kg/constructions/<slug>/`. **No `ANTHROPIC_API_KEY` and no `backend` extra are needed** — the
+session does the language work, the engine only validates + stores (§2.2, the "LLM is the session" model).
+
+Classify `$1` (a tiny Bash step — no runner/venv needed):
 
 ```bash
-PY=/home/sergi/Burgess/.venv/bin/python          # or "${CLAUDE_PLUGIN_DATA}/.venv/bin/python"
-SCRIPTS=/home/sergi/Burgess/scripts               # or "${CLAUDE_PLUGIN_ROOT}/scripts"
 SECOND="$1"
+if [ -z "$SECOND" ]; then
+  echo "MODE=degrade"                       # no second source → ensemble degrades to regroup
+elif [ "${SECOND##*.}" = "json" ]; then
+  echo "MODE=graph"; echo "SECOND_GRAPH=$SECOND"   # a pre-built graph.json → use it directly (§11)
+else
+  # a second SOURCE document → derive a stable construction NAME from its basename
+  NAME=$(basename "$SECOND"); NAME="${NAME%.*}"
+  NAME=$(printf '%s' "$NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]\+/-/g; s/^[-_.]\+//; s/[-_.]\+$//')
+  [ -n "$NAME" ] || NAME="second"
+  echo "MODE=source"; echo "CONSTRUCTION=$NAME"; echo "SECOND_SOURCE=$SECOND"
+fi
 ```
 
-- **`$1` is already a `graph.json`** → use it directly as `SECOND_GRAPH="$1"`.
-- **`$1` is a second source document** → build it headlessly into a *separate* vault and project, which
-  writes its `derived/graph.json` (needs `ANTHROPIC_API_KEY`; the in-session alternative is to run
-  `/kg-build` against a second `KG_PROJECT_DIR` and reuse its derived graph):
-  ```bash
-  export KG_PROJECT_DIR="$(mktemp -d)"; export KG_SOURCE_PATH="$1"; export KG_PACK_PATH=pack/pack.yaml
-  PYTHONPATH="$SCRIPTS" "$PY" -m kg_engine.backend extract          # extract → boundary → canon → project
-  SECOND_GRAPH="$KG_PROJECT_DIR/.kg-data/derived/graph.json"
-  ```
-- **`$1` omitted / no API key** → skip the second construction; `kg_generate` will **degrade to `regroup`**
+- **`MODE=graph`** → skip to Step 2 with `second_graph="$SECOND_GRAPH"` (the pre-built escape hatch).
+- **`MODE=source`** → launch **kg-extractor** (Task) to build the named construction, then go to Step 2 with
+  `second_construction="$CONSTRUCTION"`. The extractor writes the second source's nodes/edges via
+  `kg_write(..., construction="$CONSTRUCTION", source="$SECOND_SOURCE")` — spans verified against the SECOND
+  source, landing in that construction's own canon, key-free.
+- **`MODE=degrade`** (`$1` omitted) → skip the second construction; `kg_generate` **degrades to `regroup`**
   (a re-partition of the current construction). Surface this as a one-line note and continue — never block.
 
-If a second graph was built, sanity-check it loaded (non-empty nodes/edges) before cross-generating.
+Exact Task invocation for `MODE=source` (substitute `$CONSTRUCTION` and `$SECOND_SOURCE`):
+
+```
+Task(
+  subagent_type: "kg-extractor",
+  description: "Build second construction",
+  prompt: """
+Build a SECOND CONSTRUCTION of a different source document into a NAMED alternate canon (NOT the primary
+graph). `Read` the whole file at path: $SECOND_SOURCE  (this is the direct-invocation whole-file path —
+read it off disk, then work section by section, one `##` section per payload).
+
+On EVERY mcp__plugin_burgess_burgess__kg_write call, pass these two extra arguments so the write is routed
+to the second construction (they are the whole point — without them you would overwrite the primary graph):
+  construction: "$CONSTRUCTION"
+  source: "$SECOND_SOURCE"
+Set each edge's `source_file` to the basename of $SECOND_SOURCE. Follow your full system contract: declared
+pack node_types/edge_types only; every non-deterministic edge carries a verbatim `span` that is a substring
+of the section text (§1.5); never set a verdict (epistemic_state stays `unverified`) and never authored_by
+`human`. Emit one `complete: true` payload per section and report the dispositions per section, then a final
+node/edge tally.
+"""
+)
+```
+
+After the extractor finishes, sanity-check the build landed (its reported ACCEPTED counts are non-zero). If
+it wrote **nothing**, tell the user the second source yielded no anchored structure and either fix the source
+or fall back to `MODE=degrade` — do not proceed on an empty construction (Step 2 would then degrade to
+`regroup` anyway, with a note saying so).
 
 ## Step 2 — cross-generate (ensemble §9)
 
-Call `mcp__plugin_burgess_burgess__kg_generate(mechanism="ensemble", second_graph="$SECOND_GRAPH", k=10)`.
-It returns hypothesized candidate bridges that are adjacent in the second construction but absent in ours
-(each rationale carries `perturbation=external`). With no second graph, the same call returns the `regroup`
-degrade (its `note` says so) — still useful, but internal, not coverage-attacking.
+- **`MODE=source`** → `mcp__plugin_burgess_burgess__kg_generate(mechanism="ensemble", second_construction="$CONSTRUCTION", k=10)`.
+  The engine projects the named construction's alternate canon in-session (key-free) and cross-generates.
+- **`MODE=graph`** → `mcp__plugin_burgess_burgess__kg_generate(mechanism="ensemble", second_graph="$SECOND_GRAPH", k=10)`.
+
+Either returns hypothesized candidate bridges that are adjacent in the second construction but absent in ours
+(each rationale carries `perturbation=external`). With no second construction (`MODE=degrade`, or a
+construction that built empty), the same call returns the `regroup` degrade (its `note` says so) — still
+useful, but internal, not coverage-attacking.
 
 ## Step 3 — phrase & write to the hypothesized lane (Task → kg-generator)
 
