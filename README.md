@@ -81,6 +81,8 @@ Plus everything the convergence side always did: `/kg-build`, `/kg-query`, `/kg-
 
 Every slash command, with its arguments. The everyday flow is **diverge → build → ground → generate → query → view**; `/kg-perturb`, `/kg-eval`, and `/kg-experiment` are the optional "going further" commands. Arguments in `<angle brackets>` are **required**; those in `[square brackets]` are **optional** and fall back to a sensible default.
 
+This table is the summary. The full **[command manual](docs/COMMANDS.md)** documents what every argument option means and gives worked examples for each case.
+
 | Command | What it does | The detail in brackets |
 | --- | --- | --- |
 | `/kg-diverge <brief> [domain-template] [reach]` | Diverge from a brief into a non-cliché slate; pin/discard in chat; optionally materialize the pins — no graph or source needed | **Required:** your creative brief. *Optional:* a domain template to steer the mechanisms; a `reach` dial — `conservative\|balanced\|wild` (default `balanced`) — capping how far out the slate goes in *degree*, never in *kind* |
