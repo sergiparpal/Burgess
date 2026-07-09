@@ -7,14 +7,28 @@ import pathlib
 import sys
 
 
+def _dequote(v: str) -> str:
+    """Mirror of ``envconfig._dequote``: peel matched surrounding quote pairs, repeatedly, so a
+    double-wrapped value collapses to the bare path. Each pass drops >=2 chars, so it terminates."""
+    while len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+        v = v[1:-1].strip()
+    return v
+
+
 def _clean(value: "str | None") -> str:
     """The ONE permitted local copy of the env-value cleaner: it runs BEFORE sys.path can reach
     kg_engine.envconfig (the rule's single home, review-r5), solely to read CLAUDE_PLUGIN_ROOT.
     Everything after the sys.path insert resolves through envconfig — keep this body in lockstep
-    with envconfig.clean."""
+    with envconfig.clean.
+
+    The dequote step is load-bearing for the mirror, and the ORDER matters: dequote first, THEN test the
+    ``${...}`` placeholder, so a quoted-unsubstituted ``"${VAR}"`` is recognised as a placeholder rather
+    than treated as a real path. envconfig.clean gained the dequote with the quoted-source_path fix; this
+    copy did not, and the parametrized guard test had no quoted rows, so the two drifted while a test
+    named `test_precontext_clean_mirrors_bootstrap` asserted they agreed (review-r11)."""
     if not value:
         return ""
-    v = value.strip()
+    v = _dequote(value.strip())
     if not v or v.startswith("${") or v in ("/.venv", "/venv"):
         return ""
     return v

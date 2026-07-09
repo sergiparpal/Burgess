@@ -514,6 +514,18 @@ def _load_precontext():
         ("/venv", ""),            # bare sentinel: empty ${VAR}/venv -> /venv
         ("/real/path", "/real/path"),
         ("  /real/path  ", "/real/path"),
+        # QUOTED rows (review-r11). Their absence is why this "mirror" test stayed green for a release
+        # while the two bodies disagreed: envconfig.clean gained _dequote with the quoted-source_path
+        # fix and precontext._clean did not. A mirror test with no row exercising the divergent branch
+        # asserts nothing.
+        ('"/real/path"', "/real/path"),          # a user who quoted the option value
+        ("'/real/path'", "/real/path"),          # single quotes peel too
+        ('""/real/path""', "/real/path"),        # double-wrapped: peel repeatedly
+        ('  "/real/path"  ', "/real/path"),      # strip outside, then peel
+        ('"${CLAUDE_PLUGIN_DATA}"', ""),         # dequote BEFORE the placeholder test, or this leaks
+        ('"/.venv"', ""),                        # ...and before the bare-sentinel test
+        ('"', '"'),                              # a lone quote is part of the path, not a pair
+        ('"/a"/b"', '/a"/b'),                    # only the symmetric OUTER pair peels; interior quote stays
     ],
 )
 def test_precontext_clean_mirrors_bootstrap(raw, expected):

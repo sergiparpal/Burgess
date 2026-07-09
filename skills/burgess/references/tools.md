@@ -300,6 +300,12 @@ When no fully-grounded path exists: `{"path": [], "edges": [], "leap": null, "gr
 "reason": "no fully-grounded path between <a> and <b>"}` — an honest absence (the concepts are joined only
 through unverified/hypothesized/refuted links, or not at all), never an exception.
 
+**At most 32 distinct nodes per call.** The grounded shortest-path closure costs one BFS per pair, so the
+work is quadratic in the number of concepts you pass. Beyond the cap the tool refuses in the same empty
+shape rather than wedging the engine: `{"path": [], "leap": null, "reason": "too many nodes: 80 (max 32)"}`.
+Duplicates are deduped before the cap is applied. If you want to relate more concepts than that, ask a
+narrower question — a 32-hop chain is already past what a person can read.
+
 ### 1.11 `mcp__plugin_burgess_burgess__kg_context(query=None, budget=2000)`
 
 The **grounding-aware, provenance-carrying, token-budgeted** context tool — the one to call before reasoning

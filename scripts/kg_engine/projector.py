@@ -25,7 +25,7 @@ from .canon import Canon, _git
 from .graphio import node_link_data
 from .harness import idf_seeds, node_specificity
 from .harness import specificity as _specificity_gate
-from .model import (Edge, EpistemicState, FAILURE_STATE_VALUES, Node, Provenance,
+from .model import (Edge, EpistemicState, FAILURE_STATE_VALUES, NON_LIVE_STATE_VALUES, Node, Provenance,
                     node_content_hash, normalize_text)
 from .sources import section_corpus
 
@@ -401,7 +401,10 @@ class Projector:
         # weight while being invisible as an answer — previously obsolete was left IN centrality only,
         # an undocumented inconsistency (review-fix: L14). Excluding only the edges keeps every node
         # present (an attacked hub whose edges are all refuted still ranks honestly at degree 0).
-        _excluded = FAILURE_STATE_VALUES | {EpistemicState.OBSOLETE.value}
+        # The set is single-homed in model.NON_LIVE_STATE_VALUES and shared with generate._live_undirected,
+        # which must exclude exactly the same edges or the generators walk a topology the ranks they read
+        # were never computed over (review-r11).
+        _excluded = NON_LIVE_STATE_VALUES
         live = nx.MultiDiGraph()
         live.add_nodes_from(G.nodes(data=True))
         live.add_edges_from((u, v, k, d) for u, v, k, d in G.edges(keys=True, data=True)
@@ -774,6 +777,7 @@ class Projector:
             return False  # no db -> do_full is already True via the exists() check
         try:
             con = sqlite3.connect(self.db_path)
+            con.execute("PRAGMA busy_timeout=5000")  # another session's schema-heal DDL is exclusive
             try:
                 cols = {r[1] for r in con.execute("PRAGMA table_info(nodes)")}
                 ecols = {r[1] for r in con.execute("PRAGMA table_info(edges)")}
@@ -1189,6 +1193,11 @@ class Projector:
     def _read_meta(self) -> dict:
         try:
             con = sqlite3.connect(self.db_path)
+            # _read_meta runs on EVERY read via is_stale(). Without this, a reader that lands inside
+            # another session's `BEGIN IMMEDIATE` schema heal gets `database is locked` immediately (WAL
+            # does not cover the exclusive DDL window), degrades to {} -> "stale" -> a spurious full
+            # rebuild that then contends on the lease. Wait instead of raising (review-r11).
+            con.execute("PRAGMA busy_timeout=5000")
         except sqlite3.Error:
             return {}
         try:
@@ -1253,6 +1262,7 @@ class Projector:
             return None
         try:
             con = sqlite3.connect(self.db_path)
+            con.execute("PRAGMA busy_timeout=5000")  # a locked read here forces a needless O(V*E) recompute
             try:
                 return {r[0]: r[1] for r in con.execute("SELECT id,betweenness FROM nodes")}
             finally:
@@ -1592,10 +1602,17 @@ def _agenda_from_rows(nodes: list, edges: list, *, limit: int = 5) -> dict:
             # and a small cluster whose nodes are each already a gap (e.g. a freshly-proposed
             # hypothesized-only pair) are NOT re-surfaced here (one detector per node). Fire only when
             # >=2 members remain genuinely uncovered.
-            fresh = [m for m in nodes if m.get("community") == c and m["id"] not in emitted]
+            # id ASC before choosing anything from `fresh`: `nodes` arrives from an unordered
+            # `SELECT * FROM nodes` (and INSERT OR REPLACE reassigns rowids on incremental churn), so a
+            # degree tie would make `max` pick a different representative — hence a different question
+            # string, rank_key and focus order — between a full rebuild and an incremental reproject of
+            # the byte-identical canon. The outer `gaps` list already takes this precaution below; the
+            # item internals did not (review-r11).
+            fresh = sorted((m for m in nodes if m.get("community") == c and m["id"] not in emitted),
+                           key=lambda m: m["id"])
             if len(fresh) < 2:
                 continue
-            rep = max(fresh, key=lambda m: m.get("degree") or 0)
+            rep = max(fresh, key=lambda m: m.get("degree") or 0)  # first maximal on a tie == lowest id
             labels = ", ".join((m.get("label") or m["id"]) for m in fresh[:_STALE_PREVIEW_LABELS])
             more = "…" if len(fresh) > _STALE_PREVIEW_LABELS else ""
             gaps.append((rank_key(rep), rep["id"], {
@@ -1901,10 +1918,9 @@ class DerivedReader:
             # ...and never a refuted/obsolete edge: failed/rejected are negative information (surfaced
             # only via falsification_counters, never as an answer) and obsolete is superseded content,
             # so the answer lane must exclude them. falsification_counters above still counts them.
-            # the excluded set = the failure vocabulary (single-homed in model, review-r5) plus the
-            # superseded lifecycle state; sorted for a deterministic SQL text.
-            excluded = ",".join(repr(s) for s in
-                                sorted(FAILURE_STATE_VALUES | {EpistemicState.OBSOLETE.value}))
+            # the excluded set = the non-live vocabulary (failures + the superseded lifecycle state),
+            # single-homed in model.NON_LIVE_STATE_VALUES; sorted for a deterministic SQL text.
+            excluded = ",".join(repr(s) for s in sorted(NON_LIVE_STATE_VALUES))
             iwhere = f"provenance != 'hypothesized' AND epistemic_state NOT IN ({excluded})"
             iargs = list(term_args)
             if term_clause:

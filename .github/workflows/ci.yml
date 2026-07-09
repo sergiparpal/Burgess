@@ -17,8 +17,13 @@ jobs:
         # (Windows / macOS, see scripts/bootstrap.py) is exercised on a single pinned 3.12 to
         # bound matrix cost. The install/test commands below are OS-agnostic (`python -m pip`,
         # `pytest`), so no per-OS shell branching is needed.
+        #
+        # Cover BOTH edges of the supported range, not just the floor. `requires-python = ">=3.10"`
+        # has no upper bound, so users run whatever is current — and the field crash reports this
+        # project has taken (the kg_context loader-lock hang) came from a Python NEWER than anything
+        # CI tested. 3.13 and 3.14 pass today; without a gate that stays true only by luck (review-r11).
         os: [ubuntu-latest]
-        python-version: ["3.10", "3.12"]
+        python-version: ["3.10", "3.12", "3.13", "3.14"]
         include:
           - os: windows-latest
             python-version: "3.12"

@@ -27,7 +27,7 @@ ordering and reports why).
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Any
 
 # The brief-level cliché map enumerates ~6 obvious answers; the graph-level map
 # mirrors that size with the top grounded hubs (the graph's "center").
@@ -47,16 +47,16 @@ def pack_dpp_default(pack) -> bool:
         return False
 
 
-def _candidate_text(c: Dict[str, Any]) -> str:
+def _candidate_text(c: dict[str, Any]) -> str:
     if c.get("kind") == "node" or c.get("label"):
         return f"{c.get('label', '')} ({c.get('mechanism', '')})".strip()
     return (f"{c.get('source', '')} {c.get('relation', '')} {c.get('target', '')} "
             f"({c.get('mechanism', '')})").strip()
 
 
-def _grounded_hubs(G, k: int) -> List[Tuple[str, str]]:
+def _grounded_hubs(G, k: int) -> list[tuple[str, str]]:
     """Top-k nodes by GROUNDED-degree (fallback: total degree) — the graph's center."""
-    counts: Dict[str, int] = {}
+    counts: dict[str, int] = {}
     for u, v, data in G.edges(data=True):
         if (data or {}).get("epistemic_state") == "grounded":
             counts[u] = counts.get(u, 0) + 1
@@ -67,7 +67,7 @@ def _grounded_hubs(G, k: int) -> List[Tuple[str, str]]:
     return [(n, str(G.nodes[n].get("label", n))) for n, _ in top]
 
 
-def _structural_descriptor(c: Dict[str, Any], G, undirected, dist_cache: Dict) -> Dict[str, Any]:
+def _structural_descriptor(c: dict[str, Any], G, undirected, dist_cache: dict) -> dict[str, Any]:
     """Cheap graph-structural axes, all read straight off the derived graph."""
     if c.get("kind") == "node" or not c.get("source"):
         return {"community": "node", "graph_distance": "node", "grounded_mix": 0.0}
@@ -107,12 +107,12 @@ def _structural_descriptor(c: Dict[str, Any], G, undirected, dist_cache: Dict) -
 
 
 def order_candidates(
-    candidates: List[Dict[str, Any]],
+    candidates: list[dict[str, Any]],
     G,
     seed: int = 0,
     top_hubs: int = DEFAULT_TOP_HUBS,
     pool_cap: int = DEFAULT_POOL_CAP,
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Return (same candidates diversely reordered, advisory block).
 
     The advisory block carries the hybrid bins, per-candidate semantic novelty
@@ -164,7 +164,7 @@ def order_candidates(
             {"name": "grounded_mix", "type": "continuous", "range": [0.0, 1.0]},
         ],
     })
-    bins: List[str] = []
+    bins: list[str] = []
     for i, c in enumerate(pool):
         descriptor = {"semantic_novelty": float(semantic[i]),
                       **_structural_descriptor(c, G, undirected, dist_cache)}

@@ -129,8 +129,16 @@ Reasons:
   the canon's incoming-wins merge can't reset the verdict to a fresh `unverified` edge on an idempotent
   `/kg-build` re-run (§1.8).
 
+**Nodes have no `collapses-into-*` quarantine** — a re-emitted node id is deduped and ACCEPTED. But a node
+that already carries a verdict (`grounded`/`rejected`/`failed`/`obsolete`) keeps its **body** on that merge:
+a `Node` has no `span` field, so `kg_ground` restates a promoted node's support *in the body*
+(`grounding span: …` / `citation: …`), and an incoming body would otherwise blank the evidence the verdict
+rests on. Label and `node_type` still update. To revise a grounded node's prose, edit the canon note.
+
 The reconciler also **re-quarantines** any out-of-band `epistemic_state` transition (a forged verdict
-edited straight into canon, bypassing `kg_ground`).
+edited straight into canon, bypassing `kg_ground`). When the edit forges *over* a `rejected`/`failed`
+state, the reconciler restores that failure rather than resetting to `unverified` — an out-of-band edit may
+never be the thing that ends a falsification (§1.7).
 
 ### REJECTED — not written
 | reason                | retryable | meaning |

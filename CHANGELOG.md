@@ -1,5 +1,113 @@
 # Changelog
 
+## Unreleased
+
+Correctness, robustness and performance sweep from an eleventh exhaustive review (**review-r11**). Two
+HIGH findings, both §1.7 breaches reachable through ordinary tool use, and both with a working guard on
+the sibling code path — which is what made them findable. No change to the 27-tool MCP surface. Pinned by
+`tests/test_review_r11.py`, every test of which was mutation-verified to fail on the pre-fix tree.
+
+### Fixed
+
+- **HIGH — permanent negative memory could be laundered away.** `reconciler._restore_erased_negative`
+  only fired when the current state was `unverified`, so a canon edit taking a `rejected`/`failed` edge
+  *into* a groundable state (`rejected` → `grounded`) was detected as a forgery but reset to `unverified`
+  rather than restored. The edge then dropped out of `failure_ids`, so the write boundary stopped
+  quarantining re-proposals of the refuted claim — and since `unverified` became the new baseline, no
+  later sweep could recover it. `_requarantine_state` now restores the failure baseline the forge
+  overwrote. The two guards are the two halves of one rule: **an out-of-band edit may never be the thing
+  that ends a falsification.**
+- **HIGH — a grounded node's evidence was destroyed by a routine re-write.** A `Node` has no `span`
+  field, so `_promote_hypothesis_node` restates its support in the node *body*. The edge lane quarantines
+  a re-emit of a settled edge; the node lane had no such guard and simply overwrote the body, leaving
+  `epistemic_state=grounded, provenance=span-present` with no span anywhere — the exact state the design
+  exists to make unrepresentable. `canon._merge_into_existing` now refuses to let an incoming body blank a
+  verdict-bearing node's evidence, mirroring the edge guard.
+- **The divergence import firewall (I3) is now enforced in both directions, not just documented.** The
+  existing test policed only "the verdict path may not import `divergence`". The converse rested on
+  convention: a divergence module could `from ..canon import Canon` + `from ..model import EpistemicState`
+  and stamp a verdict straight into a canon note, with the entire suite green (verified by mutation).
+  `test_i3_divergence_cannot_reach_the_verdict_machinery` now polices the *capability* via an allowlist —
+  divergence may import the stdlib, its numeric deps, its own siblings, and the two capability-free leaves
+  `atomicio`/`envconfig`, nothing else in `kg_engine`. Without `model` there is no `EpistemicState` to
+  assign; without `canon`/`boundary`/`server` there is nothing to write one to. Lazy imports count. This
+  is what makes the verdict monopoly (I1) structurally true from the geometry side.
+- **`kg_status` bypassed the §1.9 egress scrub.** Its `coverage.sections[].title` is a `##` heading read
+  verbatim from the *unscrubbed* source, so a secret in a Markdown heading crossed the boundary intact —
+  the one read tool not routed through `_scrub_egress`.
+- **`kg_explain_path` could SIGKILL the engine.** Cost is quadratic in the caller-supplied `nodes` list
+  (a BFS per pair over the grounded closure), which is unbounded: 400 nodes took ~10s, 1500 exceeded the
+  300s `DEFAULT_HANDLER_TIMEOUT`, at which point the watchdog's `_hard_exit` kills the process. Capped at
+  `pathing.MAX_EXPLAIN_NODES` (32), refused before any graph work.
+- **A corrupt `consumed` value permanently disabled forge detection.** `_load_state` fails open on every
+  other corruption class, but a non-int inside the spend ledger raised `TypeError` in `_drain_key_ledger`
+  — before `_save_state` could heal the file, so every later sweep crashed too. Non-int values are now
+  dropped on load (forgetting a *spend* over-quarantines; it can never miss a forgery).
+- **`canonmerge` spuriously conflicted CRLF/BOM canon notes.** The edgeless/unparseable fast path handed
+  raw text to `git merge-file`, where a Windows-saved note differs from its LF twin on every line. Both
+  paths now normalize through the single-homed `model.normalize_note_text`.
+- **The generators walked a different topology than the ranks they read.** `generate._live_undirected`
+  excluded only the failure states while `projector._live_subgraph` also drops `obsolete` — while its own
+  docstring claimed the two mirrored. Both now share `model.NON_LIVE_STATE_VALUES`.
+- **`divergence._niche_slug` collapsed non-ASCII categorical values into one MAP-Elites niche.** Any value
+  whose characters all fell outside `[a-z0-9]` slugged to the literal `none`, so on a non-Latin brief (the
+  case the multilingual embedder exists to serve) two different ideas fought over one cell and
+  one-elite-per-niche evicted the loser. Lossy slugs now carry a hash, as the sibling `state._path_slug`
+  already did.
+- **A hung provisioning subprocess wedged the venv permanently.** `bootstrap.run`, `_soft_probe` and
+  `maybe_reconcile` had no timeout, while `_heartbeat_pulse` kept the provision lock fresh from another
+  thread — so the lock never aged out, no later session could reclaim it, and the venv never built. All
+  provisioning children are now bounded (`INSTALL_TIMEOUT_SECS` / `PROBE_TIMEOUT_SECS` /
+  `RECONCILE_TIMEOUT_SECS`), and a timeout takes the ordinary interrupted-build cleanup path.
+- `hooks/precontext.py:_clean` never received the `_dequote` fix its documented mirror `envconfig.clean`
+  got, and `test_precontext_clean_mirrors_bootstrap` had no quoted rows — so it asserted an agreement that
+  did not hold. Both fixed; the three implementations (engine, hook, and the `_engine_resolve.mjs` twin)
+  are now verified in lock-step.
+- The engine-written `.git/info/exclude` listed `.kg-ground-audit.jsonl` without a glob, leaving
+  `groundaudit`'s `.ckpt` spend-ledger sidecar untracked — so `git add -A` committed per-machine runtime
+  state into canon history.
+- `Edge.__post_init__` did not sanitize a non-finite `confidence_score`, so a hand-edited
+  `confidence_score: .nan` reached `json.dumps` and emitted a bare `NaN` literal, making `derived/graph.json`
+  invalid JSON (RFC 8259) for strict external consumers.
+- Three projector read helpers (`_schema_outdated`, `_read_meta`, `_read_prior_betweenness`) omitted
+  `PRAGMA busy_timeout`, so a reader landing inside another session's exclusive schema-heal window
+  degraded to a spurious full rebuild.
+- The `edgeless-communities` agenda item chose its representative from an unordered `SELECT`, so a degree
+  tie made a full rebuild and an incremental reproject of the byte-identical canon disagree.
+- `export._bridge_set` omitted the `degree` tiebreak that `kg_context`'s bridge SQL uses, despite a comment
+  claiming parity — a degree-differentiated tie straddling the top-N cutoff diverged between the two views.
+- `lightrag_arm`'s `_load_prompts` sat outside the try, so a mistyped `--prompts` produced a traceback
+  instead of the clean exit-3 the `kg-evaluator` subagent expects.
+- `launch_server.mjs` had no `unhandledRejection`/`uncaughtException` handler; on Node ≥ 15 a stray
+  rejection would silently take the supervisor — and the MCP server — down with nothing in `server.log`.
+- Four test doubles for `_atomic_write` had a fixed `(path, text)` signature and would have raised
+  `TypeError` where the test intended `OSError` — passing for the wrong reason.
+
+### Changed
+
+- **`/kg-operate`'s discovery mechanisms now claim the authorship they actually have.** The boundary has
+  always preserved `authored_by=deterministic` on the hypothesized lane "for a genuine discovery
+  mechanism", but no mechanism ever set it, so every engine-derived item was recorded as `agent` and the
+  axis carried less information than it promised. Structural edges are now `deterministic`; a node whose
+  `label`/`body` came from the caller stays `agent`.
+- CI now covers **both edges** of the supported Python range (3.10, 3.12, 3.13, 3.14). `requires-python`
+  has no upper bound and this project's field crash reports have come from interpreters newer than
+  anything CI tested.
+
+### Performance
+
+Measured on a synthetic canon; no behavioural change (the `/kg-generate` slate is byte-identical).
+
+- **`kg_generate("all")` on an 800-node graph: 5.7s → 1.6s.** `_is_failure` built two `edge_id`s — six
+  `slug()` calls — for every candidate pair in an O(n²) loop, even against an empty failure set (the common
+  case before any adversarial grounding). It now short-circuits, and `slug()` — the engine's hottest pure
+  function — is `lru_cache`d (2.2M hits at a 100% hit rate on that run).
+- **Idempotent canon re-writes parse each note once, not twice.** `_merge_into_existing` already held the
+  parsed on-disk node; it now returns its content hash instead of making `_write_batch` re-read and
+  re-parse the same file for the no-op guard.
+- **Batch canon writes fsync the canon directory once, not once per note** (802 fsyncs → 1 on a 400-node
+  batch). Per-file content durability is unchanged; only the redundant directory-entry fsync is hoisted.
+
 ## 0.3.0 — 2026-07-08
 
 Minor release. Feature-led: **tempered divergence** for `/kg-diverge` (a reach dial, a feasibility

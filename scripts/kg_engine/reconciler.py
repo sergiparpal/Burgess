@@ -103,12 +103,25 @@ class Reconciler:
         _atomic_write(self.state_path, json.dumps(state, indent=0))
 
     @staticmethod
-    def _coerce_subdict(state: dict, key: str) -> dict:
+    def _coerce_subdict(state: dict, key: str, *, int_values: bool = False) -> dict:
         """Read a state sub-dict that scan() mutates in place: `or {}` rescues a null value, the
         isinstance guard rescues a non-dict (e.g. a list) — both fail open to a fresh dict so a
-        hand-edited / truncated state can't crash scan() before _save_state heals it."""
+        hand-edited / truncated state can't crash scan() before _save_state heals it.
+
+        `int_values` additionally drops non-int VALUES, for the `consumed` spend ledger whose counts are
+        compared with `>` against the audit tallies. Without it a single string value raises TypeError
+        inside `_drain_key_ledger`/`_check_and_spend` — and because that fires before `_save_state`, the
+        corrupt file is never healed, so every later sweep crashes too and forge detection stays down
+        for good (review-r11). Dropping an entry only forgets a SPEND, which can over-strictly
+        re-quarantine but can never miss a forgery — the safe direction, and the same guard
+        `_recover_spend_ledger` already applies to checkpoint-recovered counts."""
         v = state.get(key) or {}
-        return v if isinstance(v, dict) else {}
+        if not isinstance(v, dict):
+            return {}
+        if int_values:
+            # bool is an int subclass but is never a legitimate count — exclude it explicitly.
+            return {k: c for k, c in v.items() if isinstance(c, int) and not isinstance(c, bool)}
+        return v
 
     @staticmethod
     def _anchor(blob: bytes, offset: int) -> bytes:
@@ -248,13 +261,14 @@ class Reconciler:
 
         # node-level forged verdict
         nkey = f"node:{node.id}"
-        restored = self._restore_erased_negative(node.epistemic_state, epistemic.get(nkey))
+        last_node = epistemic.get(nkey)  # read BEFORE _check_and_spend, which owns the ledger, not this
+        restored = self._restore_erased_negative(node.epistemic_state, last_node)
         if restored is not None:
             node.epistemic_state = restored
             report.requarantined.append(node.id)
             mutated = True
         elif self._check_and_spend(nkey, node.epistemic_state, epistemic, consumed, audit):
-            node.epistemic_state = EpistemicState.UNVERIFIED
+            node.epistemic_state = self._requarantine_state(last_node)
             report.requarantined.append(node.id)
             mutated = True
         epistemic[nkey] = node.epistemic_state.value
@@ -262,20 +276,41 @@ class Reconciler:
         # edge-level forged verdicts
         for e in node.edges:
             ekey = e.id
-            restored = self._restore_erased_negative(e.epistemic_state, epistemic.get(ekey))
+            last_edge = epistemic.get(ekey)
+            restored = self._restore_erased_negative(e.epistemic_state, last_edge)
             if restored is not None:
                 e.epistemic_state = restored  # keep verdict_by/at as canon holds them (the state is §1.7)
                 report.requarantined.append(e.id)
                 mutated = True
             elif self._check_and_spend(ekey, e.epistemic_state, epistemic, consumed, audit):
-                e.epistemic_state = EpistemicState.UNVERIFIED
-                e.verdict_by = None
-                e.verdict_at = None
+                e.epistemic_state = self._requarantine_state(last_edge)
+                if e.epistemic_state is EpistemicState.UNVERIFIED:
+                    # Only a never-verdicted edge loses its attribution. A RESTORED failure keeps the
+                    # rejecter's verdict_by/at as canon holds them, exactly as _restore_erased_negative does.
+                    e.verdict_by = None
+                    e.verdict_at = None
                 report.requarantined.append(e.id)
                 mutated = True
             epistemic[ekey] = e.epistemic_state.value
 
         return mutated
+
+    @staticmethod
+    def _requarantine_state(last_value) -> EpistemicState:
+        """The state a FORGED verdict is reset to: the failure baseline it overwrote, else `unverified`.
+
+        Resetting every forgery to `unverified` is correct only for an item that held no prior verdict.
+        When the last validated state was a FAILURE (§1.7 permanent negative memory), a blanket reset lets
+        a forge *over* the failure launder it away: `rejected` -> hand-edited `grounded` -> re-quarantined
+        `unverified`. The forgery itself is caught (the item never reads `grounded`), but the item drops out
+        of `failure_ids`, so the boundary stops quarantining re-proposals of the refuted claim — and since
+        `unverified` becomes the new baseline, no later sweep can recover it. That is the same erasure
+        `_restore_erased_negative` catches on the direct `failed`/`rejected` -> `unverified` edit, reached
+        through a groundable state instead (review-r11). The two guards are the two halves of one rule:
+        an out-of-band edit may never be the thing that ends a falsification."""
+        if last_value in FAILURE_STATE_VALUES:
+            return EpistemicState(last_value)
+        return EpistemicState.UNVERIFIED
 
     @staticmethod
     def _restore_erased_negative(current: EpistemicState, last_value):
@@ -510,7 +545,7 @@ class Reconciler:
         # re-quarantine baseline) and written back at the end — _coerce_subdict must never copy them out.
         files_state = self._coerce_subdict(state, "files")
         epistemic = self._coerce_subdict(state, "epistemic")
-        consumed = self._coerce_subdict(state, "consumed")
+        consumed = self._coerce_subdict(state, "consumed", int_values=True)
         self._recover_spend_ledger(consumed, epistemic)
         audit = self._audit_counts()
         report = ReconcileReport(full_sweep=full_sweep)

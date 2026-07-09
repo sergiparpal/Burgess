@@ -220,13 +220,18 @@ def _main(argv: list[str]) -> int:
     if not ok:
         print(json.dumps({"available": False, "reason": reason}), file=sys.stderr)
         return 3  # distinct from argparse(2)/generic-error(1): "arm cleanly unavailable, omit it"
-    prompts = _load_prompts(Path(args.prompts))
     store = Path(args.store) if args.store else default_store_dir()
     try:
+        # _load_prompts sits INSIDE the try with answer_prompts: a missing or wrong-shaped --prompts file
+        # (FileNotFoundError / ValueError) is the same class of operator error as a bad --source, and the
+        # kg-evaluator subagent that drives this CLI must never see a raw traceback. Previously only the
+        # bad-source path was mapped to the clean exit-3, and the arm's own CLI test never reached this
+        # line because it returns 3 above on the unavailable path (review-r11).
+        prompts = _load_prompts(Path(args.prompts))
         answers = answer_prompts(prompts, Path(args.source), store)
-    except FileNotFoundError as e:
+    except (FileNotFoundError, ValueError, OSError) as e:
         print(json.dumps({"available": False, "reason": str(e)}), file=sys.stderr)
-        return 3  # bad source surfaces as the clean 'arm unavailable, omit it' path, not a traceback
+        return 3  # bad source/prompts surfaces as the clean 'arm unavailable, omit it' path, not a traceback
     blob = json.dumps({"answers": answers}, indent=2)
     if args.out:
         Path(args.out).write_text(blob + "\n", encoding="utf-8")

@@ -20,6 +20,17 @@ import networkx as nx
 
 from .model import EpistemicState
 
+# Upper bound on the number of DISTINCT concepts one explanation may chain. Cost is quadratic in this
+# count — the metric closure runs `combinations(uniq, 2)` BFS passes (~k²/2), each O(V+E) — so an
+# uncapped, caller-supplied list is a self-inflicted denial of service: measured on a 6-regular graph,
+# 400 concepts take ~10s, 800 take ~56s, and 1500 exceed the 300s server.DEFAULT_HANDLER_TIMEOUT, at
+# which point the watchdog's `_hard_exit` SIGKILLs the engine. `nodes` comes straight from the model
+# (a plausible "explain how all these hubs connect" call), so the bound has to live here rather than in
+# a caller's good intentions. 32 keeps the worst case in the low milliseconds and is far past any chain
+# a human can read; beyond it we refuse with a `reason`, the same shape as an unreachable request
+# (review-r11).
+MAX_EXPLAIN_NODES = 32
+
 
 def grounded_view(G) -> nx.Graph:
     """The grounded-ONLY undirected view: an undirected pair {u,v} exists iff at least one parallel
@@ -83,12 +94,17 @@ def explain_grounded_path(G, nodes) -> dict:
     nearest-neighbour walk (a TSP-path approximation) over the grounded shortest-path closure.
     EMPTY (path=[], leap=null) with a ``reason`` when no fully-grounded path exists — itself
     informative: the concepts are joined only through unverified/hypothesized/refuted links, or
-    not at all."""
-    Gg = grounded_view(G)
-
+    Refuses with a ``reason`` when more than ``MAX_EXPLAIN_NODES`` concepts are requested — the closure
+    below is quadratic in that count and would otherwise wedge the handler.
+    """
     uniq = sorted(set(str(n) for n in (nodes or [])))
     if not uniq:
         return _unreachable("no nodes requested")
+    # Refuse before ANY graph work: the point of the cap is that the expensive passes never start.
+    if len(uniq) > MAX_EXPLAIN_NODES:
+        return _unreachable(f"too many nodes: {len(uniq)} (max {MAX_EXPLAIN_NODES})")
+
+    Gg = grounded_view(G)
     missing = [n for n in uniq if n not in Gg]
     if missing:
         return _unreachable(f"node not in graph: {missing[0]}")

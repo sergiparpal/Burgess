@@ -8,7 +8,6 @@
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import socket
@@ -481,7 +480,12 @@ class Canon:
         # The grounding audit log is runtime tamper-evidence, NOT canon content: it must never be
         # committed by `git add -A` nor swept by a rollback. (Even with the snapshot-scoped rollback
         # below it is untouched, but excluding it keeps it out of commits and out of `stash -u`.)
-        patterns = [LOCK_NAME, ".tmp-*", RECONCILE_STATE_NAME, GROUND_AUDIT]
+        # GLOB the audit log: groundaudit writes a `<log>.ckpt` spend-ledger sidecar beside it, and a
+        # pattern without the wildcard matches only the exact name — leaving the sidecar untracked, so
+        # `git add -A` commits per-machine runtime state into canon history and `git stash -u` discards
+        # it. The repo's own .gitignore already globs; the engine-written exclude (which is what a USER's
+        # vault gets) did not (review-r11).
+        patterns = [LOCK_NAME, ".tmp-*", RECONCILE_STATE_NAME, f"{GROUND_AUDIT}*"]
         try:
             info.mkdir(parents=True, exist_ok=True)
             current = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
@@ -761,10 +765,20 @@ class Canon:
         (mkstemp+fsync+replace+dir-fsync), and lease correctness comes from the TTL + CAS
         acquire/reclaim, NOT cadence — so refresh at most once per ttl/HEARTBEAT_REFRESHES_PER_TTL
         (a long batch stays comfortably fresh inside the TTL window; a sub-interval batch
-        heartbeats once)."""
+        heartbeats once).
+
+        Fsyncs the canon directory ONCE for the whole batch rather than once per note. Every note lives
+        directly under the flat `canon/` dir (`node_path`), and a single directory fsync after the last
+        `os.replace` makes ALL of the batch's renames durable — the per-file dir fsync was redundant work
+        on the same inode: 802 fsyncs costing 1.39s of a 3.58s 400-node batch, most visible on /kg-build
+        waves. Per-FILE durability is unchanged (each `atomic_write_text` still fsyncs its own contents
+        before the rename); only the directory-entry fsync is hoisted. A crash mid-batch is already
+        handled by the snapshot rollback, and the batch is not atomic across files either way
+        (review-r11)."""
         hb_interval = self.lock.ttl / HEARTBEAT_REFRESHES_PER_TTL
         last_hb = time.monotonic()
         self.lock.heartbeat()  # one refresh up front, then only when hb_interval has elapsed
+        wrote_any = False
         for node in nodes:
             now_mono = time.monotonic()
             if (now_mono - last_hb) > hb_interval:
@@ -772,7 +786,9 @@ class Canon:
                 # judge it stale (TTL) and steal the lock mid-write, breaking single-writer.
                 self.lock.heartbeat()
                 last_hb = now_mono
-            merged = self._merge_into_existing(node) if merge else node
+            # On the merge path `_merge_into_existing` already parsed the on-disk note and handed back its
+            # content hash, so the no-op guard below costs no second read+YAML-parse of the same file.
+            merged, pre_hash = self._merge_into_existing(node) if merge else (node, None)
             p = self.node_path(merged.id)
             # Idempotent no-op guard: if the note already on disk is byte-identical to what we
             # would write EXCEPT for created_at/updated_at, skip both the write and the
@@ -781,16 +797,23 @@ class Canon:
             # and timestamp-only commits. Compare a content hash that ignores the timestamps
             # (model.node_content_hash — the same rule the projector's staleness gate consumes).
             if p.exists():
-                try:
-                    existing = node_from_markdown(
-                        p.read_text(encoding="utf-8"), fallback_id=merged.id
-                    )
-                except Exception:  # noqa: BLE001 — unreadable existing note: fall through to write
-                    existing = None
-                if existing is not None and self._content_hash(existing) == self._content_hash(merged):
+                if pre_hash is None:
+                    # The no-merge path (kg_rename) never parsed the note; do it here. An unreadable
+                    # note falls through to the write, exactly as before.
+                    try:
+                        pre_hash = self._content_hash(node_from_markdown(
+                            p.read_text(encoding="utf-8"), fallback_id=merged.id))
+                    except Exception:  # noqa: BLE001 — unreadable existing note: fall through to write
+                        pre_hash = None
+                if pre_hash is not None and pre_hash == self._content_hash(merged):
                     continue  # real content unchanged — leave the note (and its timestamp) as-is
             merged.updated_at = utcnow()
-            _atomic_write(p, node_to_markdown(merged))
+            _atomic_write(p, node_to_markdown(merged), fsync_dir=False)
+            wrote_any = True
+        if wrote_any:
+            # One directory fsync for the whole batch — see the docstring. Best-effort like the
+            # per-write one (`atomicio.fsync_dir` swallows OSError on filesystems that refuse it).
+            fsync_dir(self._notes_dir_resolved)
 
     def _commit_batch(self, message: str, snapshot: dict) -> None:
         """The best-effort git tail of write_nodes, AFTER the writes durably landed: a non-zero git
@@ -820,11 +843,18 @@ class Canon:
         nothing real changed."""
         return node_content_hash(node)
 
-    def _merge_into_existing(self, node: Node) -> Node:
-        """Apply the single-canonical-edge rule: merge incoming edges into an existing note."""
+    def _merge_into_existing(self, node: Node) -> "tuple[Node, str | None]":
+        """Apply the single-canonical-edge rule: merge incoming edges into an existing note.
+
+        Returns `(merged, pre_hash)` where `pre_hash` is the content hash of the note AS IT WAS ON DISK,
+        or None when there was no existing note. `_write_batch`'s idempotent-no-op guard needs exactly
+        that hash and used to obtain it by reading and YAML-parsing the same file a SECOND time — 0.41s
+        of a 0.75s idempotent 400-node re-write, on the commonest path there is (every extractor edge-write
+        whose source node already exists, and every idempotent /kg-build re-run). We already hold the
+        parsed pre-merge node here, so hash it before the mutation below destroys it (review-r11)."""
         p = self.node_path(node.id)
         if not p.exists():
-            return node
+            return node, None
         # Parse the existing note once here and fold the slug-collision check in, so the batch path
         # never double-parses. An unreadable existing note is backed up and the parse error re-raised
         # (the merge path then rolls back the batch); a readable note whose id differs raises the
@@ -835,6 +865,8 @@ class Canon:
             self._backup_unreadable(p)  # preserve foreign/corrupt bytes before anything overwrites them
             raise
         self._assert_no_slug_collision(node.id, cur, p)
+        # Snapshot the on-disk identity BEFORE `cur` is mutated in place into the merged result.
+        pre_hash = self._content_hash(cur)
         # key by the canonical edge id (the slug) — the same key the boundary dedup and disk use, so
         # all three layers agree on what "one edge" is (boundary-1 / §1.4).
         by_id = {e.id: e for e in cur.edges}
@@ -871,7 +903,17 @@ class Canon:
                 e.authored_by = prev.authored_by
             by_id[e.id] = e  # incoming wins (already validated)
         cur.edges = list(by_id.values())
-        if node.body:
+        # Verdict-durability, NODE lane (§1.7, review-r11) — the exact analogue of the edge guard above.
+        # A node's grounding evidence lives in its BODY: a Node has no `span` field, so
+        # server._promote_hypothesis_node restates the support as `grounding span: …` / `citation: …`
+        # appended to `node.body`. An ordinary re-emit of the same node id (the same /kg-generate
+        # mechanism run twice, an extractor restating a node in a later section) is deduped-ACCEPTED by
+        # the boundary — nodes have no `_durability_quarantine` — so an unguarded overwrite would leave
+        # `epistemic_state: grounded, provenance: span-present` with the span it rests on GONE. The
+        # verdict would float over blanked evidence, the precise state the edge guard exists to prevent.
+        # `cur.epistemic_state` (not the incoming one) is the test: kg_ground persists via write_one, so
+        # it never reaches this merge path and can never be blocked by its own verdict.
+        if node.body and cur.epistemic_state not in GROUNDABLE_STATES:
             cur.body = node.body
         # A bare edge-only write carries a placeholder Node(id=src) whose label DEFAULTS to the id
         # (Node.__post_init__ sets label=id when blank, so `node.label` is never falsy — the old
@@ -882,7 +924,7 @@ class Canon:
             cur.label = node.label
         if node.node_type and node.node_type != UNDECLARED_TYPE:
             cur.node_type = node.node_type
-        return cur
+        return cur, pre_hash
 
     def _rollback(self, error: str, snapshot: dict | None = None) -> RollbackInfo:
         """Undo a failed batch by restoring ONLY the files it touched, from the pre-batch snapshot.

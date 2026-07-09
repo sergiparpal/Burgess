@@ -21,9 +21,26 @@ from collections import defaultdict
 
 from .generate import regroup
 from .graphio import node_attr
-from .model import Provenance, slug
+from .model import AuthoredBy, Provenance, slug
 
 HYP = Provenance.HYPOTHESIZED.value  # the propose-lane provenance, from its enum home (review-r5)
+# Structure emitted by THESE functions is computed in-process from the derived graph — no model wrote it,
+# so `agent` (the EdgeIn/NodeIn default) understates what the axis knows. The boundary preserves
+# `deterministic` on the hypothesized lane precisely for "a deterministic DISCOVERY mechanism"
+# (boundary._apply_forge_guards); until review-r11 no mechanism actually claimed it, so the branch was
+# exercised only by tests and every deterministically-discovered item was recorded as `agent`.
+#
+# Scope it honestly. EDGES here are pure structure (endpoints + relation come from the graph), so they are
+# always `deterministic`. A NODE is only `deterministic` when the engine also authored its language: the
+# caller may pass `label`/`body`, and a node carrying an agent's prose is an agent's node. See
+# `_node_author`.
+DET = AuthoredBy.DETERMINISTIC.value
+AGENT = AuthoredBy.AGENT.value
+
+
+def _node_author(label: str, body: str) -> str:
+    """`deterministic` only when neither the label nor the body came from the caller."""
+    return AGENT if (label or body) else DET
 
 # Per-operation default fan-out knobs. server.py's kg_operate imports these (`k or ops.DEFAULT_REGROUP_K`
 # / `k or ops.DEFAULT_OPEN_POINTS`) instead of re-literalizing, so each default lives in exactly one place.
@@ -93,12 +110,13 @@ def collapse_payload(G, *, target=None, members=None, label="", body=""):
     if len(members) < 2:
         return None, "collapse needs at least 2 members"
     comp_id = _compression_id(members)
+    author = _node_author(label, body)
     body = body or ("compression standing in for the cluster {" + ", ".join(sorted(members))
                     + "}; earns its keep only if it predicts (§7)")
     node = {"id": comp_id, "label": label or "", "node_type": "compression",
-            "provenance": HYP, "body": body}
-    edges = [{"source": m, "target": comp_id, "relation": "collapses_into", "provenance": HYP}
-             for m in sorted(members)]
+            "provenance": HYP, "authored_by": author, "body": body}
+    edges = [{"source": m, "target": comp_id, "relation": "collapses_into", "provenance": HYP,
+              "authored_by": DET} for m in sorted(members)]
     return {"nodes": [node], "edges": edges}, comp_id
 
 
@@ -124,12 +142,15 @@ def explode_payload(G, *, target=None, k=None, label="", body=""):
         if kk is not None:
             facets = facets[: max(0, kk)]
     nodes, edges = [], []
+    author = _node_author(label, body)
     for i, r in enumerate(facets, 1):
         cid = f"{slug(node)}-facet-{i}"
         nodes.append({"id": cid, "label": label or "", "node_type": "primitive", "provenance": HYP,
+                      "authored_by": author,
                       "body": body or f"latent facet of '{node}' along its '{r}' role (§8 explode)"})
         # the child collapses_into the parent: the parent is the compression of its facets (inverse shape)
-        edges.append({"source": cid, "target": node, "relation": "collapses_into", "provenance": HYP})
+        edges.append({"source": cid, "target": node, "relation": "collapses_into", "provenance": HYP,
+                      "authored_by": DET})
     return {"nodes": nodes, "edges": edges}, node
 
 
@@ -138,7 +159,7 @@ def regroup_payload(G, *, failures=None, k=DEFAULT_REGROUP_K):
     if not cands:
         return None, "re-partition surfaced no invisible bridges"
     edges = [{"source": c.source, "target": c.target, "relation": c.relation, "provenance": HYP,
-              "notes": c.rationale} for c in cands]
+              "authored_by": DET, "notes": c.rationale} for c in cands]
     return {"edges": edges}, f"{len(edges)} re-partition bridges"
 
 
@@ -151,8 +172,10 @@ def open_payload(G, *, label="", body="", k=DEFAULT_OPEN_POINTS):
         return None, "empty graph — nothing to open against"
     prim_id = "opening-" + slug(pts[0])
     nodes = [{"id": prim_id, "label": label or "", "node_type": "primitive", "provenance": HYP,
+              "authored_by": _node_author(label, body),
               "body": body or "opens territory the current vocabulary cannot yet express (§8 open)"}]
-    edges = [{"source": prim_id, "target": p, "relation": "bridges", "provenance": HYP} for p in pts]
+    edges = [{"source": prim_id, "target": p, "relation": "bridges", "provenance": HYP,
+              "authored_by": DET} for p in pts]
     return {"nodes": nodes, "edges": edges}, prim_id
 
 

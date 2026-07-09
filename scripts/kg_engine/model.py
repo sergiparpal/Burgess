@@ -13,6 +13,8 @@ import unicodedata
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from enum import Enum
+from functools import lru_cache
+from math import isfinite
 from typing import Any
 
 import yaml
@@ -81,6 +83,15 @@ FAILURE_STATES = {EpistemicState.REJECTED, EpistemicState.FAILED}
 # template). Single-homed here so extending the negative-memory vocabulary can never silently skip
 # a consumer that had re-typed ("failed", "rejected") by hand (review-r5).
 FAILURE_STATE_VALUES = frozenset(s.value for s in FAILURE_STATES)
+# Edge states that are NOT LIVE TOPOLOGY: failure memory plus `obsolete` (a superseded relation). The
+# live subgraph is what every structural signal is computed over — degree/community/betweenness/
+# spec_betweenness in projector._live_subgraph, the answer lane in kg_context, and the generators'
+# adjacency in generate._live_undirected. Those must agree: generate.py excluded only the failure states
+# while the projector also dropped `obsolete` (added in review-fix L14), so the five edge mechanisms took
+# adjacency/common-neighbour signal from superseded edges while reading node ranks computed WITHOUT them —
+# a silent disagreement that generate._live_undirected's own docstring claimed was impossible. One home,
+# so the two can never drift again (review-r11).
+NON_LIVE_STATE_VALUES = FAILURE_STATE_VALUES | {EpistemicState.OBSOLETE.value}
 UNDECLARED_TYPE = "undeclared-type"
 # The two boundary numbers server.py needs at import time — single-homed HERE (not boundary.py, their
 # original home) since review-r6: importing them from boundary made the read-only PreToolUse hook pay
@@ -195,10 +206,26 @@ def span_verifies(span: str, source_text: str) -> bool:
 
 
 def slug(s: str) -> str:
+    """Canonical id/filename form of a label. Memoized — see `_slug` for the rule itself.
+
+    `slug` is the single hottest pure function in the engine: `edge_id` calls it three times, and the
+    O(n^2) candidate loops in `generate` call `edge_id` twice per pair. A profile of
+    `kg_generate("all")` on an 800-node graph showed 535k `slug` calls costing 2.05s of 4.17s total —
+    two regex substitutions, an NFC normalize, a casefold and a strip, re-executed on the same few
+    thousand distinct labels over and over. It is a pure string->string function of a small, repeating
+    domain, so the cache is free correctness-wise and bounded (LRU) for a long-lived server (review-r11).
+
+    `str(s)` before the cached call: the body already coerced non-str input, and an unhashable argument
+    must not turn a working call into a TypeError at the cache boundary."""
+    return _slug(str(s))
+
+
+@lru_cache(maxsize=8192)
+def _slug(s: str) -> str:
     # NFC-normalize first so visually-identical strings in different composition forms (NFD from
     # macOS/HFS+ copy-paste vs NFC) produce the SAME slug — otherwise the same logical node/edge
     # forks into two ids/filenames and dedup (§1.4) silently fails.
-    s = unicodedata.normalize("NFC", str(s)).strip().lower()
+    s = unicodedata.normalize("NFC", s).strip().lower()
     # MAP punctuation to a separator rather than DELETING it. This is the WEAKER of two guarantees,
     # not perfect injectivity: punctuation and separators all collapse to a single '-', so
     # punctuation-only variants are *intentionally* unified — slug('a/b')==slug('a-b')==slug('a b')
@@ -258,7 +285,20 @@ class Edge:
         # from (source, relation, target).
         self.source, self.relation, self.target = str(self.source), str(self.relation), str(self.target)
         self.id = edge_id(self.source, self.relation, self.target)
-
+        # Sanitize the confidence hint at the PARSE chokepoint, with the same rule the write boundary
+        # applies: clamp to [0,1], drop non-finite. The boundary only sees agent payloads, but canon is
+        # human-editable by design — a hand-written `confidence_score: .nan` parses to nan, survives
+        # to_dict(), and reaches `json.dumps` (allow_nan=True by default), which emits a bare `NaN`
+        # literal. That is not valid JSON (RFC 8259), so the derived graph.json becomes unreadable to any
+        # strict external consumer even though the engine's own json.load tolerates it. This module
+        # already coerces every other malformed field to a safe default rather than raising; the
+        # confidence hint was the one that leaked through (review-r11).
+        if self.confidence_score is not None:
+            try:
+                score = float(self.confidence_score)
+            except (TypeError, ValueError):
+                score = None  # a non-numeric hand-edit is no hint at all
+            self.confidence_score = min(1.0, max(0.0, score)) if score is not None and isfinite(score) else None
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -360,25 +400,35 @@ def node_content_hash(node: Node) -> str:
     return hashlib.sha256((json.dumps(fm, sort_keys=True) + node.body.strip("\n")).encode()).hexdigest()
 
 
+def normalize_note_text(text: str) -> str:
+    r"""Canon note bytes -> their canonical on-read form: leading BOM stripped, CRLF/CR folded to LF.
+
+    Tolerate a leading UTF-8 BOM (U+FEFF): every canon read decodes with encoding="utf-8", which
+    preserves a BOM as a leading character, and the frontmatter regex then fails to match — so a note
+    hand-edited in an editor that writes BOMs (Windows Notepad's default "UTF-8") would raise and
+    SILENTLY vanish from every read via all_nodes()'s tolerance, taking its §1.7 failure memory with it.
+    Engine writes never emit a BOM, so this is a no-op on engine-authored notes, and the note is
+    re-serialized BOM-less on its next write.
+
+    Normalize line endings for the same reason. A note hand-edited on Windows commonly saves CRLF;
+    without this the `\r`s (a) survive `body.strip("\n")` and get written back verbatim, permanently
+    corrupting the body with mixed endings AND breaking the idempotent-no-op guard (node_content_hash
+    differs between the CRLF-on-disk and LF forms, so every re-save rewrites the note with a fresh
+    updated_at and the reconciler flags it changed every time), and (b) a CR-ONLY note fails
+    _FRONTMATTER_RE entirely -> ValueError -> all_nodes() swallows it and the whole node, incl. its §1.7
+    failed/rejected counter-edges, silently vanishes from every read. Engine writes always emit LF.
+
+    Single-homed here (review-r11) because `node_from_markdown` is NOT the only reader of raw note bytes:
+    canonmerge's edgeless / unparseable fast path hands the raw texts to `git merge-file`, where a purely
+    cosmetic CRLF or BOM difference reads as a whole-file divergence — every line differs by a `\r`, so
+    git cannot 3-way it and a trivially-mergeable note comes back fully conflicted. One home, one rule.
+    """
+    return text.lstrip("﻿").replace("\r\n", "\n").replace("\r", "\n")
+
+
 def node_from_markdown(text: str, *, fallback_id: str | None = None) -> Node:
-    # Tolerate a leading UTF-8 BOM (U+FEFF): every canon read decodes with encoding="utf-8", which
-    # preserves a BOM as a leading ﻿ character, and the frontmatter regex then fails to match —
-    # so a note hand-edited in an editor that writes BOMs (Windows Notepad's default "UTF-8") would
-    # raise here and SILENTLY vanish from every read via all_nodes()'s tolerance, taking its §1.7
-    # failure memory with it. Stripping it here (the single parse chokepoint) fixes every caller
-    # (canon, reconciler, canonmerge) at once; engine writes never emit a BOM, so this is a no-op on
-    # engine-authored notes and the note is re-serialized BOM-less on its next write.
-    text = text.lstrip("\ufeff")  # escape-spelled: the BOM is invisible as a literal (review-r5)
-    # Normalize line endings at the single parse chokepoint (sibling of the BOM strip above). A note
-    # hand-edited on Windows commonly saves CRLF; without this the `\r`s (a) survive `body.strip("\n")`
-    # and get written back verbatim, permanently corrupting the body with mixed endings AND breaking the
-    # idempotent-no-op guard (node_content_hash differs between the CRLF-on-disk and LF forms, so every
-    # re-save rewrites the note with a fresh updated_at and the reconciler flags it changed every time),
-    # and (b) a CR-ONLY note fails _FRONTMATTER_RE entirely -> ValueError -> all_nodes() swallows it and
-    # the whole node, incl. its \u00a71.7 failed/rejected counter-edges, silently vanishes from every read.
-    # One normalization here fixes canon/reconciler/canonmerge at once; engine writes always emit LF, so
-    # this is a no-op on engine-authored notes (review: CRLF/CR line endings).
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    # The single PARSE chokepoint; canonmerge's raw-text path normalizes through the same helper.
+    text = normalize_note_text(text)
     m = _FRONTMATTER_RE.match(text)
     if not m:
         raise ValueError("note has no YAML frontmatter")

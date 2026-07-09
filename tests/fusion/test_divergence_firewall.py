@@ -131,6 +131,76 @@ def test_i3_verdict_path_never_reaches_divergence():
         assert not hits, f"I3 violated: {root} imports {hits} (lazy imports count here)"
 
 
+# The ONLY kg_engine modules a divergence module may import. Both are capability-free stdlib-only leaves:
+# `atomicio` is a durable-write primitive (divergence persists its own npz/JSONL session state) and
+# `envconfig` reads/cleans environment variables. Neither can name an epistemic state, and neither
+# imports anything from kg_engine (asserted below), so neither can become a back door. Adding to this
+# set is a deliberate act that must be argued for HERE — that is the point of the list.
+DIVERGENCE_ALLOWED_ENGINE_IMPORTS = frozenset({"kg_engine.atomicio", "kg_engine.envconfig"})
+
+
+def test_i3_divergence_cannot_reach_the_verdict_machinery():
+    """I3, the OTHER half of the import firewall: nothing under `divergence/` may set or upgrade an
+    epistemic state, so the verdict monopoly (I1) cannot be broken from the geometry side. The property
+    has always been asserted in `divergence/__init__`; until review-r11 nothing tested it.
+
+    `test_i3_verdict_path_never_reaches_divergence` polices one direction only — the verdict path must
+    not import divergence. The converse was held up by convention alone: a divergence module could
+    `from ..canon import Canon` + `from ..model import EpistemicState` and stamp a verdict straight into
+    a canon note, and the ENTIRE suite stayed green (verified by mutation). The reconciler would
+    re-quarantine it on the next sweep, but that is a backstop, not a firewall.
+
+    So police the CAPABILITY, not a blocklist of module names: a divergence module may import the
+    stdlib, its numeric deps, its own siblings, and the two allowlisted leaves above — nothing else in
+    `kg_engine`. Without `model` there is no `EpistemicState` to assign; without `canon`/`boundary`/
+    `server`/`reconciler` there is nothing to write one to. An allowlist also needs no maintenance as
+    the verdict path grows, and it fails closed on a module that does not exist yet.
+
+    LAZY imports count: a deferred `import` inside a function is the obvious way past a top-level-only
+    scan and grants exactly the same capability.
+    """
+    mods = _py_modules()
+    div_mods = {n: p for n, p in mods.items() if n.startswith(DIVERGENCE)}
+    assert div_mods, "divergence package missing — the firewall has nothing to police"
+
+    def _escapes(imports: set[str]) -> set[str]:
+        """kg_engine imports that leave the divergence package and are not allowlisted. `_imports`
+        yields both `pkg.mod` and `pkg.mod.symbol` for `from pkg.mod import symbol`, so test the
+        module prefix, not the raw string."""
+        out = set()
+        for i in imports:
+            if not i.startswith("kg_engine") or i.startswith(DIVERGENCE):
+                continue
+            if any(i == a or i.startswith(a + ".") for a in DIVERGENCE_ALLOWED_ENGINE_IMPORTS):
+                continue
+            out.add(i)
+        return out
+
+    offenders = {}
+    for name, path in div_mods.items():
+        _top, anywhere = _imports(path, name)
+        if bad := _escapes(anywhere):
+            offenders[name] = sorted(bad)
+
+    assert not offenders, (
+        f"I3 violated: divergence module(s) reach the engine outside the allowlist — {offenders}. "
+        "Divergence is advisory geometry: it must not be able to name an EpistemicState, nor reach the "
+        "canon, the boundary, the reconciler, or the server. If a new leaf is genuinely capability-free, "
+        "add it to DIVERGENCE_ALLOWED_ENGINE_IMPORTS and say why."
+    )
+
+    # The allowlist is only safe while its members are leaves: a transitive hop through one of them
+    # would hand divergence the very capability the allowlist exists to withhold.
+    for allowed in DIVERGENCE_ALLOWED_ENGINE_IMPORTS:
+        assert allowed in mods, f"allowlisted module {allowed} no longer exists"
+        _t, anywhere = _imports(mods[allowed], allowed)
+        leaks = {i for i in anywhere if i.startswith("kg_engine")}
+        assert not leaks, (
+            f"I3 violated transitively: allowlisted leaf {allowed} now imports {sorted(leaks)}, "
+            "so divergence can reach the engine through it. Keep the allowlist stdlib-only."
+        )
+
+
 def test_i3_server_verdict_functions_are_divergence_free():
     path = ENGINE_DIR / "server.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))

@@ -28,10 +28,12 @@ def test_crash_mid_write_recovers_via_git(canon: Canon, monkeypatch):
 
     real_write = canon_mod._atomic_write
 
-    def boom(path, text):
+    # **kw: _write_batch passes fsync_dir=False (the batch fsyncs the canon dir once at the end).
+    # A fixed-arity double raises TypeError instead of the OSError under test (review-r11).
+    def boom(path, text, **kw):
         if path.name == "c.md":
             raise OSError("simulated crash mid-write")
-        return real_write(path, text)
+        return real_write(path, text, **kw)
 
     monkeypatch.setattr(canon_mod, "_atomic_write", boom)
     info = canon.write_nodes([Node(id="b", label="B"), Node(id="c", label="C")], message="batch b,c")
@@ -53,10 +55,12 @@ def test_rollback_preserves_unrelated_uncommitted_work(canon: Canon, monkeypatch
 
     real_write = canon_mod._atomic_write
 
-    def boom(path, text):
+    # **kw: _write_batch passes fsync_dir=False (the batch fsyncs the canon dir once at the end).
+    # A fixed-arity double raises TypeError instead of the OSError under test (review-r11).
+    def boom(path, text, **kw):
         if path.name == "c.md":
             raise OSError("simulated crash mid-write")
-        return real_write(path, text)
+        return real_write(path, text, **kw)
 
     monkeypatch.setattr(canon_mod, "_atomic_write", boom)
     info = canon.write_nodes([Node(id="b", label="B"), Node(id="c", label="C")], message="batch b,c")

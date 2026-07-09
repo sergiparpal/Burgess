@@ -104,4 +104,10 @@ def test_intermediate_state_record_cannot_resurrect_a_forged_verdict(engine):
     report = recon.scan(full_sweep=True)
     assert eid in report.requarantined  # the orphan grounded record was already drained -> caught
     after = next(e for e in engine.canon.all_edges() if e.id == eid)
-    assert after.epistemic_state == EpistemicState.UNVERIFIED
+    # The forgery is reverted (this test's subject). Since review-r11 the revert restores the FAILURE
+    # baseline the forge overwrote rather than blanket-resetting to `unverified` — resetting a forge over
+    # a failure to `unverified` would let the edit launder §1.7 negative memory away (the edge would drop
+    # out of failure_ids and the refuted claim could be re-proposed). `failed` is the strictly stronger
+    # outcome: still not the forged `grounded`, and still remembered as refuted.
+    assert after.epistemic_state == EpistemicState.FAILED
+    assert after.epistemic_state != EpistemicState.GROUNDED

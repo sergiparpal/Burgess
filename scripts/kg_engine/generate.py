@@ -30,13 +30,16 @@ from pathlib import Path
 import networkx as nx
 
 from .graphio import node_attr, node_link_graph
-from .model import FAILURE_STATE_VALUES, edge_id
+from .model import NON_LIVE_STATE_VALUES, edge_id
 
 # The edge epistemic_state string values the generators must treat as NON-live (§1.7). Generators build
-# their adjacency/undirected topology over the SAME failure-EXCLUDED subgraph that node ranks were
-# computed over (projector._live_subgraph): a `failed`/`rejected` edge is negative information — it must
-# never seed a spurious shared-neighbour bridge/seed/periphery candidate or inflate absorption density.
-_FAILURE_VALUES = FAILURE_STATE_VALUES  # single vocabulary home in model (review-r5)
+# their adjacency/undirected topology over the SAME non-live-EXCLUDED subgraph that node ranks were
+# computed over (projector._live_subgraph): a `failed`/`rejected` edge is negative information and an
+# `obsolete` edge is superseded — neither may seed a spurious shared-neighbour bridge/seed/periphery
+# candidate or inflate absorption density. Shared with the projector via model.NON_LIVE_STATE_VALUES so
+# the two definitions cannot drift (review-r11: this set omitted `obsolete` while the projector's did not,
+# so generators walked a topology the ranks they read were never computed over).
+_NON_LIVE_VALUES = NON_LIVE_STATE_VALUES  # single vocabulary home in model (review-r5/r11)
 
 # The mechanism vocabulary. The DEFAULT_SET is what `/kg-generate` runs unless the user opts into all
 # seven (PLAN Stage 6 non-blocking survey). "all" runs ALL_SET.
@@ -144,20 +147,22 @@ def _pair_specificity(G, a, b) -> float:
 
 
 def _live_undirected(G):
-    """Undirected projection with `failed`/`rejected` edges excluded (§1.7), mirroring
-    projector._live_subgraph so generators walk the SAME live topology their node ranks were computed
-    over. Nodes are all kept (an attacked hub whose edges are all refuted still appears at degree 0)."""
+    """Undirected projection with the NON-LIVE edges excluded — `failed`/`rejected` (§1.7) and `obsolete`
+    (superseded) — mirroring projector._live_subgraph so generators walk the SAME live topology their node
+    ranks were computed over. The exclusion set is `model.NON_LIVE_STATE_VALUES`, shared with the projector
+    so this claim stays TRUE (review-r11: it once said "mirroring" while omitting `obsolete`).
+    Nodes are all kept (an attacked hub whose edges are all refuted still appears at degree 0)."""
     live = nx.MultiDiGraph()
     live.add_nodes_from(G.nodes(data=True))
     live.add_edges_from((u, v, k, d) for u, v, k, d in G.edges(keys=True, data=True)
-                        if d.get("epistemic_state") not in _FAILURE_VALUES)
+                        if d.get("epistemic_state") not in _NON_LIVE_VALUES)
     return live.to_undirected()
 
 
 def _undirected_adjacency(G) -> dict:
     adj: dict = defaultdict(set)
     for u, v, st in G.edges(data="epistemic_state"):
-        if u != v and st not in _FAILURE_VALUES:  # failure memory is not live topology (§1.7)
+        if u != v and st not in _NON_LIVE_VALUES:  # failure memory is not live topology (§1.7)
             adj[u].add(v)
             adj[v].add(u)
     return adj
@@ -200,7 +205,14 @@ def _strength_map(G) -> "tuple[int, dict]":
 
 def _is_failure(failures: set, source: str, relation: str, target: str) -> bool:
     """invariant 5 (PLAN §13): a candidate edge whose identity OR its reverse already lives in failure
-    memory is dropped on sight — generation never re-proposes what was refuted."""
+    memory is dropped on sight — generation never re-proposes what was refuted.
+
+    Called once per candidate pair, so it runs O(n^2) times per mechanism. Building both `edge_id`s costs
+    six `slug` calls; against an EMPTY failure set — the common case, before any adversarial grounding has
+    produced a `failed`/`rejected` edge — every one of them is wasted, since nothing can be a member of
+    an empty set. Short-circuit first (review-r11: ~1.1s of pointless work per 200k pairs)."""
+    if not failures:
+        return False
     return (edge_id(source, relation, target) in failures
             or edge_id(target, relation, source) in failures)
 

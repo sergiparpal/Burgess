@@ -55,7 +55,7 @@ Two layers, one boundary:
 
 `scripts/kg_engine/divergence/` — model2vec embedder (deterministic hash embedder in tests/offline), MAP-Elites archive, k-NN novelty, DPP slates, anti-collapse monitor. Constraints, all test-enforced in `tests/fusion/`:
 
-- **Import firewall**: nothing under `divergence/` can set or upgrade an epistemic state.
+- **Import firewall** (**I3**, both directions, `tests/fusion/test_divergence_firewall.py`): no grounding/verdict/reconciler module may import `divergence` even lazily, and no module under `divergence/` may import anything in `kg_engine` outside its own siblings and the capability-free leaves `atomicio`/`envconfig` (allowlist) — so nothing there can set or upgrade an epistemic state.
 - **Advisory ceiling**: geometry (DPP order, novelty, cliché distance) affects what is proposed and in what order, never what is true — grounding output is snapshot-tested bit-identical with `divergence.dpp` on vs off.
 - **Ephemerality**: archives live under project-local `.kg/diverge/` and die with the session; only pins/discards/comparisons persist. Pins enter the graph ONLY via the propose lane (`kg_propose`/`kg_diverge_materialize`) as `provenance=hypothesized, epistemic_state=unverified` — the next `/kg-ground` is the filter.
 - **Graceful degradation**: every `kg_*` graph tool works with divergence deps blocked.

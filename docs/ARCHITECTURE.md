@@ -118,6 +118,9 @@ folded). The full contract, reason strings and worked examples:
 `kg_propose(payload)` is the **hypothesized write lane**: it forces `provenance=hypothesized`,
 refuses text claims (`propose-lane-text-claim`), requires no span, and preserves
 `authored_by=deterministic` for genuine discovery mechanisms. Same validator, same forge guards.
+The `/kg-operate` mechanisms are those discovery mechanisms and they do claim it: their structural edges
+carry `authored_by=deterministic`, while a node whose `label`/`body` came from the caller stays `agent` —
+structure is computed, language is authored.
 
 An optional `idempotency_key` makes a re-sent identical write a true no-op (verbatim cached replay);
 `kg_write` also reuses a signature-keyed canon baseline across calls so parallel build waves don't
@@ -222,7 +225,9 @@ Full signatures and return shapes: `skills/burgess/references/tools.md`.
 - **Read/query (12):** `kg_ping`, `kg_scrub`, `kg_metrics`, `kg_status` (projection-free
   status + section coverage + the engine-resolved `source` — the build-resume probe and
   `/kg-build`'s source-of-truth for the configured `source_path`), `query_graph`, `get_node`, `get_neighbors`,
-  `shortest_path`, `kg_explain_path` (grounded-edges-only chain + advisory `leap`), `kg_context`
+  `shortest_path`, `kg_explain_path` (grounded-edges-only chain + advisory `leap`; capped at
+  `pathing.MAX_EXPLAIN_NODES` distinct nodes — its closure is quadratic in that count, so an uncapped
+  model-supplied list would outrun the handler watchdog), `kg_context`
   (budgeted, falsification-aware; grounded `items[]` never mixed with `hypotheses[]`), `kg_agenda`
   (structural suggested questions, `answerable_now` vs `blocked_on_grounding`), `kg_export`
   (offline `graph.html` + `GRAPH_REPORT.md`; the three axes on independent visual channels).
@@ -415,7 +420,11 @@ The eleven fusion invariants, all test-enforced (`tests/fusion/`):
 - **I1 — verdict monopoly**: only `kg_ground` produces verdicts.
 - **I2 — span-present boundary**: no span-less grounded edge can exist; forged verdicts are
   stripped at the boundary and re-quarantined by the reconciler.
-- **I3 — import firewall**: nothing under `divergence/` can set or upgrade an epistemic state.
+- **I3 — import firewall** (both directions): no grounding/verdict/reconciler module may import
+  `divergence/`, even lazily; and no module under `divergence/` may import anything in `kg_engine`
+  beyond its own siblings and the capability-free leaves `atomicio`/`envconfig`. It therefore cannot
+  name an `EpistemicState`, let alone set one — which is what makes I1 structurally true from the
+  geometry side rather than merely unexercised.
 - **I4 — DB isolation**: no vector schema anywhere the graph query tools read.
 - **I5 — advisory ceiling**: geometry affects what is proposed and in what order, never what is
   true; grounding output is snapshot-tested bit-identical with `divergence.dpp` on vs off.

@@ -172,8 +172,11 @@ EXIT_CRASH = 70         # an exception escaped the serve loop
 EXIT_WATCHDOG = 71      # a handler wedged past KG_HANDLER_TIMEOUT and the watchdog forced a fresh process
 # A handler that runs longer than this is treated as wedged (a deadlocked write, a runaway projection) and
 # the watchdog forces a clean process exit so the supervisor relaunches — never a half-dead "Running…"
-# state. Generous by default: the only legitimately-slow path is a cross-process lease wait (capped at
+# state. Generous by default: the legitimately-slow paths are a cross-process lease wait (capped at
 # canon.LOCK_ACQUIRE_TIMEOUT = 30s) plus a projection, both far under this. 0 disables the watchdog.
+# This budget is NOT a substitute for bounding caller-supplied work: a handler whose cost is
+# superlinear in a model-supplied argument must cap that argument itself, or it turns the watchdog into
+# a remote kill switch (pathing.MAX_EXPLAIN_NODES is the worked example — review-r11).
 DEFAULT_HANDLER_TIMEOUT = 300.0
 # Idempotency: bound the in-memory replay cache so a long-lived server can't grow it without limit.
 _WRITE_CACHE_MAX = 256
@@ -1653,7 +1656,12 @@ class KGEngine:
             "nodes_by_epistemic_state": nodes_by_state,
             "unverified_edges": by_state.get(EpistemicState.UNVERIFIED.value, 0),
             "source": self._source_info(),
-            "coverage": self._coverage(edges),
+            # `coverage` embeds free source text: `sections[].title` is a `##` heading read VERBATIM off
+            # the raw (unscrubbed) source file, so unlike every other kg_status field it can carry a
+            # secret across the §1.9 egress boundary. The extractor only ever sees the kg_scrub-ed source;
+            # this read must not be the hole that hands it the original. Scrub it like every sibling read
+            # (get_node/kg_context/query_graph/explain_path) — `title` is in _EGRESS_TEXT_KEYS (review-r11).
+            "coverage": self._scrub_egress(self._coverage(edges)),
             "derived_present": self.projector.db_path.exists(),
             "projection_degraded": self._projection_degraded,
         }
@@ -1908,8 +1916,10 @@ class KGEngine:
     # (which stays untouched), so scrubbing it costs no referential integrity. `question` (kg_agenda)
     # and `rationale` (kg_generate candidates) are derived FROM labels, so they must be covered too or
     # the same secret round-trips through a differently-named field (review-r4: egress-label-gap).
+    # `title` is kg_status's coverage section heading — raw source text, hence scrubbable free text
+    # like the rest of these (review-r11).
     _EGRESS_TEXT_KEYS = frozenset({"span", "notes", "note", "body", "support_note",
-                                   "label", "question", "rationale"})
+                                   "label", "question", "rationale", "title"})
 
     def _scrub_egress(self, obj):
         """Re-run the §1.9 egress scrub over the free-text fields of a read result before it returns to

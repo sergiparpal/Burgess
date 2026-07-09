@@ -38,7 +38,7 @@ import tempfile
 from pathlib import Path
 
 from .atomicio import atomic_write_bytes
-from .model import EpistemicState, Node, node_from_markdown, node_to_markdown
+from .model import EpistemicState, Node, node_from_markdown, node_to_markdown, normalize_note_text
 
 __all__ = ["merge_nodes", "merge_note_files", "main"]
 
@@ -263,6 +263,15 @@ def merge_note_files(base_text: str, ours_text: str, theirs_text: str) -> tuple[
     verbatim. But an edgeless node whose sides DISAGREE on ``epistemic_state`` (or any node with edges)
     must go through ``merge_nodes`` so the node-level ``epistemic_state`` demote (and scalar 3-way) apply —
     else an edgeless node's one-sided verdict would be silently kept, bypassing never-forge-a-verdict."""
+    # Normalize the RAW texts to the canon on-read form (BOM stripped, LF endings) before anything reads
+    # them. The semantic path gets this for free via node_from_markdown, but the fast paths below hand the
+    # raw bytes to `git merge-file`: a note saved once in a CRLF/BOM editor then differs from its LF twin
+    # on EVERY line, so git sees a whole-file divergence and returns a full-file conflict for a note whose
+    # real change was one non-overlapping line. Normalizing here drops no frontmatter key, so the fast
+    # path's "keep a pure-prose / non-canon note verbatim" purpose is preserved (review-r11).
+    base_text = normalize_note_text(base_text)
+    ours_text = normalize_note_text(ours_text)
+    theirs_text = normalize_note_text(theirs_text)
     ours = _parse(ours_text)
     theirs = _parse(theirs_text)
     if ours is None or theirs is None:

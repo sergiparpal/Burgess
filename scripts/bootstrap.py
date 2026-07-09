@@ -106,6 +106,19 @@ HEARTBEAT_SECS = STALE_LOCK_SECS / 4
 POLL_SECS = 2.0                     # how often a foreground waiter re-checks the lock
 LOG_NAME = "provision.log"          # where the detached worker logs
 SCHEMA = "1"                        # bump to force every venv to rebuild
+# Every provisioning subprocess is bounded. Without this, a child that never returns — a dead NFS/network
+# mount, an AV scanner holding the unsigned `_c_leiden` DLL, a stalled index fetch — blocks do_install
+# forever WHILE `_heartbeat_pulse` keeps the provision lock fresh from another thread. The lock therefore
+# never ages past STALE_LOCK_SECS and `pid_probe` still sees the hung PID alive, so no later session can
+# reclaim it: every subsequent provision waits out its full deadline and returns EXIT_STILL_PROVISIONING,
+# and the venv never builds. That is the field-reported venv-wedge class, reached without any crash.
+# A timeout raises TimeoutExpired, which do_install's `except BaseException` cleanup converts into the
+# ordinary interrupted-build path (husk removed, sentinel kept, lock released) — recoverable next run.
+# Generous enough that a cold, no-wheel, source-building install on a slow link still finishes
+# (review-r11).
+INSTALL_TIMEOUT_SECS = 30 * 60      # `uv sync` / `pip install` — may compile wheels on a slow link
+PROBE_TIMEOUT_SECS = 60             # in-venv import probes (mandatory verify + advisory soft probes)
+RECONCILE_TIMEOUT_SECS = 120        # the post-install canon reconcile sweep
 # Provisioning process exit codes, named once (review-r5: the meanings lived only in prose here
 # and again in launch_server.mjs's comments). launch_server treats any non-zero as "not ready";
 # the distinct values make the logs say WHY.
@@ -290,9 +303,12 @@ def release(venv_dir: Path) -> None:
 # --------------------------------------------------------------------------- #
 # Install
 # --------------------------------------------------------------------------- #
-def run(cmd: list[str], *, cwd: Path | None = None, env: dict | None = None) -> None:
+def run(cmd: list[str], *, cwd: Path | None = None, env: dict | None = None,
+        timeout: float | None = None) -> None:
+    """Run a provisioning step, checked and BOUNDED. `timeout` is required in spirit: every caller passes
+    one (see the *_TIMEOUT_SECS constants for why an unbounded child wedges provisioning permanently)."""
     print(f"[bootstrap] $ {' '.join(str(c) for c in cmd)}", flush=True)
-    subprocess.run(cmd, check=True, cwd=str(cwd) if cwd else None, env=env)
+    subprocess.run(cmd, check=True, cwd=str(cwd) if cwd else None, env=env, timeout=timeout)
 
 
 def install_with_uv(venv_dir: Path, uv: str) -> None:
@@ -310,7 +326,7 @@ def install_with_uv(venv_dir: Path, uv: str) -> None:
         shutil.copyfile(PYPROJECT, proj_dir / "pyproject.toml")
     env = {**os.environ, "UV_PROJECT_ENVIRONMENT": str(venv_dir)}
     print("[bootstrap] Installing dependencies with uv (sync --no-install-project)", flush=True)
-    run([uv, "sync", "--no-install-project"], cwd=proj_dir, env=env)
+    run([uv, "sync", "--no-install-project"], cwd=proj_dir, env=env, timeout=INSTALL_TIMEOUT_SECS)
 
 
 def install_with_pip(venv_dir: Path) -> None:
@@ -331,9 +347,10 @@ def install_with_pip(venv_dir: Path) -> None:
     py = venv_python(venv_dir)
     if not py.exists():
         raise SystemExit(f"[bootstrap] venv interpreter not found at {py}")
-    run([str(py), "-m", "pip", "install", "--upgrade", "pip", "wheel", "setuptools"])
+    run([str(py), "-m", "pip", "install", "--upgrade", "pip", "wheel", "setuptools"],
+        timeout=INSTALL_TIMEOUT_SECS)
     print("[bootstrap] Installing the engine + dependencies with pip", flush=True)
-    run([str(py), "-m", "pip", "install", str(REPO_ROOT)])
+    run([str(py), "-m", "pip", "install", str(REPO_ROOT)], timeout=INSTALL_TIMEOUT_SECS)
 
 
 def _engine_env() -> dict:
@@ -343,7 +360,7 @@ def _engine_env() -> dict:
 
 def verify_imports(py: Path) -> None:
     print("[bootstrap] Verifying core imports", flush=True)
-    run([str(py), "-c", _VERIFY_IMPORTS], env=_engine_env())
+    run([str(py), "-c", _VERIFY_IMPORTS], env=_engine_env(), timeout=PROBE_TIMEOUT_SECS)
 
 
 def _is_functional_venv(venv_dir: Path) -> bool:
@@ -374,9 +391,15 @@ def _soft_probe(py: Path, snippet: str, parent_fail_msg: str) -> None:
     """Run an ADVISORY in-venv import probe that must never abort provisioning (review-r5: the
     two probes were structural copy-paste). A NON-checking subprocess (never ``run()``, which is
     ``check=True``); the in-venv import/DLL-load error is reported by the snippet itself, and a
-    parent-side launch failure (OSError) by the except — either way provisioning proceeds."""
+    parent-side launch failure (OSError) by the except — either way provisioning proceeds.
+
+    Bounded like every other provisioning child: a soft probe that HANGS (an AV scanner holding the
+    unsigned `_c_leiden` DLL is the known case) would otherwise wedge do_install indefinitely while the
+    heartbeat keeps the provision lock fresh. TimeoutExpired lands in the same swallow-and-report path as
+    any other probe failure, because an advisory probe's verdict is never load-bearing (review-r11)."""
     try:
-        subprocess.run([str(py), "-c", snippet], check=False, env=_engine_env())
+        subprocess.run([str(py), "-c", snippet], check=False, env=_engine_env(),
+                       timeout=PROBE_TIMEOUT_SECS)
     except Exception as exc:  # noqa: BLE001 — an optional/blocked dep must never abort provisioning
         print(parent_fail_msg.format(exc=f"{type(exc).__name__}: {exc}"), flush=True)
 
@@ -680,8 +703,11 @@ def maybe_reconcile(venv_dir: Path) -> None:
         "          f\"forged verdict(s)\")\n"
     )
     try:
-        subprocess.run([str(py), "-c", snippet], check=False, env=_engine_env())
-    except OSError:
+        # Bounded: a reconcile that hangs (an unreadable canon on a dead mount) must not hold the
+        # provision lock open forever — the sweep is best-effort and re-runs next session (review-r11).
+        subprocess.run([str(py), "-c", snippet], check=False, env=_engine_env(),
+                       timeout=RECONCILE_TIMEOUT_SECS)
+    except (OSError, subprocess.TimeoutExpired):
         pass
 
 
@@ -755,13 +781,20 @@ def provision(venv_dir: Path, *, wait_secs: float, reconcile: bool = False) -> i
         do_install(venv_dir)
         print("[bootstrap] Done.", flush=True)
         return _ok_with_reconcile(venv_dir, reconcile)
-    except subprocess.CalledProcessError as exc:
-        # A failed pip/uv/venv command: in the foreground catch-up path (the launcher
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        # A failed OR TIMED-OUT pip/uv/venv command: in the foreground catch-up path (the launcher
         # racing the background build) show a clean, actionable line instead of a raw
         # traceback. The detached worker logs the same to provision.log.
+        # A timeout is the interrupted-build path, not a distinct outcome: do_install's cleanup already
+        # removed the husk and kept the owner sentinel, so the next session rebuilds. Report it as such —
+        # TimeoutExpired carries `cmd` but no `returncode` (review-r11).
         log_path = venv_dir.parent / LOG_NAME
+        if isinstance(exc, subprocess.TimeoutExpired):
+            what = f"timed out after {exc.timeout:.0f}s"
+        else:
+            what = f"failed (exit {exc.returncode})"
         sys.stderr.write(
-            f"[bootstrap] Install step failed (exit {exc.returncode}): "
+            f"[bootstrap] Install step {what}: "
             f"{' '.join(str(c) for c in exc.cmd)}\n"
             f"[bootstrap] See {log_path} for details, then start a new session.\n"
         )

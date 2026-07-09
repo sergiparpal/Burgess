@@ -101,10 +101,13 @@ def test_write_failure_still_rolls_back(canon: Canon, monkeypatch):
     canon.write_nodes([Node(id="a", label="A")], message="seed a")
     real_write = canon_mod._atomic_write
 
-    def boom(path, text):
+    # **kw: _write_batch passes fsync_dir=False (the batch fsyncs the canon dir once at the end).
+    # A double with a fixed (path, text) signature raises TypeError instead of the OSError under test,
+    # which still "rolls back" — so the test would pass for the wrong reason (review-r11).
+    def boom(path, text, **kw):
         if path.name == "c.md":
             raise OSError("simulated crash mid-write")
-        return real_write(path, text)
+        return real_write(path, text, **kw)
 
     monkeypatch.setattr(canon_mod, "_atomic_write", boom)
     info = canon.write_nodes([Node(id="b", label="B"), Node(id="c", label="C")], message="batch b,c")

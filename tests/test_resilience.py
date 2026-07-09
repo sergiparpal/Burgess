@@ -102,10 +102,12 @@ def test_partially_applied_write_is_atomic(engine, monkeypatch):
     Stage-1 chaos suite, driven through the kg_write boundary."""
     real = canon_mod._atomic_write
 
-    def boom(path, text):
+    # **kw: _write_batch passes fsync_dir=False; a fixed-arity double would raise TypeError instead of
+    # the OSError under test and the assertion would hold for the wrong reason (review-r11).
+    def boom(path, text, **kw):
         if path.name == "claim.md":
             raise OSError("simulated crash mid-write")
-        return real(path, text)
+        return real(path, text, **kw)
 
     monkeypatch.setattr(canon_mod, "_atomic_write", boom)
     out = engine.kg_write(_grounding_payload())
@@ -182,10 +184,10 @@ def test_rolled_back_write_is_not_cached(engine, monkeypatch):
     real = canon_mod._atomic_write
     fail = {"on": True}
 
-    def maybe_boom(path, text):
+    def maybe_boom(path, text, **kw):  # **kw: _write_batch passes fsync_dir=False (review-r11)
         if fail["on"] and path.name == "claim.md":
             raise OSError("transient")
-        return real(path, text)
+        return real(path, text, **kw)
 
     monkeypatch.setattr(canon_mod, "_atomic_write", maybe_boom)
     r1 = engine.kg_write(_grounding_payload(), idempotency_key="k")

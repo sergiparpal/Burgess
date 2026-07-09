@@ -427,8 +427,27 @@ function main() {
     },
   });
   sup.installSignalHandlers();
+  installProcessGuards();
   serverLog(`supervisor up (py=${py})`);
   sup.start();
+}
+
+// Last-resort process guards, installed only on the real supervisor path (never on import, so the
+// launcher tests are unaffected). Node >= 15 terminates the process on an unhandled promise rejection:
+// for a long-running supervisor whose whole job is to keep the engine alive, a stray rejection in a
+// logging or heal path would silently take the MCP server down with no trace in server.log. Log it and
+// KEEP SUPERVISING — the child engine is the thing that matters, and nothing here awaits a promise whose
+// failure invalidates supervisor state. An uncaughtException is different: state may be inconsistent, so
+// record it and exit non-zero, which is what would have happened anyway — except now it is written down
+// (review-r11).
+function installProcessGuards() {
+  process.on("unhandledRejection", (reason) => {
+    serverLog(`unhandled rejection (supervisor continues): ${reason?.stack || reason}`);
+  });
+  process.on("uncaughtException", (err) => {
+    serverLog(`uncaught exception: ${err?.stack || err}`);
+    process.exit(1);
+  });
 }
 
 // Only supervise when invoked as the entry script — importing this module (the launcher tests import the
