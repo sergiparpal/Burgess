@@ -7,11 +7,11 @@
 **This document is the contract.** If any instruction here conflicts with what the agent finds in the actual donor code, the agent records the discrepancy in `INVENTORY.md`, adapts the task to reality, and preserves the *invariants* (Section 4) — the invariants win over everything, including this plan's own task descriptions.
 
 > **Editorial note (2026-07-09), added after the fact.** This plan is a **historical record** of how Burgess
-> was built; it is preserved as written except that the donor repository URLs have been removed. Both donor
-> repositories have since been **retired and unpublished** by their author, so the provisioning steps below
-> that clone them from GitHub can no longer be executed. The pinned donor checkouts recorded in
-> `scripts/donor_pins.json` are the surviving copies, and the I11 donor-integrity gate still runs against
-> them. Nothing else in this document has been changed.
+> was built. Both donor repositories have since been **retired and unpublished** by their author, so the
+> provisioning steps below that clone them from GitHub can no longer be executed. The pinned donor checkouts
+> recorded in `scripts/donor_pins.json` are the surviving copies, and the I11 donor-integrity gate still runs
+> against them. Decision Rule **D5 (upstream drift)** is retired as a consequence — see the annotation at §14.
+> Apart from the removal of the donor URLs and that one marked annotation, the document is preserved as written.
 
 ---
 
@@ -354,7 +354,12 @@ Resuming later (new session): same instruction — the agent reads `docs/fusion/
 - **D2 — Constant conflicts.** If donor code constants differ from this plan's README-derived values (judge weight/clip, monitor thresholds, embedder id): **code wins**, plan text is annotated in `INVENTORY.md`, no question asked.
 - **D3 — Naming collisions.** If a proposed name (command, module, table) collides with an existing symbol, prefix with `divergence_`/`ideate_` and record in `DECISIONS.md`; no question asked.
 - **D4 — Flaky donor-baseline tests.** Tests already failing at the Stage-0 donor baselines never block a stage commit; new failures always do.
-- **D5 — Upstream drift.** Donor repos are read at the Stage-0 SHAs. If a donor's remote gains new commits mid-build, ignore them; note the fact in `BASELINE.md`. Re-syncing is a post-release, human-initiated decision.
+- **D5 — Upstream drift.** ~~Donor repos are read at the Stage-0 SHAs. If a donor's remote gains new commits mid-build, ignore them; note the fact in `BASELINE.md`. Re-syncing is a post-release, human-initiated decision.~~
+  > **[RETIRED 2026-07-09]** Both donor repositories have been unpublished by their author. There is no
+  > upstream left to drift, and the "post-release, human-initiated" re-sync this rule deferred has been
+  > foreclosed rather than taken. D5 governs nothing and requires nothing; the ID is kept, struck through,
+  > so the historical record and every citation of it still resolve. Donor *integrity* is unaffected and
+  > still enforced — that was always I11, not D5. See `DECISIONS.md`, "Decision Rule D5 retired".
 
 ---
 

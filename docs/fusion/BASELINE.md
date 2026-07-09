@@ -2,6 +2,10 @@
 
 Both donors pinned at these SHAs for the whole build (Decision Rule D5: upstream drift is ignored; re-syncing is a post-release human decision).
 
+> **D5 is retired (2026-07-09).** Both donor repositories have been unpublished, so there is no upstream to
+> drift from and no re-sync to decide; these SHAs are now permanent by necessity. Donor *integrity* is
+> unaffected — that is I11, which still runs against the local checkouts. See `DECISIONS.md`.
+
 ## Sproutgraph (convergence donor)
 
 - HEAD: `17c406632bb547a4abca3a824d9ffdc577e83891` (branch `main`)
