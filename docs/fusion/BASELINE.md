@@ -4,7 +4,6 @@ Both donors pinned at these SHAs for the whole build (Decision Rule D5: upstream
 
 ## Sproutgraph (convergence donor)
 
-- URL: https://github.com/sergiparpal/Sproutgraph
 - HEAD: `17c406632bb547a4abca3a824d9ffdc577e83891` (branch `main`)
 - Working tree at pin time: clean (`git status --porcelain` empty)
 - Test baseline (pristine `git archive` copy, `uv run --extra dev pytest tests/ -p no:cacheprovider`, `PYTHONDONTWRITEBYTECODE=1`):
@@ -15,7 +14,6 @@ Both donors pinned at these SHAs for the whole build (Decision Rule D5: upstream
 
 ## Cambrian (divergence donor)
 
-- URL: https://github.com/sergiparpal/Cambrian
 - HEAD: `a2adfa1d8b83c52ba17a79382811ea82012f8f99` (branch `main`)
 - Working tree at pin time: clean
 - Test baseline (pristine `git archive` copy; venv via `uv venv` py3.12; `pip install -r skills/ideate/scripts/requirements-dev.txt` + `pip install -e skills/ideate/scripts --no-deps`; `CAMBRIAN_EMBEDDER=hash`, `PYTHONDONTWRITEBYTECODE=1`, `pytest -q -p no:cacheprovider`):

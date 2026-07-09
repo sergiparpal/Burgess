@@ -6,14 +6,21 @@
 **Human role:** Answer a short kickoff questionnaire (Stage 0) and, at most, one brief multiple-choice question per stage if the agent is genuinely blocked. Every question ships with a recommended default and a short timeout, after which the default applies and execution continues. There are **no mandatory human review checkpoints**: every gate that would normally be a human review is an automated test suite or a pre-declared decision rule (Section 14).
 **This document is the contract.** If any instruction here conflicts with what the agent finds in the actual donor code, the agent records the discrepancy in `INVENTORY.md`, adapts the task to reality, and preserves the *invariants* (Section 4) — the invariants win over everything, including this plan's own task descriptions.
 
+> **Editorial note (2026-07-09), added after the fact.** This plan is a **historical record** of how Burgess
+> was built; it is preserved as written except that the donor repository URLs have been removed. Both donor
+> repositories have since been **retired and unpublished** by their author, so the provisioning steps below
+> that clone them from GitHub can no longer be executed. The pinned donor checkouts recorded in
+> `scripts/donor_pins.json` are the surviving copies, and the I11 donor-integrity gate still runs against
+> them. Nothing else in this document has been changed.
+
 ---
 
 ## 1. Mission
 
-Build one plugin from two donors by the same author — both of which continue to exist, untouched, as independent projects:
+Build one plugin from two donors by the same author — both of which were, when this plan was written, live and untouched independent projects (see the editorial note above):
 
-- **Sproutgraph** — <https://github.com/sergiparpal/Sproutgraph> — the *convergence* donor. Grows source documents into a grounded, queryable knowledge graph. Every non-deterministic edge must quote a verbatim span from the source and survive re-checking, or it is rejected. It guarantees fidelity to the source, never truth about the world.
-- **Cambrian** — <https://github.com/sergiparpal/Cambrian> — the *divergence* donor. Turns any creative brief into a diverse, non-cliché slate of ideas using a local, server-less Python engine (MAP-Elites + geometric novelty + DPP selection) that keeps the LLM from collapsing to the mean. The human steers and selects in chat.
+- **Sproutgraph** — the *convergence* donor. Grows source documents into a grounded, queryable knowledge graph. Every non-deterministic edge must quote a verbatim span from the source and survive re-checking, or it is rejected. It guarantees fidelity to the source, never truth about the world.
+- **Cambrian** — the *divergence* donor. Turns any creative brief into a diverse, non-cliché slate of ideas using a local, server-less Python engine (MAP-Elites + geometric novelty + DPP selection) that keeps the LLM from collapsing to the mean. The human steers and selects in chat.
 
 The new plugin inherits Sproutgraph's architecture as its spine (canon/derived split, MCP trust boundary, grounding loop, experiment harness) and absorbs Cambrian's engine as a **firewalled divergence subsystem below the grounding boundary**: its geometry governs how ideas are generated and presented, and it never gains any authority over what counts as grounded.
 
@@ -32,11 +39,11 @@ All three repositories sit side by side under one parent directory:
 ```
 <parent>/
 ├── NewPlugin/       ← this repo (starts containing only FUSION_PLAN.md)
-├── Sproutgraph/     ← donor, read-only   (https://github.com/sergiparpal/Sproutgraph)
-└── Cambrian/        ← donor, read-only   (https://github.com/sergiparpal/Cambrian)
+├── Sproutgraph/     ← donor, read-only
+└── Cambrian/        ← donor, read-only
 ```
 
-If a donor sibling is missing at Stage 0, the agent clones it from its GitHub URL into the parent directory. Cloning creates a local copy and modifies nothing upstream.
+If a donor sibling is missing at Stage 0, the agent clones it into the parent directory. Cloning creates a local copy and modifies nothing upstream. (As written, this step cloned each donor from its GitHub URL; both repositories have since been retired, so the local checkouts pinned in `scripts/donor_pins.json` are now the only copies.)
 
 ### 2.2 Read-only enforcement (Invariant I11)
 
@@ -188,9 +195,10 @@ Python ≥3.11 **(verify against donors' pins)**, `git`, `uv` (fallback `python 
 ```bash
 mkdir NewPlugin && cd NewPlugin && git init
 # put this file at the repo root as FUSION_PLAN.md  (the repo's only initial content)
-# optional but recommended — donors as siblings (the agent will clone them if absent):
-git -C .. clone https://github.com/sergiparpal/Sproutgraph
-git -C .. clone https://github.com/sergiparpal/Cambrian
+# optional but recommended — donors as siblings (the agent will clone them if absent).
+# NOTE: both donor repos have since been retired; these clone steps no longer resolve.
+git -C .. clone <Sproutgraph>
+git -C .. clone <Cambrian>
 claude
 > Read FUSION_PLAN.md and execute it stage by stage, starting at Stage 0.
 > Follow its Agent Operating Protocol exactly. It is the contract.

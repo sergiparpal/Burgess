@@ -10,8 +10,8 @@
 
 Burgess fuses two engines around one boundary:
 
-- a **convergence engine** (from [Sproutgraph](https://github.com/sergiparpal/Sproutgraph)) that grows source documents into a rigorously grounded, queryable knowledge graph — human-editable canon, three-axis provenance, a span-present write boundary, a grounding loop with permanent memory of failures, and a regenerable NetworkX/SQLite derived layer;
-- a **divergence engine** (from [Cambrian](https://github.com/sergiparpal/Cambrian)) that turns any brief into a diverse, non-cliché slate of ideas — a local, server-less MAP-Elites archive with k-NN geometric novelty, DPP slate selection, and an anti-collapse monitor, with you steering and selecting in chat.
+- a **convergence engine** (from Sproutgraph) that grows source documents into a rigorously grounded, queryable knowledge graph — human-editable canon, three-axis provenance, a span-present write boundary, a grounding loop with permanent memory of failures, and a regenerable NetworkX/SQLite derived layer;
+- a **divergence engine** (from Cambrian) that turns any brief into a diverse, non-cliché slate of ideas — a local, server-less MAP-Elites archive with k-NN geometric novelty, DPP slate selection, and an anti-collapse monitor, with you steering and selecting in chat.
 
 The name is the thesis: the **Burgess Shale** is where the Cambrian explosion's forms were preserved in stone — divergence and grounding in one word.
 
@@ -135,10 +135,11 @@ The fusion invariants live in `tests/fusion/` (import firewall, DB isolation, ad
 
 ## Lineage
 
-Burgess is a fusion of two MIT-licensed plugins by the same author, both of which continue as independent projects:
+Burgess is a fusion of two MIT-licensed plugins by the same author. Both donor repositories have since been
+retired and are no longer published; Burgess is their continuation:
 
-- **Sproutgraph** — <https://github.com/sergiparpal/Sproutgraph> — the convergence spine (engine, MCP boundary, commands, agents, experiment harness, canon/derived model), vendored at `17c4066`.
-- **Cambrian** — <https://github.com/sergiparpal/Cambrian> — the divergence engine (embedder, MAP-Elites, novelty, DPP, monitor, judge bounds, cliché discipline), vendored at `a2adfa1`.
+- **Sproutgraph** — the convergence spine (engine, MCP boundary, commands, agents, experiment harness, canon/derived model), vendored at `17c4066`.
+- **Cambrian** — the divergence engine (embedder, MAP-Elites, novelty, DPP, monitor, judge bounds, cliché discipline), vendored at `a2adfa1`.
 
 Per-file attribution with SHAs and every adaptation: [`docs/fusion/ATTRIBUTION.md`](docs/fusion/ATTRIBUTION.md). Migrating from either donor: [`docs/MIGRATION.md`](docs/MIGRATION.md). How this plugin was built (the full fusion plan and its decision log): [`docs/fusion/`](docs/fusion/).
 
