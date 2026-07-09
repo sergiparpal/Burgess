@@ -302,7 +302,8 @@ through unverified/hypothesized/refuted links, or not at all), never an exceptio
 
 **At most 32 distinct nodes per call.** The grounded shortest-path closure costs one BFS per pair, so the
 work is quadratic in the number of concepts you pass. Beyond the cap the tool refuses in the same empty
-shape rather than wedging the engine: `{"path": [], "leap": null, "reason": "too many nodes: 80 (max 32)"}`.
+shape rather than wedging the engine: `{"path": [], "edges": [], "leap": null, "grounded_only": true,
+"reason": "too many nodes: 80 (max 32)"}`.
 Duplicates are deduped before the cap is applied. If you want to relate more concepts than that, ask a
 narrower question — a 32-hop chain is already past what a person can read.
 
@@ -928,7 +929,7 @@ errors}`.
 | connect concepts over GROUNDED edges only (+ advisory leap) | `kg_explain_path(nodes)` |
 | budgeted, grounding-aware context (+ failures + bridges) | `kg_context(query=?, budget=?)` |
 | propose hypothesized candidates (the offensive lane) | `kg_propose(payload)` |
-| generate structural idea candidates (read-only) | `kg_generate(mechanism=?, k=?, second_graph=?, second_construction=?)` |
+| generate structural idea candidates (read-only) | `kg_generate(mechanism=?, k=?, second_graph=?, dpp=?, second_construction=?)` |
 | run a §8 endo operation (collapse/explode/regroup/open) | `kg_operate(op, …)` |
 | score the §14 absorption window | `kg_absorption()` |
 | start/resume a divergence session for a brief | `kg_diverge_init(project, axes=?, session=?)` |

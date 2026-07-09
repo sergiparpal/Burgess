@@ -609,6 +609,12 @@ An open-ended orientation question:
 /kg-query What is this graph confident about, and where is it weakest?
 ```
 
+> **Bound on structural chains.** When a question makes the command trace an associative chain between
+> concepts, it walks **grounded edges only** and relates **at most 32 concepts per call**. The search costs
+> one traversal per pair, so it is quadratic in that count; beyond the cap the engine refuses outright
+> (`too many nodes: N (max 32)`) rather than stalling. A question that needs more concepts than that is
+> really several narrower questions.
+
 ### Reading the answer
 
 Every cited claim carries its axes inline:

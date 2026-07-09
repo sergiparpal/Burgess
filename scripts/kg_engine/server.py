@@ -2471,8 +2471,9 @@ def _register(mcp, engine: KGEngine) -> None:
                     dpp: bool | None = None, second_construction: str | None = None) -> dict:
         """Generate hypothesized idea candidates from the graph's structure (PLAN Stage 3). Mechanisms:
         bridge (§2/§4), seed (§3 residual), compression (§7 new nodes), regroup (§8), transplant (§5),
-        ensemble (§9) — or "all"/"default". READ-ONLY: candidates are proposals (provenance=hypothesized,
-        no span); route them through kg_propose. Generate offensively; kg_ground judges later.
+        ensemble (§9), periphery (§5 low-degree sources) — or "all"/"default". READ-ONLY: candidates are
+        proposals (provenance=hypothesized, no span); route them through kg_propose. Generate
+        offensively; kg_ground judges later.
         For the `ensemble` exo move, supply EITHER `second_construction` (the NAME of an in-session
         second construction built via kg_write(..., construction=…) — projected here, key-free) OR
         `second_graph` (a path to a pre-built graph.json); with neither, ensemble degrades to `regroup`
@@ -2572,7 +2573,7 @@ def _register(mcp, engine: KGEngine) -> None:
         return engine.kg_export(kind)
 
     # ------------------------------------------------------------------------- #
-    # Divergence surface (FUSION_PLAN Stage 3) — the /kg-diverge flow's six tools.
+    # Divergence surface (FUSION_PLAN Stage 3) — the /kg-diverge flow's seven tools.
     #
     # Everything here sits BELOW the grounding boundary: these tools organize idea
     # candidates geometrically (embed → MAP-Elites → k-NN novelty → DPP slate →
@@ -2581,7 +2582,7 @@ def _register(mcp, engine: KGEngine) -> None:
     # local and session-ephemeral (.kg/diverge, I4/I10). kg_engine.divergence is
     # imported LAZILY inside each body so this module's import graph stays
     # divergence-free (I3, firewall-tested) and a missing divergence dep degrades
-    # only these six tools with a clear error (I9) — never a kg_* tool.
+    # only these seven tools with a clear error (I9) — never a kg_* tool.
     # ------------------------------------------------------------------------- #
     @mcp.tool()
     @_tool_result

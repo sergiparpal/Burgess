@@ -65,6 +65,9 @@ Use these to follow specific relationships rather than to re-rank context:
   Unlike `shortest_path`, every hop here has actually been verified; `leap` (= path length) is an **advisory**
   creative-distance signal, never a verdict. Empty `path`/`leap=null` with a `reason` when the only connection
   runs through unverified/hypothesized links — say so honestly rather than implying a grounded chain exists.
+  **Pass at most 32 distinct nodes**: the cost is quadratic in that count, so beyond the cap the tool refuses
+  in the same empty shape (`reason: "too many nodes: N (max 32)"`) rather than stalling the engine. If a
+  question seems to need more, it is really several narrower questions.
 
 ### 3. Answer with provenance attached
 For every edge you cite, surface its axes inline. A compact convention:

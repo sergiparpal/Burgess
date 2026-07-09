@@ -93,7 +93,7 @@ class Candidate:
     (the propose lane forces them).
     """
     kind: str            # "edge" | "node"
-    mechanism: str       # "bridge" | "seed" | "compression" | "regroup" | "transplant" | "ensemble"
+    mechanism: str       # "bridge" | "seed" | "compression" | "regroup" | "transplant" | "ensemble" | "periphery"
     source: str = ""     # for edges
     target: str = ""     # for edges
     relation: str = ""   # for edges (a pack edge_type)
@@ -694,7 +694,7 @@ def _dedup_candidates(out: list, mech_by_key: dict) -> list:
 
 def run_generators(G, mechanism="bridge", *, pack=None, corpus=None, failures=None, k=10,
                    second_graph=None) -> list:
-    """Dispatch to one mechanism, the default set, or all six. `mechanism="all"` runs ALL_SET;
+    """Dispatch to one mechanism, the default set, or all seven. `mechanism="all"` runs ALL_SET;
     `mechanism="default"` runs DEFAULT_SET; an unknown name runs DEFAULT_SET (never raises).
     `pack`/`corpus` are accepted for API stability but unused: no mechanism reads them (review-r5
     dropped them from the mechanism signatures, where they were dead weight on every call site)."""

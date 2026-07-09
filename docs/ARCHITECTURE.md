@@ -115,10 +115,17 @@ source span** (normalized substring check: whitespace collapsed, case-folded, cu
 folded). The full contract, reason strings and worked examples:
 `skills/burgess/references/contract.md`.
 
+Nodes carry no `collapses-into-*` quarantine — a re-emitted node id is deduped and ACCEPTED. But a
+node already holding a verdict (`grounded`/`rejected`/`failed`/`obsolete`) keeps its **body** across
+that merge: a `Node` has no `span` field, so `kg_ground` restates a promoted node's support *in the
+body*, and an incoming body would otherwise blank the very evidence the verdict rests on
+(`canon._merge_into_existing`). Label and `node_type` still update. To revise a grounded node's
+prose, edit the canon note.
+
 `kg_propose(payload)` is the **hypothesized write lane**: it forces `provenance=hypothesized`,
 refuses text claims (`propose-lane-text-claim`), requires no span, and preserves
 `authored_by=deterministic` for genuine discovery mechanisms. Same validator, same forge guards.
-The `/kg-operate` mechanisms are those discovery mechanisms and they do claim it: their structural edges
+The `kg_operate` mechanisms are those discovery mechanisms and they do claim it: their structural edges
 carry `authored_by=deterministic`, while a node whose `label`/`body` came from the caller stays `agent` —
 structure is computed, language is authored.
 
@@ -137,9 +144,16 @@ ledger `<project>/.kg-ground-audit.jsonl` (with a `.ckpt` sidecar for O(1) recov
 
 The **reconciler** (`reconciler.py`) polices the canon for out-of-band edits: an
 `epistemic_state` sitting in a groundable state with no matching audit record is a **forged
-verdict** and is reset to `unverified` (verdict fields cleared, re-quarantined). Forge detection
-is *counting*, not set-membership — each legitimate transition consumes exactly one audit record,
-defeating replay. State cache: `<project>/.kg-reconcile-state.json` (fails open). `rejected` and
+verdict**, and its fields are cleared and re-quarantined. The state it is reset *to* is the
+failure baseline the forge overwrote, falling back to `unverified` only when the item held no
+prior verdict (`_requarantine_state`) — otherwise a forge *over* a failure
+(`rejected` → hand-edited `grounded` → re-quarantined `unverified`) would launder the failure
+away: the item drops out of `failure_ids`, the boundary stops quarantining re-proposals of the
+refuted claim, and no later sweep can recover it. Its twin, `_restore_erased_negative`, catches
+the same erasure attempted directly (`failed`/`rejected` → `unverified`). The two guards are the
+two halves of one rule: **an out-of-band edit may never be the thing that ends a falsification**
+(§1.7). Forge detection is *counting*, not set-membership — each legitimate transition consumes
+exactly one audit record, defeating replay. State cache: `<project>/.kg-reconcile-state.json` (fails open). `rejected` and
 `failed` edges are permanent negative memory — never pruned, surfaced in
 `kg_context.falsification_counters`.
 

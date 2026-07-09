@@ -85,7 +85,7 @@ the sibling code path — which is what made them findable. No change to the 27-
 
 ### Changed
 
-- **`/kg-operate`'s discovery mechanisms now claim the authorship they actually have.** The boundary has
+- **`kg_operate`'s discovery mechanisms now claim the authorship they actually have.** The boundary has
   always preserved `authored_by=deterministic` on the hypothesized lane "for a genuine discovery
   mechanism", but no mechanism ever set it, so every engine-derived item was recorded as `agent` and the
   axis carried less information than it promised. Structural edges are now `deterministic`; a node whose
@@ -107,6 +107,45 @@ Measured on a synthetic canon; no behavioural change (the `/kg-generate` slate i
   re-parse the same file for the no-op guard.
 - **Batch canon writes fsync the canon directory once, not once per note** (802 fsyncs → 1 on a 400-node
   batch). Per-file content durability is unchanged; only the redundant directory-entry fsync is hoisted.
+
+### Docs
+
+- **`docs/COMMANDS.md`** — new complete command manual: every argument of all nine slash commands, what
+  each option value means, and a worked example per case. Linked from the README's command table, which
+  stays the summary.
+- **README `Configuration` section** — the four install-time settings (`source_path`, `sensitivity`,
+  `metrics_mode`, `extract_wave_size`) documented with their values, defaults, and what each controls,
+  plus how `source_path` resolves a file, a directory, or a glob.
+- **Decision Rule D5 (upstream drift) is retired.** Both donor repositories have been unpublished, so the
+  rule's premise — an upstream that can gain commits — no longer holds, and its one open clause (a
+  deferred re-sync) is foreclosed rather than exercised. The ID is kept and struck through at the
+  definition site so its citations still resolve. Donor *integrity* is untouched: that was always **I11**,
+  which still gates every commit. Dead donor-repo links removed from the README, `MIGRATION.md`,
+  `ATTRIBUTION.md`, `BASELINE.md`, `FUSION_PLAN.md` and `scripts/donor_pins.json`; the surviving D5
+  citations in `BASELINE.md` and `PLAN_STATE.md` now carry the retirement note.
+- Closed the v0.3.0 reference/user-facing doc gap: the tempered-divergence `reach` dial and the key-free
+  second construction reached `TUTORIAL.md`, the README cheat sheet, and the subagent-facing
+  `references/{contract,tools,pack-schema,axis_inference}.md`, which the feature commits had skipped.
+- `kg_explain_path`'s 32-concept cap now also appears where a *caller* meets it — the `/kg-query` command
+  body and the command manual — alongside the existing notes in `references/tools.md` and
+  `ARCHITECTURE.md`. `references/contract.md` is the write contract and correctly stays silent on it.
+- **The review-r11 engine changes reached the prose.** `ARCHITECTURE.md` still described a forged verdict
+  as reset to `unverified`; it is now restored to the failure baseline the forge overwrote (`unverified`
+  only when the item held no prior verdict). Its write-path section never stated the node-body durability
+  rule — that a verdict-bearing node keeps the body carrying its `grounding span:` across a re-write —
+  which `references/contract.md` documents.
+- **Names corrected where a doc invented one.** `kg_operate` was written as a slash command
+  (`/kg-operate`) in `ARCHITECTURE.md` and this changelog; there is no such command — it is a tool, called
+  by `/kg-generate`. Two `server.py` comments called the divergence surface "six tools" (seven). The
+  `kg_generate` tool description and the `Candidate` docstring both omitted `periphery`, a mechanism
+  `_resolve_mechanisms` accepts directly, so a caller could not discover it. `references/tools.md`'s
+  quick-map row for `kg_generate` had lost its `dpp=` parameter (the authoritative §1.13 entry kept it),
+  and its cap-refusal example omitted the `edges`/`grounded_only` keys the tool really returns.
+- `/kg-experiment`'s own `description` advertised four arms; its body runs five (it omitted
+  `graph+generate+dpp`). The README's provisioning note claimed a Python floor of 3.11, where
+  `requires-python` and CI both say **3.10**. `TUTORIAL.md`'s cheat-sheet dropped `/kg-diverge`'s
+  `domain-template` dial and `/kg-perturb`'s `graph.json` form, and now points at the command manual for
+  the optional arguments it deliberately leaves out.
 
 ## 0.3.0 — 2026-07-08
 

@@ -312,16 +312,19 @@ believed.
 
 | Command | When you reach for it |
 |---|---|
-| `/kg-diverge <brief> [reach]` | Brainstorm wide, fight clichés, pin the keepers. No graph needed. Add `wild` or `conservative` to change how far out it goes (default `balanced`). |
+| `/kg-diverge <brief> [domain-template] [reach]` | Brainstorm wide, fight clichés, pin the keepers. No graph needed. Add `wild` or `conservative` to change how far out it goes (default `balanced`), and name a domain template (e.g. `marketing`) to pick the axes it spreads across. |
 | *materialize* (just ask) | Promote your pinned ideas into the graph as hypotheses. |
 | `/kg-build <file/folder>` | Turn a document (or many) into a graph. Adds to what's there. |
 | `/kg-ground` | Fact-check against your source. The **only** way to mark something trusted. |
 | `/kg-generate` | Let the graph's structure suggest new candidate ideas. |
-| `/kg-perturb <2nd source>` | Bring in an outside viewpoint to expose blind spots. |
+| `/kg-perturb [2nd source]` | Bring in an outside viewpoint to expose blind spots. Give it another document, or a prior construction's `graph.json`. |
 | `/kg-query <question>` | Ask your graph, with trust levels attached to every answer. |
 | `/kg-view` | Render an offline interactive map + a written report. |
 | `/kg-eval` | Measure extraction precision and grounding reliability. |
 | `/kg-experiment` | Blind-test whether the graph really improves ideation. |
+
+Most commands take optional arguments this table leaves out — every one of them, with worked examples,
+is in the [command manual](docs/COMMANDS.md).
 
 ---
 

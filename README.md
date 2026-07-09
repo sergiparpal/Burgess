@@ -30,7 +30,7 @@ For local development, point Claude Code at a checkout instead:
 claude --plugin-dir /path/to/Burgess
 ```
 
-On first load a SessionStart hook provisions a local Python venv (Python ≥ 3.11 recommended; `uv` preferred, stdlib `venv`+`pip` fallback) in the plugin's persistent data dir. Everything runs locally; the divergence embedder is [model2vec](https://github.com/MinishLab/model2vec) `potion-multilingual-128M` (CPU, torch-free, ~120 MB, cached after first download).
+On first load a SessionStart hook provisions a local Python venv (Python ≥ 3.10; `uv` preferred, stdlib `venv`+`pip` fallback) in the plugin's persistent data dir. Everything runs locally; the divergence embedder is [model2vec](https://github.com/MinishLab/model2vec) `potion-multilingual-128M` (CPU, torch-free, ~120 MB, cached after first download).
 
 ## Configuration
 
@@ -201,7 +201,7 @@ Remember: the status check (`kg_ping`) and the other behind-the-scenes MCP tools
 
 The knowledge-graph spine: canon = one human-editable Markdown file per node (git-mergeable, semantic merge driver); derived = regenerable NetworkX/SQLite projections; MCP server (`burgess`, 27 tools) is the trust boundary; six subagents (extractor, grounder, adversarial-grounder, generator, annotator, evaluator) do the language work; the engine stays deterministic.
 
-The full, self-contained architecture reference — module map, data model, write-boundary contract, tool surface, divergence internals and constants, runtime and environment — is [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+Those six are the load-bearing ones; the suite enforces eleven (`I1`–`I11`). The full, self-contained architecture reference — module map, data model, write-boundary contract, tool surface, divergence internals and constants, runtime and environment, and the invariants in full — is [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## What this does not guarantee
 

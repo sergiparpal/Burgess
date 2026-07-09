@@ -6,7 +6,11 @@ Handoff note: **ALL STAGES DONE AND PUBLISHED.** The publishing steps were origi
 2. ✅ **GitHub Release created:** https://github.com/sergiparpal/Burgess/releases/tag/v0.1.0 (notes from CHANGELOG 0.1.0).
 3. ✅ **Marketplace live + installed:** `claude plugin marketplace add sergiparpal/Burgess` → `claude plugin install burgess@sergiparpal` (user scope). Component inventory verified: 10 skills, 6 agents, 2 hooks, 1 MCP server (~1.5k always-on tokens).
 4. ✅ **Production smoke through the INSTALLED plugin** (real headless Claude Code sessions in a scratch project): SessionStart hook auto-provisioned the venv into the plugin data dir (divergence deps probe OK); `kg_ping` → `{version: 0.1.0, pack_loaded: true, …}`; `kg_diverge_init` → project-local `.kg/diverge/<brief>/` state with session.json + ephemeral session/ zone. Note: the MCP server correctly does NOT start until the REQUIRED `source_path` userConfig is set — it was set at user scope to `~/.claude/burgess-demo-source.md` (a copy of examples/source.md); reconfigure per project with `/plugin configure burgess@sergiparpal` for real use.
-5. Donors remain untouched and pinned (I11 green at and after every commit); re-syncing to any future upstream Sproutgraph/Cambrian commits is a post-release decision (D5).
+5. Donors remain untouched and pinned (I11 green at and after every commit); ~~re-syncing to any future upstream Sproutgraph/Cambrian commits is a post-release decision (D5)~~.
+
+> **D5 is retired (2026-07-09).** Both donor repositories have been unpublished, so there is no upstream
+> to re-sync from and no post-release decision left to take. Donor *integrity* is unaffected — that is
+> I11, which still runs green against the local sibling checkouts. See `DECISIONS.md`.
 
 | Stage | Status | Commit(s) | Notes |
 |---|---|---|---|
