@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.1 — 2026-07-09
 
 Correctness, robustness and performance sweep from an eleventh exhaustive review (**review-r11**). Two
 HIGH findings, both §1.7 breaches reachable through ordinary tool use, and both with a working guard on
