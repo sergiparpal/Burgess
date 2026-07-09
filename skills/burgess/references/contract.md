@@ -13,13 +13,15 @@ Before extraction, the §1.9 **egress scrub** `mcp__plugin_burgess_burgess__kg_s
 **consistent** placeholders (`⟦SECRET:1⟧` etc.) so relational structure survives, then hands the scrubbed
 text to the subagent. `kg_write` **restores** the placeholder spans to the ORIGINAL text before writing, so
 the boundary stores the restored original span in the canon (the span still verifies against the unscrubbed
-source, §5). For a no-PII source the scrub is a no-op (`redactions=0`). The full tool surface adds the
+source, §5). For a no-PII source the scrub is a no-op (`redactions=0`). The graph tool surface adds the
 generative layer's tools on top of the sixteen core read/write tools: `kg_ping`, `kg_scrub`, `kg_write`,
 `kg_ground`, `kg_rename`, `kg_merge` (deliberate node-merge with edge dedup), `kg_metrics`, `kg_status`,
 `query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_explain_path` (read-only grounded-only
 associative chain + advisory `leap`, §2), `kg_context`, `kg_agenda` (read-only structural agenda),
 `kg_export` (read-only human-facing render) (plus the four generative-layer tools `kg_propose` (§5a),
 `kg_generate`, `kg_operate`, `kg_absorption` — see the generative-layer references) — twenty in all.
+The seven `kg_diverge_*` tools of the divergence engine bring the full MCP surface to twenty-seven; they
+never touch this contract (nothing under `divergence/` can set an epistemic state — invariant I3).
 
 ---
 
@@ -240,6 +242,16 @@ that arrives **explicitly** claiming `span-present`/`inferred` is REFUSED with r
 above apply uniformly. The return adds `{propose_lane: true, refused_text_claims: N}` to the `kg_write` shape.
 **Generate offensively; judge defensively (PLAN §1.2):** `kg_propose` never gates on a quality metric — every
 candidate is written `hypothesized/unverified`; the grounding loop is the post-hoc filter.
+
+Both `kg_write` and `kg_propose` take an optional `construction=<name>` (with a companion `source=<path>`).
+It routes the SAME payload through the SAME `validate_payload` — same dispositions, same span verification,
+only now against the `source` document you name — and stores the result in a **separately-named alternate
+canon** under `<project>/.kg/constructions/<slug>/` instead of the primary canon. This is the in-session
+**second construction** `/kg-perturb` cross-generates against (§9/§15): a `kg-extractor` subagent builds it
+with no API key and no `backend` extra, because the session does the language work and the engine only
+validates and stores. The store is session-ephemeral (git commits disabled; wiped fresh on the first
+materialization of a session), and `kg_generate(second_construction=<name>)` projects it to cross-generate.
+Omit both params — the default — and the write is the byte-for-byte unchanged primary-canon path.
 
 ---
 

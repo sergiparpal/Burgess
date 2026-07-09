@@ -103,6 +103,11 @@ Type a command with your brief:
 /kg-diverge names and angles for a calm, screen-free bedtime routine for toddlers
 ```
 
+Burgess runs at **balanced** reach unless you say otherwise — novel ideas that still hold together.
+Add `wild` on the end for further-out ideas, or `conservative` for safer, more buildable ones. Reach
+changes only how *far* the ideas go, never how *varied* they are: every slate is still built from
+genuinely different mechanisms. You can change it any round.
+
 What happens next is a guided back-and-forth:
 
 1. Claude first jots down the **most obvious, clichéd answers** to your brief — and then deliberately
@@ -307,7 +312,7 @@ believed.
 
 | Command | When you reach for it |
 |---|---|
-| `/kg-diverge <brief>` | Brainstorm wide, fight clichés, pin the keepers. No graph needed. |
+| `/kg-diverge <brief> [reach]` | Brainstorm wide, fight clichés, pin the keepers. No graph needed. Add `wild` or `conservative` to change how far out it goes (default `balanced`). |
 | *materialize* (just ask) | Promote your pinned ideas into the graph as hypotheses. |
 | `/kg-build <file/folder>` | Turn a document (or many) into a graph. Adds to what's there. |
 | `/kg-ground` | Fact-check against your source. The **only** way to mark something trusted. |

@@ -922,7 +922,7 @@ errors}`.
 | connect concepts over GROUNDED edges only (+ advisory leap) | `kg_explain_path(nodes)` |
 | budgeted, grounding-aware context (+ failures + bridges) | `kg_context(query=?, budget=?)` |
 | propose hypothesized candidates (the offensive lane) | `kg_propose(payload)` |
-| generate structural idea candidates (read-only) | `kg_generate(mechanism=?, k=?, second_graph=?)` |
+| generate structural idea candidates (read-only) | `kg_generate(mechanism=?, k=?, second_graph=?, second_construction=?)` |
 | run a §8 endo operation (collapse/explode/regroup/open) | `kg_operate(op, …)` |
 | score the §14 absorption window | `kg_absorption()` |
 | start/resume a divergence session for a brief | `kg_diverge_init(project, axes=?, session=?)` |

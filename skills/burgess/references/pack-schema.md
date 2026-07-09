@@ -109,8 +109,13 @@ divergence:
   unit_of_generation: idea        # idea | concept | hypothesis | name | feature | ...
   axes:                           # 4-6 descriptor axes; exactly one open/primary_novelty axis
     - {name: angle, type: categorical}
-    - {name: boldness, type: continuous, range: [0.0, 1.0]}
-    - {name: mechanism, type: open, primary_novelty: true}
+    - {name: scope, type: categorical}
+    - {name: form, type: categorical}
+    - {name: boldness, type: continuous, range: [0.0, 1.0]}   # safe <-> daring (capped by the reach dial)
+    - {name: feasibility, type: continuous, range: [0.0, 1.0]} # far-fetched <-> buildable; a COVERAGE axis:
+                                  # MAP-Elites keeps one elite per feasibility bin, so a bold idea can never
+                                  # evict a buildable one. Skip only where "buildable" is meaningless (names).
+    - {name: mechanism, type: open, primary_novelty: true}     # novelty carrier; never capped
   slate_size: 6                   # ideas surfaced per cycle
   candidates_per_generation: 12   # ideas the agent drafts per cycle
   engine: {}                      # OPTIONAL per-domain engine-tuning overrides

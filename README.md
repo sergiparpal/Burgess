@@ -83,7 +83,7 @@ Every slash command, with its arguments. The everyday flow is **diverge → buil
 
 | Command | What it does | The detail in brackets |
 | --- | --- | --- |
-| `/kg-diverge <brief> [domain-template]` | Diverge from a brief into a non-cliché slate; pin/discard in chat; optionally materialize the pins — no graph or source needed | **Required:** your creative brief. *Optional:* a domain template to steer the mechanisms |
+| `/kg-diverge <brief> [domain-template] [reach]` | Diverge from a brief into a non-cliché slate; pin/discard in chat; optionally materialize the pins — no graph or source needed | **Required:** your creative brief. *Optional:* a domain template to steer the mechanisms; a `reach` dial — `conservative\|balanced\|wild` (default `balanced`) — capping how far out the slate goes in *degree*, never in *kind* |
 | `/kg-build [source_path] [wave_size]` | Extract a span-anchored graph from your source (wave-parallel extractors); additive to any existing graph | *Optional:* the document / folder / glob to build from (defaults to your `source_path` config); how many sections per parallel wave |
 | `/kg-ground [query-or-node-filter]` | Run the grounding loop — the **only** verdict path: promotions need support, failures become permanent memory | *Optional:* limit it to one topic or node area (defaults to the whole backlog) |
 | `/kg-generate [mechanism-set] [k]` | Propose hypothesized candidates from graph structure (7 mechanisms; optional advisory-DPP order) | *Optional:* which mechanism(s) — `bridge\|seed\|compression\|regroup\|transplant\|ensemble\|periphery`; how many candidates |

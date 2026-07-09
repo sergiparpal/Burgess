@@ -10,7 +10,7 @@ Burgess is a Claude Code **plugin** fusing two engines around one trust boundary
 
 ```bash
 uv sync --extra dev                  # install (or: pip install -e ".[dev]"; CI uses ".[dev,backend]")
-uv run pytest tests/                 # full suite (pyproject sets -q; ~1100 tests, no network needed)
+uv run pytest tests/                 # full suite (pyproject sets -q; ~1200 tests, no network needed)
 uv run pytest tests/test_grounding.py::test_name   # single test
 uv run pytest -m "not selftest"      # faster loop (skips divergence selftest e2e) — run the FULL suite before committing
 ```

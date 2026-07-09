@@ -62,6 +62,7 @@ axes:
   - {name: locus, type: categorical}                # product / pricing / market / ops
   - {name: user_segment, type: categorical}         # new / power / dormant
   - {name: time_horizon, type: continuous, range: [0, 1]}  # acute <-> structural
+  - {name: feasibility, type: continuous, range: [0, 1]}   # far-fetched <-> testable (coverage axis)
   - {name: causal_mechanism, type: open, primary_novelty: true}  # the proposed "why"
 ```
 
