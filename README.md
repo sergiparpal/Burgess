@@ -32,6 +32,99 @@ claude --plugin-dir /path/to/Burgess
 
 On first load a SessionStart hook provisions a local Python venv (Python ≥ 3.11 recommended; `uv` preferred, stdlib `venv`+`pip` fallback) in the plugin's persistent data dir. Everything runs locally; the divergence embedder is [model2vec](https://github.com/MinishLab/model2vec) `potion-multilingual-128M` (CPU, torch-free, ~120 MB, cached after first download).
 
+## Configuration
+
+Installing Burgess asks for **four settings**. Only the first is required; the other three ship with working defaults you can ignore until you have a reason not to. Claude Code prompts for them at install time and stores them per-installation — to change one later, reconfigure the plugin from the `/plugin` interface. The engine reads its settings when the MCP server starts, so a changed value takes effect on the next session.
+
+| Setting | Required | Values | Default | What it controls |
+| --- | --- | --- | --- | --- |
+| `source_path` | **Yes** | a file, a directory, or a glob | — | The document(s) your graph is built and grounded against |
+| `sensitivity` | No | `low` · `medium` · `high` | `medium` | How aggressively text is scrubbed before it leaves for a subagent |
+| `metrics_mode` | No | `structure_only` · `with_embeddings` | `structure_only` | Which signal the graph's metrics use |
+| `extract_wave_size` | No | `1`–`10` | `6` | How many extractors `/kg-build` runs concurrently |
+
+### `source_path` — the document your graph is grounded against *(required)*
+
+The one setting Burgess cannot run without, because it names the source of truth. Every non-deterministic edge in the graph must quote a **verbatim span** from one of these files, and `/kg-ground` re-checks each span against the specific file it came from. This is what lets the plugin tell you a claim is *supported* rather than merely plausible. The `burgess` MCP server does not start until it is set.
+
+| Form you enter | Resolves to | Notes |
+| --- | --- | --- |
+| A single **file** | Just that file | Any extension — you pointed at it directly, so it is honored even if it isn't `.md`/`.txt` |
+| A **directory** | Every `.md`/`.txt` directly inside it | **Not recursive.** Dotfiles are skipped |
+| A **glob** | Every matching `.md`/`.txt` | Use a `**` segment to recurse into subdirectories |
+
+```text
+/home/me/notes/theory-of-change.md      a single document
+C:\docs\source.md                       the same, on Windows
+/home/me/research/papers                every .md/.txt directly in that folder
+/home/me/research/**/*.md               every .md at any depth below it
+```
+
+Four rules worth knowing before you type it:
+
+- **Enter the bare path, without surrounding quotes** — `C:\docs\source.md`, not `"C:\docs\source.md"`. Quotes are stripped defensively, but don't add them.
+- **Markdown and plain text only.** No PDFs, no media.
+- **Files are deduped by basename.** If a directory or glob resolves two files both named `notes.md`, only one is used — the lexicographically-first full path, so the choice is stable across machines. Rename one if you need both.
+- **A non-UTF-8 or binary file in the resolved set is skipped**, not fatal; the rest of the build proceeds.
+
+`/kg-build` resolves this value **through the engine**, never through a shell variable. That is deliberate: a configured source can never be silently ignored, and an unreadable path stops the build with a message rather than quietly falling back to the bundled demo corpus.
+
+### `sensitivity` — how much is redacted before text leaves your machine
+
+When `/kg-build` hands a section of your source to an extractor subagent, that text crosses an **egress boundary**. It is scrubbed first: secrets and PII are replaced with *consistent* placeholders (`⟦SECRET:1⟧`, `⟦EMAIL:1⟧`, …) so the relational structure survives the redaction while the sensitive values do not leave. Spans are restored to their original text when written to the canon — **the scrub protects the egress, not your local graph.**
+
+| Value | Redacts | Choose it when |
+| --- | --- | --- |
+| `low` | Secrets only — API keys, tokens, credentials | The document is public or already clean, and you want spans to read exactly as written |
+| **`medium`** *(default)* | Secrets **+ structured PII**: emails, phone numbers, SSNs, credit-card numbers, IP addresses, credentialed URLs | Almost always. Structured PII is matched by shape, so false positives are rare |
+| `high` | Everything in `medium` **+ person-name and street-address heuristics** | The document names people or addresses you don't want leaving your machine |
+
+**Secrets are always scrubbed, at every level** — `low` does not mean off. An unrecognized value falls back to `medium`.
+
+`high` uses heuristics rather than exact patterns, so it redacts more aggressively and can catch ordinary capitalized phrases. If spans start reading as `⟦PERSON:1⟧` where no person exists, step back to `medium`.
+
+This setting also governs engine **error text**: absolute filesystem paths are always redacted, and the same secret/PII scrub runs on top before an error reaches your transcript.
+
+### `metrics_mode` — which signal the graph's metrics use
+
+| Value | Effect |
+| --- | --- |
+| **`structure_only`** *(default)* | Graph structure is the signal: degree, betweenness, communities, the specificity gate. This is the mode that does something. |
+| `with_embeddings` | **Currently inert.** The embedding-backed candidate generator it once selected (sqlite-vss) was removed; the option is kept for compatibility. Selecting it changes nothing. |
+
+Leave it at `structure_only`. It is documented here only because you will see it in the install prompt and in `kg_ping`'s output, and a setting that looks meaningful but isn't deserves to be named as such. An unrecognized value falls back to `structure_only`.
+
+This has **no bearing on `/kg-diverge`**, whose embedder is always model2vec. `metrics_mode` governs the knowledge graph's metrics, nothing else.
+
+### `extract_wave_size` — how many extractors `/kg-build` runs at once
+
+`/kg-build` launches **one extractor subagent per section**, and that isolation is load-bearing: an extractor can only copy a span verbatim from text it can actually see, which is what makes `span-present` checkable rather than remembered. This setting changes only how many of those single-section extractors run **concurrently**, in bounded waves.
+
+| Value | Effect |
+| --- | --- |
+| `1`–`2` | Effectively serial. Gentlest on rate limits; lets you watch each section land |
+| **`6`** *(default)* | A 19-section document builds in four waves (6 + 6 + 6 + 1) |
+| `8`–`10` | Fastest on a long document; expect rate-limit and lock pressure |
+
+Unlike the three above, this is an **orchestration knob** the `/kg-build` command reads — the engine never sees it. So `/kg-build`'s own second argument overrides it for a single run:
+
+```text
+/kg-build notes/theory-of-change.md 2     this run uses a wave of 2, whatever the setting says
+```
+
+Values are clamped to `1`–`10`. Non-numeric, or below `1`, falls back to `6`; above `10` clamps to `10`.
+
+### Verifying your configuration
+
+The status tools have no slash — just ask Claude in plain words:
+
+```text
+"Is the Burgess engine running?"    → kg_ping reports version, sensitivity, metrics_mode
+"What source is configured?"        → kg_status reports the resolved source path and its files
+```
+
+If `kg_status` reports no source, `/kg-build` will stop and tell you rather than build the wrong thing.
+
 ## Quick start
 
 Installed? This is the whole everyday flow — the commands you'll actually type, in the order you'd reach for them. Run each in Claude Code and steer the rest in plain chat; skip any phase you don't need.
