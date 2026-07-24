@@ -1,7 +1,5 @@
 # Burgess
 
-![burgess-with-fossils.png](images/burgess-with-fossils.png)
-
 **Turn conceptual prose into a source-anchored knowledge graph — then query it, challenge it, and propose new connections from its structure.**
 
 Burgess is a Claude Code plugin for researchers, theorists, and technical writers developing conceptual frameworks in Markdown or plain text.
